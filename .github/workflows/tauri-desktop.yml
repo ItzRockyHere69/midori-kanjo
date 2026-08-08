@@ -1,0 +1,113 @@
+name: Build and test Tauri desktop installers
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_native_offline_sync_test:
+        description: Run the real Tauri IndexedDB → Supabase → IndexedDB round-trip test
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tauri-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-desktop:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: windows-x64
+            label: Windows 10/11 · MSI + NSIS EXE
+            os: windows-latest
+            rust_targets: x86_64-pc-windows-msvc
+            tauri_args: --bundles msi,nsis
+            binary_path: src-tauri/target/release/midori-kanjo.exe
+            artifact_name: midori-kanjo-windows-x64-installers
+            artifact_path: |
+              src-tauri/target/release/bundle/msi/*.msi
+              src-tauri/target/release/bundle/nsis/*-setup.exe
+          - id: macos-universal
+            label: macOS · Universal DMG
+            os: macos-latest
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            tauri_args: --target universal-apple-darwin --bundles dmg
+            binary_path: src-tauri/target/release/midori-kanjo
+            artifact_name: midori-kanjo-macos-universal-dmg
+            artifact_path: |
+              src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+    env:
+      CARGO_TERM_COLOR: always
+      MIDORI_TAURI_BINARY: ${{ github.workspace }}/${{ matrix.binary_path }}
+      MIDORI_E2E_RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
+      MIDORI_E2E_SUPABASE_URL: ${{ secrets.MIDORI_E2E_SUPABASE_URL }}
+      MIDORI_E2E_SUPABASE_ANON_KEY: ${{ secrets.MIDORI_E2E_SUPABASE_ANON_KEY }}
+      MIDORI_E2E_SYNC_CODE: ${{ secrets.MIDORI_E2E_SYNC_CODE }}
+
+    steps:
+      - name: Check out the single shared codebase
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Validate Tauri packaging configuration
+        run: npm run test:tauri:config
+
+      - name: Lint shared application
+        run: npm run lint
+
+      - name: Test shared billing and sync logic
+        run: npm run test:unit
+
+      - name: Validate native sync-test secrets
+        if: ${{ inputs.run_native_offline_sync_test }}
+        run: node scripts/require-desktop-e2e-env.mjs
+
+      - name: Build native runner test binary
+        if: ${{ inputs.run_native_offline_sync_test }}
+        run: npm run tauri:e2e:build
+
+      - name: Test offline create, restart, reconnect and idempotent sync
+        if: ${{ inputs.run_native_offline_sync_test }}
+        run: npm run test:tauri:e2e
+
+      - name: Build production installer
+        uses: tauri-apps/tauri-action@v1
+        with:
+          args: ${{ matrix.tauri_args }}
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14

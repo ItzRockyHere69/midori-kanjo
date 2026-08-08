@@ -1,0 +1,25 @@
+appId: com.mantu.billing
+productName: Midori Kanjo
+electronVersion: 38.8.6
+asar: true
+files:
+  - main.cjs
+  - package.json
+  - mobile-dist/**/*
+artifactName: Midori-Kanjo-Setup-v${version}.${ext}
+win:
+  icon: mobile-dist/app-icon-512.png
+  target:
+    - target: nsis
+      arch:
+        - x64
+  signExecutable: false
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Midori Kanjo
+  uninstallDisplayName: Midori Kanjo
+  deleteAppDataOnUninstall: false

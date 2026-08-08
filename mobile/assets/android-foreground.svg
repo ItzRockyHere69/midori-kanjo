@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Midori Kanjo launcher foreground">
+  <rect x="96" y="56" width="320" height="400" rx="48" fill="#f9f9f9"/>
+  <path d="M151 350V162h50l55 83 55-83h50v188h-49V239l-48 72h-17l-47-72v111z" fill="#004e23"/>
+  <rect x="151" y="374" width="144" height="18" rx="9" fill="#309d4b"/>
+  <rect x="311" y="374" width="50" height="18" rx="9" fill="#e2e2db"/>
+</svg>

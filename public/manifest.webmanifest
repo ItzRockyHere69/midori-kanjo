@@ -1,0 +1,16 @@
+{
+  "name": "Midori Kanjo",
+  "short_name": "Midori Kanjo",
+  "description": "Fast offline billing and party khata for Burrabazar festival-decoration traders.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f9f9f9",
+  "theme_color": "#014921",
+  "orientation": "portrait-primary",
+  "icons": [
+    { "src": "/app-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/app-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
