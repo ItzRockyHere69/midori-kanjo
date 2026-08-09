@@ -1,10 +1,12 @@
 import "fake-indexeddb/auto";
+import "./pdf-i18n.test";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
   db,
   priceKey,
   type AccountEntry,
+  type Expense,
   type Invoice,
   type InvoiceLine,
   type Item,
@@ -24,14 +26,19 @@ import {
   customerPaymentHistory,
   dueCustomerRows,
   formatMoney,
+  fuzzyScore,
+  invoiceInitialPaymentBreakdown,
   partyDueStatement,
   partyMatchesSearch,
   priceForParty,
   recordDue,
   recordPayment,
+  roundMoney,
   saveQuotation,
   saveSale,
   shouldOfferInlineItemCreation,
+  softDeleteInvoice,
+  restoreInvoice,
 } from "../lib/billing";
 import {
   buildCashFlowReport,
@@ -48,13 +55,31 @@ import {
 import { invoicePdf } from "../lib/pdf";
 import { itemProfitMetrics } from "../lib/item-profit";
 import {
+  isLanguage,
+  labels,
+  localeForLanguage,
+  localizedInvoicePartyName,
+  localizedItemName,
+} from "../lib/i18n";
+import {
   sampleCategories,
   sampleItems,
   sampleParties,
+  samplePrices,
   sampleSuppliers,
   seedIfNeeded,
 } from "../lib/seed";
-import { pendingCount, reconcilePartyBalances, syncDiagnostics, syncWithClient } from "../lib/sync";
+import {
+  clearCloudConfig,
+  configureCloud,
+  generateBusinessSyncCode,
+  getCloudConfig,
+  pendingCount,
+  reconcilePartyBalances,
+  supabaseClient,
+  syncDiagnostics,
+  syncWithClient,
+} from "../lib/sync";
 import {
   buildDailySalesReport,
   buildDeadStockReport,
@@ -66,9 +91,13 @@ import {
 } from "../lib/reports";
 import { cataloguePdf, cataloguePrice } from "../lib/catalogue-pdf";
 import {
+  canonicalizeMessageTemplates,
   clearBillDraft,
   dailyCashSummary,
+  defaultMessageTemplates,
   loadBillDraft,
+  localizedDefaultMessageTemplates,
+  messageTemplatesForLanguage,
   mergeItems,
   mergeParties,
   normalizeWorkspace,
@@ -78,10 +107,23 @@ import {
   saveBillDraft,
   saveDailyClose,
   setOwnerPin,
+  sha256Hex,
   variantFamily,
   verifyOwnerPin,
   withVariantFamily,
 } from "../lib/qol";
+
+test("tenant identifiers use the standard SHA-256 hex representation", () => {
+  assert.equal(
+    sha256Hex("test-business-sync-code-1234567890"),
+    "7bdebe348faeda556a3005c310de23f8744f21cd7a0b3c9d8a745ef85695219a",
+  );
+  const first = generateBusinessSyncCode();
+  const second = generateBusinessSyncCode();
+  assert.match(first, /^[a-f0-9]{64}$/);
+  assert.match(second, /^[a-f0-9]{64}$/);
+  assert.notEqual(first, second);
+});
 
 test("owner item metrics calculate profit and gross margin without inventing unknown costs", () => {
   assert.deepEqual(
@@ -239,6 +281,119 @@ test("inline item creation stays available beside fuzzy suggestions but not for 
   await db.delete();
 });
 
+test("Unicode fuzzy search never treats unrelated Hindi or Bengali as a product match", () => {
+  const item = sampleItems[0];
+  assert.equal(fuzzyScore("बिल्कुल असंबंधित", item), 0);
+  assert.equal(fuzzyScore("সম্পূর্ণ অসংলগ্ন", item), 0);
+  assert.equal(fuzzyScore("झ", item), 0);
+  assert.equal(fuzzyScore("ঙ", item), 0);
+  assert.ok(fuzzyScore(item.nameHi, item) >= 5000);
+  assert.ok(fuzzyScore(item.nameBn, item) >= 5000);
+  assert.ok(fuzzyScore("१२", item) > 0);
+  assert.ok(fuzzyScore("১২", item) > 0);
+  assert.equal(
+    fuzzyScore("মালা", { ...item, name: "", nameHi: "", nameBn: "মেলা" }),
+    0,
+  );
+});
+
+test("modern Hindi and Bengali labels stay complete, safe and business-friendly", () => {
+  const englishKeys = Object.keys(labels.en).sort();
+  assert.deepEqual(Object.keys(labels.hi).sort(), englishKeys);
+  assert.deepEqual(Object.keys(labels.bn).sort(), englishKeys);
+  assert.equal(isLanguage("hi"), true);
+  assert.equal(isLanguage("bn"), true);
+  assert.equal(isLanguage("legacy-language"), false);
+  assert.equal(localeForLanguage("hi"), "hi-IN-u-nu-latn");
+  assert.equal(localeForLanguage("bn"), "bn-IN-u-nu-latn");
+  assert.doesNotMatch(Object.values(labels.hi).join(" "), /निर्यात|शुद्ध नकदी|वास्तविक प्राप्ति|विविध/);
+  assert.doesNotMatch(Object.values(labels.bn).join(" "), /রপ্তানি|প্রকৃত প্রাপ্তি|নথিভুক্ত|পুনরুদ্ধার/);
+  assert.equal(localizedItemName("hi", sampleItems[0]), sampleItems[0].nameHi);
+  assert.equal(localizedItemName("bn", sampleItems[0]), sampleItems[0].nameBn);
+  assert.equal(
+    localizedInvoicePartyName("hi", { partyName: "Cash customer" }),
+    "कैश कस्टमर",
+  );
+  assert.equal(
+    localizedInvoicePartyName("bn", { partyName: "Cash customer" }),
+    "ক্যাশ কাস্টমার",
+  );
+  assert.equal(
+    localizedInvoicePartyName("bn", {
+      partyId: "party-1",
+      partyName: "Owner-entered party name",
+    }),
+    "Owner-entered party name",
+  );
+  assert.equal(
+    messageTemplatesForLanguage("hi", defaultMessageTemplates).invoice,
+    localizedDefaultMessageTemplates.hi.invoice,
+  );
+  assert.deepEqual(
+    canonicalizeMessageTemplates("bn", localizedDefaultMessageTemplates.bn),
+    defaultMessageTemplates,
+  );
+  assert.equal(
+    canonicalizeMessageTemplates("hi", {
+      ...localizedDefaultMessageTemplates.hi,
+      invoice: "Custom {{invoice_number}}",
+    }).invoice,
+    "Custom {{invoice_number}}",
+  );
+});
+
+test("cash-flow exports localize system labels but preserve custom descriptions", () => {
+  const expense = {
+    id: "expense-default-title",
+    category: "refreshments",
+    amount: 25,
+    date: "2026-08-09",
+    description: "Tea & coffee",
+    paymentMode: "cash",
+    reference: "",
+    isSynced: false,
+    createdAt: "2026-08-09T10:00:00.000Z",
+    updatedAt: "2026-08-09T10:00:00.000Z",
+  } satisfies Expense;
+  const reportFor = (description: string) => buildCashFlowReport({
+    invoices: [],
+    payments: [],
+    parties: [],
+    accountEntries: [],
+    expenses: [{ ...expense, description }],
+    fromDate: expense.date,
+    toDate: expense.date,
+  });
+  const business = { name: "Test shop", address: "", phone: "", gstin: "" };
+
+  const hindi = cashFlowText(reportFor("Tea & coffee"), business, "hi");
+  assert.match(hindi, /चाय और कॉफ़ी/);
+  assert.doesNotMatch(hindi, /Tea & coffee/);
+
+  const bengali = cashFlowText(reportFor("চা ও কফি"), business, "bn");
+  assert.match(bengali, /চা ও কফি/);
+
+  const custom = cashFlowText(reportFor("Tea for the night shift"), business, "hi");
+  assert.match(custom, /Tea for the night shift/);
+
+  const cashInvoiceReport = reportFor("Tea for the night shift");
+  cashInvoiceReport.movements = [{
+    id: "invoice-cash-sale",
+    date: expense.date,
+    createdAt: expense.createdAt,
+    direction: "in",
+    source: "sale",
+    partyId: null,
+    title: "Sale CASH-1",
+    details: "Cash customer",
+    mode: "cash",
+    amount: 100,
+  }];
+  const cashInvoiceHindi = cashFlowText(cashInvoiceReport, business, "hi");
+  assert.match(cashInvoiceHindi, /कैश कस्टमर/);
+  assert.doesNotMatch(cashInvoiceHindi, /Cash customer/);
+});
+
 test("an offline product photo survives the seed-data upgrade", async () => {
   await db.open();
   const imageUrl = "data:image/jpeg;base64,cHJvZHVjdC1waG90bw==";
@@ -249,6 +404,79 @@ test("an offline product photo survives the seed-data upgrade", async () => {
 
   assert.equal((await db.items.get(sampleItems[0].id))?.imageUrl, imageUrl);
   assert.equal((await db.items.get(sampleItems[1].id))?.imageUrl, undefined);
+  await db.delete();
+});
+
+test("seed upgrades add missing defaults without overwriting editable business data", async () => {
+  await db.delete();
+  await db.open();
+  const customItem = {
+    ...sampleItems[0],
+    name: "Owner renamed product",
+    purchasePrice: 777,
+    priceWholesale: 999,
+    isActive: false,
+    imageUrl: "data:image/jpeg;base64,b3duZXItcGhvdG8=",
+    updatedAt: "2026-08-09T12:00:00.000Z",
+    isSynced: true,
+  };
+  const customParty = {
+    ...sampleParties[0],
+    phone: "9999999999",
+    address: "Owner-entered address",
+    openingBalance: 123,
+    currentBalance: 456,
+    notes: "Owner-entered customer notes",
+    updatedAt: "2026-08-09T12:00:00.000Z",
+    isSynced: true,
+  };
+  const customPrice = {
+    ...samplePrices[0],
+    lastPrice: 432,
+    lockedPrice: true,
+    timesSold: 99,
+    updatedAt: "2026-08-09T12:00:00.000Z",
+    isSynced: true,
+  };
+  const customCategory = {
+    ...sampleCategories[1],
+    name: "Owner category name",
+  };
+  const legacyItem = {
+    ...sampleItems[0],
+    id: "i-mm12-green",
+    name: "Owner legacy item",
+    skuCode: "OWNER-LEGACY-ITEM",
+  };
+  const legacyParty = {
+    ...sampleParties[0],
+    id: "p-ganesh",
+    name: "Owner legacy party",
+    codeName: "OWNER-LEGACY-PARTY",
+  };
+  await db.items.bulkPut([customItem, legacyItem]);
+  await db.parties.bulkPut([customParty, legacyParty]);
+  await db.partyItemPrices.put(customPrice);
+  await db.categories.put(customCategory);
+  await db.meta.put({ key: "seeded-v1", value: true });
+
+  await seedIfNeeded();
+
+  assert.deepEqual(
+    await db.items.get(customItem.id),
+    customItem,
+  );
+  assert.deepEqual(
+    await db.parties.get(customParty.id),
+    customParty,
+  );
+  assert.deepEqual(await db.partyItemPrices.get(customPrice.id), customPrice);
+  assert.deepEqual(await db.categories.get(customCategory.id), customCategory);
+  assert.equal((await db.items.get(legacyItem.id))?.name, legacyItem.name);
+  assert.equal((await db.parties.get(legacyParty.id))?.name, legacyParty.name);
+  assert.ok(await db.items.get(sampleItems[1].id));
+  assert.ok(await db.parties.get(sampleSuppliers[0].id));
+  assert.equal((await db.meta.get("seeded-v3"))?.value, true);
   await db.delete();
 });
 
@@ -600,6 +828,71 @@ test("A4, A5 and thermal invoices render with stable page sizes and no signature
   );
 });
 
+test("thermal invoices use one measured roll page and split only beyond the safe PDF height", async () => {
+  const makeInvoice = (count: number, longNames = false): Invoice => {
+    const drafts = Array.from({ length: count }, (_, index): InvoiceLine => ({
+      itemId: `thermal-${index}`,
+      itemName: longNames
+        ? `Premium festival decoration item ${index + 1} with a deliberately long multilingual-ready description `.repeat(5)
+        : `Counter item ${index + 1}`,
+      skuCode: `TH-${index + 1}`,
+      hsnCode: "9505",
+      qty: 1,
+      unit: "piece",
+      baseUnit: "piece",
+      rate: 10,
+      discount: 0,
+      taxableAmount: 0,
+      gstRate: 18,
+      gstAmount: 0,
+      amount: 0,
+    }));
+    const lineItems = drafts.map((line) => ({ ...line, ...calculateLine(line) }));
+    const paid = 100;
+    const totals = calculateBill(lineItems, paid);
+    return {
+      id: `thermal-plan-${count}-${longNames}`,
+      invoiceNumber: `TH-${count}`,
+      partyName: "Thermal Plan Buyer",
+      date: "2026-08-10",
+      type: "sale",
+      lineItems,
+      ...totals,
+      initialAmountPaid: paid,
+      paymentMode: "mixed",
+      paymentBreakdown: [
+        { mode: "cash", amount: 40 },
+        { mode: "upi", amount: 60, reference: "UPI-THERMAL" },
+      ],
+      notes: "",
+      isSynced: false,
+      createdAt: "2026-08-10T09:00:00.000Z",
+      updatedAt: "2026-08-10T09:00:00.000Z",
+    };
+  };
+  const business = {
+    name: "Measured Roll Shop",
+    ownerName: "Shopkeeper Name",
+    address: "12 Long Market Road, Burrabazar, Kolkata, West Bengal",
+    phone: "9000000000",
+    alternatePhone: "9000000001",
+    email: "shop@example.com",
+    gstin: "19ABCDE1234F1Z5",
+  };
+  const ordinary = await invoicePdf(makeInvoice(40), business, "thermal");
+  assert.equal(ordinary.getNumberOfPages(), 1);
+  assert.ok(ordinary.internal.pageSize.getHeight() < 1200);
+
+  const extreme = await invoicePdf(makeInvoice(250, true), business, "thermal");
+  assert.ok(extreme.getNumberOfPages() >= 2);
+  const heights = Array.from({ length: extreme.getNumberOfPages() }, (_, index) => {
+    extreme.setPage(index + 1);
+    return extreme.internal.pageSize.getHeight();
+  });
+  assert.ok(heights.every((height) => height >= 190 && height <= 4800));
+  assert.ok(heights.at(-1)! < 4800);
+});
+
 test("toggleable carrier, packing and big-box charges are included exactly once", async () => {
   await db.delete();
   await db.open();
@@ -750,6 +1043,80 @@ test("customer receivables and supplier payables add dues and subtract payments"
         paymentMode: "credit",
       }),
     /customer/,
+  );
+  await db.delete();
+});
+
+test("payments allocate only to receivable sales or payable purchases and never to quotations", async () => {
+  await db.delete();
+  await db.open();
+  const customer = await createParty({
+    name: "Quotation Payment Guard",
+    type: "customer",
+    openingBalance: 500,
+  });
+  const quotation = await saveQuotation({
+    party: customer,
+    lines: [sampleInvoiceLine()],
+  });
+  const customerPayment = await recordPayment(
+    customer,
+    100,
+    "cash",
+    "opening balance payment",
+  );
+  const storedQuotation = await db.invoices.get(quotation.id);
+  assert.deepEqual(customerPayment.allocatedTo, []);
+  assert.deepEqual(
+    { paid: storedQuotation?.amountPaid, due: storedQuotation?.amountDue },
+    { paid: 0, due: quotation.grandTotal },
+  );
+
+  const supplier = await createParty({
+    name: "Purchase Allocation Supplier",
+    type: "supplier",
+    openingBalance: 500,
+  });
+  const stamp = "2026-08-09T10:00:00.000Z";
+  const purchase: Invoice = {
+    id: "purchase-allocation-only",
+    invoiceNumber: "PUR-ALLOCATION-ONLY",
+    partyId: supplier.id,
+    partyName: supplier.name,
+    date: "2026-08-09",
+    type: "purchase",
+    lineItems: [sampleInvoiceLine()],
+    subtotal: 200,
+    discountTotal: 0,
+    gstTotal: 0,
+    otherCharges: [],
+    otherChargesTotal: 0,
+    roundOff: 0,
+    grandTotal: 200,
+    amountPaid: 0,
+    amountDue: 200,
+    paymentMode: "credit",
+    notes: "",
+    isSynced: false,
+    createdAt: stamp,
+    updatedAt: stamp,
+  };
+  await db.invoices.put(purchase);
+  const supplierPayment = await recordPayment(
+    supplier,
+    125,
+    "bank",
+    "supplier transfer",
+  );
+  assert.deepEqual(supplierPayment.allocatedTo, [
+    { invoiceId: purchase.id, amount: 125 },
+  ]);
+  assert.deepEqual(
+    {
+      paid: (await db.invoices.get(purchase.id))?.amountPaid,
+      due: (await db.invoices.get(purchase.id))?.amountDue,
+    },
+    { paid: 125, due: 75 },
   );
   await db.delete();
 });
@@ -1034,7 +1401,23 @@ test("miscellaneous expenses and cash-flow reports count real money once and exp
   });
   const afterSale = await db.parties.get(customer.id);
   assert.ok(afterSale);
-  await recordPayment(afterSale, 30, "upi", "LATER-UPI");
+  const laterCustomerPayment = await recordPayment(afterSale, 30, "upi", "LATER-UPI");
+  // Simulate a stale invoice snapshot from another device. The immutable
+  // amount received with the bill must still drive cash flow.
+  await db.invoices.update(invoice.id, { amountPaid: 30, amountDue: 88 });
+  const [staleInvoice, currentCustomer] = await Promise.all([
+    db.invoices.get(invoice.id),
+    db.parties.get(customer.id),
+  ]);
+  assert.ok(staleInvoice && currentCustomer);
+  const staleStatement = partyDueStatement(
+    currentCustomer,
+    [staleInvoice],
+    [laterCustomerPayment],
+    [],
+  );
+  assert.equal(staleStatement.totalPaid, 70);
+  assert.equal(staleStatement.remainingDue, 48);
   await recordPayment(supplier, 20, "bank", "SUPPLIER-BANK");
   const expense = await recordExpense({
     category: "refreshments",
@@ -1168,8 +1551,12 @@ test("Phase 1 billing core works offline without duplicate bills", async () => {
   assert.equal(new Set(bills.map((bill) => bill.invoiceNumber)).size, 5);
   assert.ok(
     bills.every((bill) =>
-      /^MB-\d{4}-\d{2}-[A-Z0-9]{4}-\d+$/.test(bill.invoiceNumber),
+      /^MB-\d{4}-\d{2}-[A-Z0-9]{8,}-\d+$/.test(bill.invoiceNumber),
     ),
+  );
+  assert.match(
+    String((await db.meta.get("invoice-device-code"))?.value),
+    /^[A-Z0-9]{8,}$/,
   );
   assert.equal(bills.filter((bill) => !bill.isSynced).length, 5);
   const customerHistory = customerInvoiceHistory(
@@ -1510,6 +1897,33 @@ test("payments reject overpayment and invalid manual allocation without changing
   await db.delete();
 });
 
+test("payments and expenses reject positive inputs that round below one paisa", async () => {
+  await db.delete();
+  await db.open();
+  const party = await createParty({
+    name: "Sub-cent Guard",
+    type: "customer",
+    openingBalance: 1,
+  });
+  await assert.rejects(
+    () => recordPayment(party, 0.004, "cash", "too small"),
+    /at least ₹0\.01/,
+  );
+  await assert.rejects(
+    () =>
+      recordExpense({
+        category: "other",
+        amount: 0.004,
+        paymentMode: "cash",
+      }),
+    /at least ₹0\.01/,
+  );
+  assert.equal(await db.payments.count(), 0);
+  assert.equal(await db.expenses.count(), 0);
+  assert.equal((await db.parties.get(party.id))?.currentBalance, 1);
+  await db.delete();
+});
+
 test("sale and payment balance updates use the latest stored party balance", async () => {
   await db.open();
   await seedIfNeeded();
@@ -1543,6 +1957,17 @@ test("sale and payment balance updates use the latest stored party balance", asy
     (await db.parties.get(staleParty.id))?.currentBalance,
     5000 + invoice.amountDue,
   );
+  await db.delete();
+});
+
+test("invoice numbering preserves an existing legacy device code", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  await db.meta.put({ key: "invoice-device-code", value: "AB12" });
+  const quotation = await saveQuotation({ lines: [sampleInvoiceLine()] });
+  assert.match(quotation.invoiceNumber, /^QT-\d{4}-\d{2}-AB12-\d+$/);
+  assert.equal((await db.meta.get("invoice-device-code"))?.value, "AB12");
   await db.delete();
 });
 
@@ -1724,6 +2149,15 @@ test("advanced reports calculate daily, party, profit, aging, dead stock, top re
     ),
     ["item-never"],
   );
+  const unknownCostStock = {
+    ...item("item-unknown-cost", "Unknown Cost Stock", 0),
+    currentStock: 12,
+  };
+  assert.equal(
+    buildDeadStockReport([], [unknownCostStock], "2026-08-08")[0]
+      .stockValue,
+    null,
+  );
   assert.deepEqual(
     buildTopRevenueItems(invoices, items).map((row) => [
       row.itemId,
@@ -1787,7 +2221,20 @@ test("a quotation changes no balances until one-tap conversion and conversion is
     rememberedBefore?.lastPrice,
   );
 
+  const counterBefore = Number((await db.meta.get("invoice-counter"))?.value);
+  await assert.rejects(
+    () => convertQuotationToInvoice("missing-quotation"),
+    /no longer available/,
+  );
+  assert.equal(
+    Number((await db.meta.get("invoice-counter"))?.value),
+    counterBefore,
+  );
   const invoice = await convertQuotationToInvoice(quotation.id);
+  const counterAfterConversion = Number(
+    (await db.meta.get("invoice-counter"))?.value,
+  );
+  assert.equal(counterAfterConversion, counterBefore + 1);
   assert.equal(invoice.type, "sale");
   assert.match(invoice.invoiceNumber, /^MB-/);
   assert.equal(invoice.amountDue, invoice.grandTotal);
@@ -1805,7 +2252,31 @@ test("a quotation changes no balances until one-tap conversion and conversion is
   assert.equal(convertedInvoiceId(storedQuotation), invoice.id);
   const retried = await convertQuotationToInvoice(quotation.id);
   assert.equal(retried.id, invoice.id);
+  assert.equal(
+    Number((await db.meta.get("invoice-counter"))?.value),
+    counterAfterConversion,
+  );
   assert.equal(await db.invoices.where("type").equals("sale").count(), 1);
+  await db.delete();
+});
+
+test("legacy quotations without an initial-payment snapshot remain cloud-syncable", async () => {
+  await db.delete();
+  await db.open();
+  const party = await createParty({ name: "Legacy Quote Buyer", type: "customer" });
+  const quotation = await saveQuotation({
+    party,
+    lines: [{ ...sampleInvoiceLine(), rate: 125, gstRate: 0 }],
+  });
+  await db.invoices.update(quotation.id, {
+    initialAmountPaid: undefined,
+    isSynced: false,
+  });
+  const cloud = memorySupabase();
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  const remote = cloud.rows("invoices").find((row) => row.id === quotation.id);
+  assert.equal(remote?.initial_amount_paid, 0);
+  assert.equal(remote?.amount_paid, 0);
   await db.delete();
 });
 
@@ -1837,6 +2308,28 @@ test("owner PIN is PBKDF2-protected, verifies correctly and never stores plainte
   await db.delete();
 });
 
+test("owner PIN lockout survives caller remounts", async () => {
+  await db.delete();
+  await db.open();
+  await setOwnerPin("5931");
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    assert.equal(await verifyOwnerPin("0000"), false);
+  }
+  const lockout = JSON.parse(
+    String((await db.meta.get("owner-pin-lockout-v1"))?.value || "{}"),
+  ) as { failures?: number; lockedUntil?: number };
+  assert.equal(lockout.failures, 5);
+  assert.ok(Number(lockout.lockedUntil) > Date.now());
+
+  db.close();
+  await db.open();
+  await assert.rejects(
+    () => verifyOwnerPin("5931"),
+    /Owner PIN is temporarily locked/,
+  );
+  await db.delete();
+});
+
 test("portable PBKDF2 fallback matches standard SHA-256 vectors", () => {
   const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
   assert.equal(hex(pbkdf2Sha256Fallback("password", "salt", 1)), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
@@ -1849,10 +2342,19 @@ test("automatic bill drafts restore every counter field and tolerate cleanup", a
   const line = { ...sampleInvoiceLine(), qty: 6, rate: 333, gstRate: 18 };
   await saveBillDraft({
     draftId: "draft-crash-test",
-    partyId: "p-ramesh",
+    customerDraft: {
+      name: "Walk-in Draft Buyer",
+      phone: "9000000033",
+      address: "New Market",
+    },
     lines: [line],
     paid: 500,
     paymentMode: "upi",
+    splitPayment: true,
+    paymentBreakdown: [
+      { mode: "cash", amount: 200 },
+      { mode: "upi", amount: 300, reference: "UPI-DRAFT" },
+    ],
     paymentPlan: "partial",
     documentType: "sale",
     gstEnabled: true,
@@ -1863,6 +2365,9 @@ test("automatic bill drafts restore every counter field and tolerate cleanup", a
   assert.equal(restored?.draftId, "draft-crash-test");
   assert.equal(restored?.lines[0].rate, 333);
   assert.equal(restored?.paymentPlan, "partial");
+  assert.equal(restored?.customerDraft?.name, "Walk-in Draft Buyer");
+  assert.equal(restored?.splitPayment, true);
+  assert.equal(restored?.paymentBreakdown?.[1].reference, "UPI-DRAFT");
   assert.equal(restored?.otherCharges[0].amount, 25);
   await clearBillDraft();
   assert.equal(await loadBillDraft(), null);
@@ -1887,6 +2392,169 @@ function sampleInvoiceLine(): InvoiceLine {
     amount: 0,
   };
 }
+
+test("ordinary customers can stay code-less while entered trade codes remain unique", async () => {
+  await db.delete();
+  await db.open();
+  const first = await createParty({ name: "Daily Buyer One", type: "customer" });
+  const second = await createParty({ name: "Daily Buyer Two", type: "customer" });
+  assert.equal(first.codeName, "");
+  assert.equal(second.codeName, "");
+  const trade = await createParty({
+    name: "Large Trade Buyer",
+    codeName: "LARGE-01",
+    type: "customer",
+  });
+  assert.equal(trade.codeName, "LARGE-01");
+  await assert.rejects(
+    () => createParty({ name: "Duplicate Trade Code", codeName: "large-01", type: "customer" }),
+    /already used/,
+  );
+  assert.equal(await db.parties.count(), 3);
+  await db.delete();
+});
+
+test("a typed billing customer and four-way split payment save atomically", async (t) => {
+  await db.delete();
+  await db.open();
+  t.after(async () => { await db.delete(); });
+  await seedIfNeeded();
+  const line = sampleInvoiceLine();
+  const preview = calculateBill([line], 0);
+  const paid = 185;
+  const invoice = await saveSale({
+    customerDraft: {
+      name: "রোজকার ক্রেতা",
+      phone: "৯০০০০০০০৪৪",
+      address: "বড়বাজার",
+    },
+    lines: [line],
+    paid,
+    paymentMode: "mixed",
+    paymentPlan: "partial",
+    paymentBreakdown: [
+      { mode: "cash", amount: 40 },
+      { mode: "upi", amount: 60, reference: "UPI-44" },
+      { mode: "bank", amount: 35, reference: "BANK-44" },
+      { mode: "cheque", amount: 50, reference: "CHQ-44" },
+    ],
+    idempotencyKey: "typed-split-sale",
+  });
+  const customer = invoice.partyId ? await db.parties.get(invoice.partyId) : undefined;
+  assert.ok(customer);
+  assert.equal(customer.name, "রোজকার ক্রেতা");
+  assert.equal(customer.codeName, "");
+  assert.equal(customer.phone, "৯০০০০০০০৪৪");
+  assert.equal(customer.address, "বড়বাজার");
+  assert.equal(invoice.initialAmountPaid, paid);
+  assert.equal(invoice.amountDue, roundMoney(preview.grandTotal - paid));
+  assert.equal(invoice.paymentMode, "mixed");
+  assert.equal(invoice.paymentReceivedMode, undefined);
+  assert.deepEqual(invoice.paymentBreakdown?.map((entry) => [entry.mode, entry.amount, entry.reference || ""]), [
+    ["cash", 40, ""],
+    ["upi", 60, "UPI-44"],
+    ["bank", 35, "BANK-44"],
+    ["cheque", 50, "CHQ-44"],
+  ]);
+  assert.equal(customer.currentBalance, invoice.amountDue);
+  assert.equal(
+    invoiceInitialPaymentBreakdown(invoice).reduce((sum, entry) => sum + entry.amount, 0),
+    paid,
+  );
+  const summary = dailyCashSummary(invoice.date, [invoice], [], [], 0, [customer]);
+  assert.equal(summary.invoiceCash, 40);
+  assert.equal(summary.upiIn, 60);
+  assert.equal(summary.bankIn, 35);
+  assert.equal(summary.chequeIn, 50);
+  const cashFlow = buildCashFlowReport({
+    invoices: [invoice],
+    payments: [],
+    parties: [customer],
+    accountEntries: [],
+    expenses: [],
+  });
+  assert.deepEqual(
+    Object.fromEntries(cashFlow.movements.map((movement) => [movement.mode, movement.amount])),
+    { cash: 40, upi: 60, bank: 35, cheque: 50 },
+  );
+});
+
+test("typed-customer duplicate checks and failed split validation leave no orphan records", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  await createParty({
+    name: "ＡＣＭＥ   ट्रेडर्स",
+    phone: "9000000055",
+    type: "customer",
+  });
+  const beforeParties = await db.parties.count();
+  const beforeInvoices = await db.invoices.count();
+  await assert.rejects(
+    () => saveSale({
+      customerDraft: { name: "ACME ट्रेडर्स" },
+      lines: [sampleInvoiceLine()],
+      paid: 0,
+      paymentMode: "credit",
+      paymentPlan: "credit",
+      idempotencyKey: "duplicate-name-sale",
+    }),
+    /already matches/,
+  );
+  await assert.rejects(
+    () => saveSale({
+      customerDraft: { name: "Different name", phone: "৯০০০০০০০৫৫" },
+      lines: [sampleInvoiceLine()],
+      paid: 0,
+      paymentMode: "credit",
+      paymentPlan: "credit",
+      idempotencyKey: "duplicate-phone-sale",
+    }),
+    /already matches/,
+  );
+  await assert.rejects(
+    () => saveSale({
+      customerDraft: { name: "Should Roll Back" },
+      lines: [sampleInvoiceLine()],
+      paid: 50,
+      paymentMode: "mixed",
+      paymentPlan: "partial",
+      paymentBreakdown: [
+        { mode: "cash", amount: 20 },
+        { mode: "upi", amount: 20 },
+      ],
+      idempotencyKey: "bad-split-sale",
+    }),
+    /add up/,
+  );
+  assert.equal(await db.parties.count(), beforeParties);
+  assert.equal(await db.invoices.count(), beforeInvoices);
+  await db.delete();
+});
+
+test("the same pending-customer draft ID creates one customer and one invoice", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const input = {
+    customerDraft: { name: "One Retry Customer", codeName: "RETRY-01" },
+    lines: [sampleInvoiceLine()],
+    paid: 0,
+    paymentMode: "credit" as const,
+    paymentPlan: "credit" as const,
+    idempotencyKey: "pending-customer-idempotent",
+  };
+  const first = await saveSale(input);
+  const second = await saveSale(input);
+  assert.equal(second.id, first.id);
+  assert.equal(await db.invoices.where("id").equals(input.idempotencyKey).count(), 1);
+  assert.equal(
+    await db.parties.filter((party) => party.name === "One Retry Customer").count(),
+    1,
+  );
+  assert.equal((await db.parties.get(first.partyId!))?.codeName, "RETRY-01");
+  await db.delete();
+});
 
 test("a restored draft ID saves exactly one invoice and changes the balance once", async () => {
   await db.delete();
@@ -1921,19 +2589,512 @@ test("reviewed party and item merges preserve ledger ownership and archive sourc
   const source = await createParty({ name: "Duplicate Buyer", codeName: "DUP-A", phone: "9000000011", address: "A", type: "customer", openingBalance: 100 });
   const target = await createParty({ name: "Duplicate Buyer", codeName: "DUP-B", phone: "9000000011", address: "B", type: "customer", openingBalance: 50 });
   const due = await recordDue(source, 75, "Old notebook due");
+  const sourcePartyPrice = {
+    ...samplePrices[0],
+    id: priceKey(source.id, sampleItems[0].id),
+    partyId: source.id,
+    itemId: sampleItems[0].id,
+    isSynced: true,
+  };
+  const targetPartyPrice = {
+    ...samplePrices[0],
+    id: priceKey(target.id, sampleItems[0].id),
+    partyId: target.id,
+    itemId: sampleItems[0].id,
+    lastPrice: 265,
+    lastSoldDate: "2026-07-30",
+    timesSold: 2,
+    updatedAt: "2026-07-30T10:00:00.000Z",
+    isSynced: true,
+  };
+  await db.partyItemPrices.bulkPut([sourcePartyPrice, targetPartyPrice]);
   await mergeParties(source.id, target.id);
   assert.equal((await db.accountEntries.get(due.id))?.partyId, target.id);
   assert.equal((await db.parties.get(target.id))?.currentBalance, 225);
   assert.ok((await db.parties.get(source.id))?.tags.includes(`mergedInto:${target.id}`));
+  assert.ok(await db.partyItemPrices.get(sourcePartyPrice.id));
+  const mergedPartyPrice = await db.partyItemPrices.get(
+    priceKey(target.id, sampleItems[0].id),
+  );
+  assert.equal(mergedPartyPrice?.timesSold, 11);
+  assert.equal(mergedPartyPrice?.lastSoldDate, "2026-08-01");
+  assert.equal(mergedPartyPrice?.lastPrice, 275);
 
-  const sourceItem = { ...sampleItems[0], id: "merge-source", skuCode: "MERGE-A", currentStock: 4, saleCount: 2, isSynced: false };
-  const targetItem = { ...sampleItems[0], id: "merge-target", skuCode: "MERGE-B", currentStock: 6, saleCount: 3, isSynced: false };
+  const sourceItem = { ...sampleItems[0], id: "merge-source", skuCode: "MERGE-A", currentStock: 4, saleCount: 2, lastSoldDate: "2026-08-03", isSynced: false };
+  const targetItem = { ...sampleItems[0], id: "merge-target", skuCode: "MERGE-B", currentStock: 6, saleCount: 3, lastSoldDate: "2026-08-01", isSynced: false };
   await db.items.bulkPut([sourceItem, targetItem]);
+  const sourceItemPrice = {
+    ...samplePrices[0],
+    id: priceKey(target.id, sourceItem.id),
+    partyId: target.id,
+    itemId: sourceItem.id,
+    isSynced: true,
+  };
+  await db.partyItemPrices.put(sourceItemPrice);
   await mergeItems(sourceItem.id, targetItem.id);
   assert.equal((await db.items.get(sourceItem.id))?.isActive, false);
   assert.equal((await db.items.get(targetItem.id))?.currentStock, 10);
   assert.equal((await db.items.get(targetItem.id))?.saleCount, 5);
+  assert.equal((await db.items.get(targetItem.id))?.lastSoldDate, "2026-08-03");
+  assert.ok(await db.partyItemPrices.get(sourceItemPrice.id));
+  assert.ok(await db.partyItemPrices.get(priceKey(target.id, targetItem.id)));
+  const mergedCount = (await db.items.get(targetItem.id))?.saleCount;
+  await assert.rejects(
+    () => mergeItems(sourceItem.id, targetItem.id),
+    /already been merged or archived/,
+  );
+  assert.equal((await db.items.get(targetItem.id))?.saleCount, mergedCount);
+  await assert.rejects(
+    () => mergeParties(source.id, target.id),
+    /already been merged/,
+  );
+
+  const unknownSource = { ...sampleItems[0], id: "merge-unknown-source", skuCode: "MERGE-UNKNOWN-A", currentStock: null, isSynced: false };
+  const knownTarget = { ...sampleItems[0], id: "merge-known-target", skuCode: "MERGE-UNKNOWN-B", currentStock: 5, isSynced: false };
+  await db.items.bulkPut([unknownSource, knownTarget]);
+  await mergeItems(unknownSource.id, knownTarget.id);
+  assert.equal((await db.items.get(knownTarget.id))?.currentStock, null);
   assert.ok((await db.activityLogs.count()) >= 2);
+  await db.delete();
+});
+
+test("item merges combine remembered-price histories without losing lock semantics", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const lockedBuyer = await createParty({
+    name: "Merged Locked Price Buyer",
+    type: "customer",
+  });
+  const latestBuyer = await createParty({
+    name: "Merged Latest Price Buyer",
+    type: "customer",
+  });
+  const source = await createQuickItem("Price History Source", 90);
+  const target = await createQuickItem("Price History Target", 80);
+  const rememberedPrice = (
+    partyId: string,
+    itemId: string,
+    lastPrice: number,
+    lastSoldDate: string,
+    timesSold: number,
+    lockedPrice: boolean,
+  ) => ({
+    id: priceKey(partyId, itemId),
+    partyId,
+    itemId,
+    lastPrice,
+    lastSoldDate,
+    timesSold,
+    lockedPrice,
+    updatedAt: `${lastSoldDate}T10:00:00.000Z`,
+    isSynced: true,
+  });
+  const lockedTarget = rememberedPrice(
+    lockedBuyer.id,
+    target.id,
+    100,
+    "2026-08-01",
+    3,
+    true,
+  );
+  const lockedSource = rememberedPrice(
+    lockedBuyer.id,
+    source.id,
+    200,
+    "2026-08-03",
+    2,
+    true,
+  );
+  const latestTarget = rememberedPrice(
+    latestBuyer.id,
+    target.id,
+    110,
+    "2026-08-01",
+    4,
+    true,
+  );
+  const latestSource = rememberedPrice(
+    latestBuyer.id,
+    source.id,
+    210,
+    "2026-08-04",
+    1,
+    false,
+  );
+  await db.partyItemPrices.bulkPut([
+    lockedTarget,
+    lockedSource,
+    latestTarget,
+    latestSource,
+  ]);
+
+  await mergeItems(source.id, target.id);
+  const mergedLocked = await db.partyItemPrices.get(
+    priceKey(lockedBuyer.id, target.id),
+  );
+  const mergedLatest = await db.partyItemPrices.get(
+    priceKey(latestBuyer.id, target.id),
+  );
+  assert.deepEqual(
+    {
+      count: mergedLocked?.timesSold,
+      date: mergedLocked?.lastSoldDate,
+      price: mergedLocked?.lastPrice,
+      locked: mergedLocked?.lockedPrice,
+    },
+    { count: 5, date: "2026-08-03", price: 100, locked: true },
+  );
+  assert.deepEqual(
+    {
+      count: mergedLatest?.timesSold,
+      date: mergedLatest?.lastSoldDate,
+      price: mergedLatest?.lastPrice,
+      locked: mergedLatest?.lockedPrice,
+    },
+    { count: 5, date: "2026-08-04", price: 210, locked: false },
+  );
+  assert.ok(await db.partyItemPrices.get(lockedSource.id));
+  assert.ok(await db.partyItemPrices.get(latestSource.id));
+  await db.delete();
+});
+
+test("paid invoices cannot be deleted and unpaid invoice restore is balance-safe", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const party = await createParty({ name: "Delete Safety Buyer", type: "customer" });
+  const paidInvoice = await saveSale({
+    party,
+    lines: [{ ...sampleInvoiceLine(), rate: 100, gstRate: 0 }],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  const afterBill = await db.parties.get(party.id);
+  assert.ok(afterBill);
+  await recordPayment(afterBill, 40, "cash", "part payment");
+  await assert.rejects(
+    () => softDeleteInvoice(paidInvoice.id),
+    /recorded payment and cannot be deleted/,
+  );
+  assert.equal((await db.invoices.get(paidInvoice.id))?.deletedAt, undefined);
+
+  const unpaidInvoice = await saveSale({
+    party: (await db.parties.get(party.id))!,
+    lines: [{ ...sampleInvoiceLine(), rate: 50, gstRate: 0 }],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  assert.equal((await db.parties.get(party.id))?.currentBalance, 110);
+  await softDeleteInvoice(unpaidInvoice.id);
+  assert.equal((await db.parties.get(party.id))?.currentBalance, 60);
+  await restoreInvoice(unpaidInvoice.id);
+  assert.equal((await db.parties.get(party.id))?.currentBalance, 110);
+
+  const paidAtSave = await saveSale({
+    party: (await db.parties.get(party.id))!,
+    lines: [{ ...sampleInvoiceLine(), rate: 100, gstRate: 0 }],
+    paid: 40,
+    paymentMode: "cash",
+    paymentPlan: "partial",
+  });
+  await assert.rejects(
+    () => softDeleteInvoice(paidAtSave.id),
+    /recorded payment and cannot be deleted/,
+  );
+  assert.equal((await db.invoices.get(paidAtSave.id))?.deletedAt, undefined);
+  await db.invoices.update(paidAtSave.id, {
+    amountPaid: 0,
+    amountDue: paidAtSave.grandTotal,
+  });
+  await assert.rejects(
+    () => softDeleteInvoice(paidAtSave.id),
+    /recorded payment and cannot be deleted/,
+  );
+  await db.invoices.update(paidAtSave.id, {
+    deletedAt: "2026-08-09T12:00:00.000Z",
+    isSynced: true,
+  });
+  await db.parties.update(party.id, { currentBalance: 110, isSynced: true });
+  await reconcilePartyBalances();
+  assert.equal((await db.invoices.get(paidAtSave.id))?.deletedAt, undefined);
+  assert.equal((await db.parties.get(party.id))?.currentBalance, 170);
+  await db.delete();
+});
+
+test("deleting and restoring sales reverses item and remembered-price statistics", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const party = await createParty({
+    name: "Sale Statistics Buyer",
+    type: "customer",
+  });
+  const item = await createQuickItem("Sale Statistics Item", 80);
+  const line = (rate: number): InvoiceLine => ({
+    ...sampleInvoiceLine(),
+    itemId: item.id,
+    itemName: item.name,
+    skuCode: item.skuCode,
+    unit: item.baseUnit,
+    baseUnit: item.baseUnit,
+    rate,
+    gstRate: 0,
+  });
+
+  const first = await saveSale({
+    party,
+    lines: [line(123)],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  assert.deepEqual(
+    {
+      count: (await db.items.get(item.id))?.saleCount,
+      date: (await db.items.get(item.id))?.lastSoldDate,
+      partyCount: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.timesSold,
+      partyPrice: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.lastPrice,
+    },
+    { count: 1, date: first.date, partyCount: 1, partyPrice: 123 },
+  );
+
+  await softDeleteInvoice(first.id);
+  assert.deepEqual(
+    {
+      count: (await db.items.get(item.id))?.saleCount,
+      date: (await db.items.get(item.id))?.lastSoldDate,
+      partyCount: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.timesSold,
+      partyDate: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.lastSoldDate,
+      partyPrice: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.lastPrice,
+    },
+    {
+      count: 0,
+      date: undefined,
+      partyCount: 0,
+      partyDate: "",
+      partyPrice: item.priceWholesale,
+    },
+  );
+
+  await restoreInvoice(first.id);
+  assert.equal((await db.items.get(item.id))?.saleCount, 1);
+  assert.equal((await db.items.get(item.id))?.lastSoldDate, first.date);
+  assert.equal(
+    (await db.partyItemPrices.get(priceKey(party.id, item.id)))?.lastPrice,
+    123,
+  );
+  await db.invoices.update(first.id, {
+    date: "2026-08-01",
+    createdAt: "2026-08-01T10:00:00.000Z",
+  });
+
+  const second = await saveSale({
+    party: (await db.parties.get(party.id))!,
+    lines: [line(175)],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  await softDeleteInvoice(second.id);
+  assert.deepEqual(
+    {
+      count: (await db.items.get(item.id))?.saleCount,
+      date: (await db.items.get(item.id))?.lastSoldDate,
+      partyCount: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.timesSold,
+      partyDate: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.lastSoldDate,
+      partyPrice: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.lastPrice,
+    },
+    {
+      count: 1,
+      date: "2026-08-01",
+      partyCount: 1,
+      partyDate: "2026-08-01",
+      partyPrice: 123,
+    },
+  );
+  await restoreInvoice(second.id);
+  assert.deepEqual(
+    {
+      count: (await db.items.get(item.id))?.saleCount,
+      date: (await db.items.get(item.id))?.lastSoldDate,
+      partyCount: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.timesSold,
+      partyPrice: (await db.partyItemPrices.get(priceKey(party.id, item.id)))
+        ?.lastPrice,
+    },
+    { count: 2, date: second.date, partyCount: 2, partyPrice: 175 },
+  );
+  await db.delete();
+});
+
+test("remembered prices replay consecutive locked sales chronologically", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const party = await createParty({
+    name: "Locked Price Replay Buyer",
+    type: "customer",
+  });
+  const item = await createQuickItem("Locked Price Replay Item", 80);
+  const lockedLine = (rate: number): InvoiceLine => ({
+    ...sampleInvoiceLine(),
+    itemId: item.id,
+    itemName: item.name,
+    skuCode: item.skuCode,
+    unit: item.baseUnit,
+    baseUnit: item.baseUnit,
+    rate,
+    gstRate: 0,
+    lockPrice: true,
+  });
+  await saveSale({
+    party,
+    lines: [lockedLine(100)],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  const laterLockedSale = await saveSale({
+    party: (await db.parties.get(party.id))!,
+    lines: [lockedLine(200)],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  const rememberedId = priceKey(party.id, item.id);
+  assert.deepEqual(
+    {
+      price: (await db.partyItemPrices.get(rememberedId))?.lastPrice,
+      locked: (await db.partyItemPrices.get(rememberedId))?.lockedPrice,
+      count: (await db.partyItemPrices.get(rememberedId))?.timesSold,
+    },
+    { price: 100, locked: true, count: 2 },
+  );
+  await softDeleteInvoice(laterLockedSale.id);
+  assert.deepEqual(
+    {
+      price: (await db.partyItemPrices.get(rememberedId))?.lastPrice,
+      locked: (await db.partyItemPrices.get(rememberedId))?.lockedPrice,
+      count: (await db.partyItemPrices.get(rememberedId))?.timesSold,
+    },
+    { price: 100, locked: true, count: 1 },
+  );
+  await restoreInvoice(laterLockedSale.id);
+  assert.deepEqual(
+    {
+      price: (await db.partyItemPrices.get(rememberedId))?.lastPrice,
+      locked: (await db.partyItemPrices.get(rememberedId))?.lockedPrice,
+      count: (await db.partyItemPrices.get(rememberedId))?.timesSold,
+    },
+    { price: 100, locked: true, count: 2 },
+  );
+  await db.delete();
+});
+
+test("sale deletion follows merged-item alias chains to the active product", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const party = await createParty({
+    name: "Merged Product Buyer",
+    type: "customer",
+  });
+  const source = await createQuickItem("Merged Source Item", 90);
+  const middle = await createQuickItem("Merged Middle Item", 80);
+  const target = await createQuickItem("Merged Target Item", 70);
+  const invoice = await saveSale({
+    party,
+    lines: [{
+      ...sampleInvoiceLine(),
+      itemId: source.id,
+      itemName: source.name,
+      skuCode: source.skuCode,
+      unit: source.baseUnit,
+      baseUnit: source.baseUnit,
+      rate: 155,
+      gstRate: 0,
+    }],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  await mergeItems(source.id, middle.id);
+  await mergeItems(middle.id, target.id);
+  const targetPriceId = priceKey(party.id, target.id);
+  assert.equal((await db.items.get(target.id))?.saleCount, 1);
+  assert.equal((await db.partyItemPrices.get(targetPriceId))?.lastPrice, 155);
+
+  await softDeleteInvoice(invoice.id);
+  assert.deepEqual(
+    {
+      count: (await db.items.get(target.id))?.saleCount,
+      date: (await db.items.get(target.id))?.lastSoldDate,
+      partyCount: (await db.partyItemPrices.get(targetPriceId))?.timesSold,
+      partyDate: (await db.partyItemPrices.get(targetPriceId))?.lastSoldDate,
+      partyPrice: (await db.partyItemPrices.get(targetPriceId))?.lastPrice,
+    },
+    {
+      count: 0,
+      date: undefined,
+      partyCount: 0,
+      partyDate: "",
+      partyPrice: target.priceWholesale,
+    },
+  );
+
+  await restoreInvoice(invoice.id);
+  assert.deepEqual(
+    {
+      count: (await db.items.get(target.id))?.saleCount,
+      date: (await db.items.get(target.id))?.lastSoldDate,
+      partyCount: (await db.partyItemPrices.get(targetPriceId))?.timesSold,
+      partyDate: (await db.partyItemPrices.get(targetPriceId))?.lastSoldDate,
+      partyPrice: (await db.partyItemPrices.get(targetPriceId))?.lastPrice,
+    },
+    {
+      count: 1,
+      date: invoice.date,
+      partyCount: 1,
+      partyDate: invoice.date,
+      partyPrice: 155,
+    },
+  );
+  await db.delete();
+});
+
+test("invoice cost snapshots keep historical profit stable after a product edit", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const party = await createParty({ name: "Historical Cost Buyer", type: "customer" });
+  const item = await db.items.get(sampleItems[0].id);
+  assert.ok(item);
+  const invoice = await saveSale({
+    party,
+    lines: [{ ...sampleInvoiceLine(), qty: 2, gstRate: 0 }],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  const snapshottedCost = invoice.lineItems[0].unitCost;
+  assert.equal(snapshottedCost, item.purchasePrice);
+  await db.items.update(item.id, { purchasePrice: item.purchasePrice + 500 });
+  const report = buildItemProfitReport(
+    [invoice],
+    await db.items.toArray(),
+  );
+  assert.equal(report[0].cost, snapshottedCost! * 2);
   await db.delete();
 });
 
@@ -1959,10 +3120,168 @@ test("daily closing separates customer cash, supplier cash and expenses", async 
   await db.delete();
 });
 
+test("expense and daily-close validation reject impossible dates and non-finite cash", async () => {
+  await db.delete();
+  await db.open();
+  await assert.rejects(
+    () => recordExpense({
+      category: "other",
+      amount: 10,
+      date: "2026-02-31",
+      description: "Impossible date",
+      paymentMode: "cash",
+    }),
+    /valid expense date/,
+  );
+  await assert.rejects(
+    () => saveDailyClose({
+      date: "2026-02-31",
+      openingCash: 0,
+      expectedCash: 0,
+      countedCash: 0,
+      notes: "",
+    }),
+    /valid closing date/,
+  );
+  for (const input of [
+    { openingCash: Number.POSITIVE_INFINITY, expectedCash: 0, countedCash: 0 },
+    { openingCash: 0, expectedCash: Number.NaN, countedCash: 0 },
+    { openingCash: 0, expectedCash: 0, countedCash: Number.POSITIVE_INFINITY },
+  ]) {
+    await assert.rejects(
+      () => saveDailyClose({ date: "2026-08-09", ...input, notes: "" }),
+      /finite|could not be calculated/,
+    );
+  }
+  const negativeExpected = await saveDailyClose({
+    date: "2026-08-09",
+    openingCash: 0,
+    expectedCash: -25,
+    countedCash: 0,
+    notes: "Cash source needs review",
+  });
+  assert.equal(negativeExpected.expectedCash, -25);
+  assert.equal(negativeExpected.discrepancy, 25);
+  assert.equal(await db.expenses.count(), 0);
+  await db.delete();
+});
+
+test("daily closing counts initial invoice money once and keeps later payment channels", async () => {
+  await db.delete();
+  await db.open();
+  const customer = await createParty({
+    name: "Daily Channel Buyer",
+    type: "customer",
+  });
+  const invoice = await saveSale({
+    party: customer,
+    lines: [{ ...sampleInvoiceLine(), rate: 100, gstRate: 0 }],
+    paid: 40,
+    paymentMode: "cash",
+    paymentPlan: "partial",
+  });
+  const afterSale = await db.parties.get(customer.id);
+  assert.ok(afterSale);
+  const laterUpi = await recordPayment(
+    afterSale,
+    30,
+    "upi",
+    "later online payment",
+  );
+  const storedInvoice = await db.invoices.get(invoice.id);
+  assert.ok(storedInvoice);
+  assert.equal(storedInvoice.amountPaid, 70);
+
+  const summary = dailyCashSummary(
+    invoice.date,
+    [storedInvoice],
+    [laterUpi],
+    [],
+    0,
+    await db.parties.toArray(),
+  );
+  assert.deepEqual(
+    {
+      invoiceCash: summary.invoiceCash,
+      customerCash: summary.customerCash,
+      upiIn: summary.upiIn,
+      bankIn: summary.bankIn,
+      expectedCash: summary.expectedCash,
+    },
+    {
+      invoiceCash: 40,
+      customerCash: 0,
+      upiIn: 30,
+      bankIn: 0,
+      expectedCash: 40,
+    },
+  );
+  const legacyMixedSummary = dailyCashSummary(
+    invoice.date,
+    [{
+      ...storedInvoice,
+      paymentMode: "mixed",
+      paymentReceivedMode: undefined,
+    }],
+    [laterUpi],
+    [],
+    0,
+    await db.parties.toArray(),
+  );
+  assert.equal(legacyMixedSummary.invoiceCash, 40);
+  assert.equal(legacyMixedSummary.expectedCash, 40);
+  await db.delete();
+});
+
+test("daily closing includes cash purchases and returns in drawer cash", () => {
+  const stamp = "2026-08-09T12:00:00.000Z";
+  const invoice = (id: string, type: Invoice["type"], amount: number): Invoice => ({
+    id,
+    invoiceNumber: id.toUpperCase(),
+    partyName: "Counterparty",
+    date: "2026-08-09",
+    type,
+    lineItems: [],
+    subtotal: amount,
+    discountTotal: 0,
+    gstTotal: 0,
+    otherCharges: [],
+    otherChargesTotal: 0,
+    roundOff: 0,
+    grandTotal: amount,
+    initialAmountPaid: amount,
+    amountPaid: amount,
+    amountDue: 0,
+    paymentMode: "cash",
+    paymentReceivedMode: "cash",
+    notes: "",
+    isSynced: false,
+    createdAt: stamp,
+    updatedAt: stamp,
+  });
+  const summary = dailyCashSummary(
+    "2026-08-09",
+    [
+      invoice("sale-cash", "sale", 100),
+      invoice("purchase-cash", "purchase", 40),
+      invoice("sale-return-cash", "sale_return", 10),
+      invoice("purchase-return-cash", "purchase_return", 15),
+    ],
+    [],
+    [],
+    50,
+  );
+  assert.equal(summary.invoiceCash, 115);
+  assert.equal(summary.invoiceCashOut, 50);
+  assert.equal(summary.expectedCash, 115);
+});
+
 function pagedSupabase(initial: Record<string, Record<string, unknown>[]>) {
   const tables = new Map(Object.entries(initial).map(([name, rows]) => [name, new Map(rows.map((row) => [String(row.id), structuredClone(row)]))]));
   const ranges: Record<string, number> = {};
   const batches: Record<string, number[]> = {};
+  const batchBytes: Record<string, number[]> = {};
+  const orders: Record<string, string[]> = {};
   const table = (name: string) => { if (!tables.has(name)) tables.set(name, new Map()); return tables.get(name)!; };
   const client = {
     auth: {
@@ -1971,13 +3290,35 @@ function pagedSupabase(initial: Record<string, Record<string, unknown>[]>) {
       signInAnonymously: async () => ({ data: { session: null }, error: null }),
     },
     from: (name: string) => ({
-      upsert: async (rows: Record<string, unknown>[]) => { batches[name] ||= []; batches[name].push(rows.length); for (const row of rows) table(name).set(String(row.id), structuredClone(row)); return { data: null, error: null }; },
-      select: () => ({
-        range: async (from: number, to: number) => { ranges[name] = (ranges[name] || 0) + 1; const rows = [...table(name).values()].slice(from, to + 1).map((row) => structuredClone(row)); return { data: rows, error: null }; },
-      }),
+      upsert: async (rows: Record<string, unknown>[]) => {
+        batches[name] ||= [];
+        batchBytes[name] ||= [];
+        batches[name].push(rows.length);
+        batchBytes[name].push(Buffer.byteLength(JSON.stringify(rows)));
+        for (const row of rows) table(name).set(String(row.id), structuredClone(row));
+        return { data: null, error: null };
+      },
+      select: () => {
+        const query = {
+          order(column: string) {
+            orders[name] ||= [];
+            orders[name].push(column);
+            return query;
+          },
+          async range(from: number, to: number) {
+            ranges[name] = (ranges[name] || 0) + 1;
+            const rows = [...table(name).values()]
+              .sort((left, right) => String(left.id).localeCompare(String(right.id)))
+              .slice(from, to + 1)
+              .map((row) => structuredClone(row));
+            return { data: rows, error: null };
+          },
+        };
+        return query;
+      },
     }),
   } as unknown as Parameters<typeof syncWithClient>[0];
-  return { client, ranges, batches, rows: (name: string) => [...table(name).values()] };
+  return { client, ranges, batches, batchBytes, orders, rows: (name: string) => [...table(name).values()] };
 }
 
 const remoteItem = (index: number): Record<string, unknown> => ({
@@ -2013,13 +3354,66 @@ test("sync downloads 2,501 products by page and uploads large changes in bounded
   assert.equal(await syncWithClient(cloud.client), "synced");
   assert.equal(await db.items.count(), 2501);
   assert.equal(cloud.ranges.items, 6);
+  assert.deepEqual(cloud.orders.items, Array(6).fill("id"));
   const changed = (await db.items.limit(205).toArray()).map((item, index) => ({ ...item, priceWholesale: 100 + index, updatedAt: "2026-12-01T00:00:00.000Z", isSynced: false }));
   await db.items.bulkPut(changed);
   assert.equal(await syncWithClient(cloud.client), "synced");
   assert.deepEqual(cloud.batches.items, [100, 100, 5]);
+  const pushed = cloud.rows("items").filter((row) => changed.some((item) => item.id === row.id));
+  assert.ok(pushed.every((row) => row.business_id === "7bdebe348faeda556a3005c310de23f8744f21cd7a0b3c9d8a745ef85695219a"));
+  assert.ok(pushed.every((row) => row.business_id !== "test-business-sync-code-1234567890"));
+
+  const imageChanged = changed.slice(0, 20).map((item, index) => ({
+    ...item,
+    imageUrl: `data:image/jpeg;base64,${"a".repeat(96_000)}`,
+    updatedAt: `2026-12-02T00:00:${String(index).padStart(2, "0")}.000Z`,
+    isSynced: false,
+  }));
+  await db.items.bulkPut(imageChanged);
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  assert.equal(cloud.batches.items.slice(3).reduce((sum, value) => sum + value, 0), 20);
+  assert.ok(cloud.batches.items.slice(3).every((size) => size < 100));
+  assert.ok(cloud.batchBytes.items.every((size) => size <= 900_000));
   assert.equal(await pendingCount(), 0);
   const info = await syncDiagnostics();
   assert.equal(info.totalPending, 0);
+
+  const oversized = {
+    ...(await db.items.get(imageChanged[0].id))!,
+    imageUrl: `data:image/jpeg;base64,${"b".repeat(950_000)}`,
+    updatedAt: "2026-12-03T00:00:00.000Z",
+    isSynced: false,
+  };
+  await db.items.put(oversized);
+  const batchesBeforeOversized = cloud.batches.items.length;
+  assert.equal(await syncWithClient(cloud.client), "pending");
+  assert.equal(cloud.batches.items.length, batchesBeforeOversized);
+  assert.equal((await db.items.get(oversized.id))?.isSynced, false);
+  await db.delete();
+});
+
+test("cloud payments with a legacy null allocation list normalize safely", async () => {
+  await db.delete();
+  await db.open();
+  const stamp = "2026-08-09T12:00:00.000Z";
+  const cloud = pagedSupabase({
+    payments: [{
+      id: "legacy-null-allocation",
+      party_id: "legacy-party",
+      amount: 10,
+      date: "2026-08-09",
+      mode: "cash",
+      reference: "legacy",
+      allocated_to: null,
+      created_at: stamp,
+      updated_at: stamp,
+    }],
+  });
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  assert.deepEqual(
+    (await db.payments.get("legacy-null-allocation"))?.allocatedTo,
+    [],
+  );
   await db.delete();
 });
 
@@ -2040,6 +3434,396 @@ test("ledger reconciliation repairs a corrupted party balance from canonical eve
   assert.notEqual(repaired.currentBalance, 999999);
   assert.equal(repaired.currentBalance, party.openingBalance + invoice.amountDue - Math.min(100, party.openingBalance + invoice.amountDue));
   await db.delete();
+});
+
+test("ledger reconciliation merges concurrent payment events and restores legacy paid deletions", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const party = await createParty({ name: "Concurrent Payment Buyer", type: "customer" });
+  const invoice = await saveSale({
+    party,
+    lines: [{ ...sampleInvoiceLine(), rate: 100, gstRate: 0 }],
+    paid: 0,
+    paymentMode: "credit",
+    paymentPlan: "credit",
+  });
+  const firstStamp = "2026-08-09T10:00:00.000Z";
+  const secondStamp = "2026-08-09T10:01:00.000Z";
+  const payments: Payment[] = [
+    {
+      id: "device-a-payment",
+      partyId: party.id,
+      amount: 30,
+      date: invoice.date,
+      mode: "cash",
+      reference: "device A",
+      allocatedTo: [{ invoiceId: invoice.id, amount: 30 }],
+      createdAt: firstStamp,
+      updatedAt: firstStamp,
+      isSynced: true,
+    },
+    {
+      id: "device-b-payment",
+      partyId: party.id,
+      amount: 40,
+      date: invoice.date,
+      mode: "upi",
+      reference: "device B",
+      allocatedTo: [{ invoiceId: invoice.id, amount: 40 }],
+      createdAt: secondStamp,
+      updatedAt: secondStamp,
+      isSynced: true,
+    },
+  ];
+  await db.payments.bulkPut(payments);
+  await db.invoices.update(invoice.id, {
+    amountPaid: 40,
+    amountDue: 60,
+    deletedAt: secondStamp,
+    isSynced: true,
+  });
+  await db.parties.update(party.id, { currentBalance: 999, isSynced: true });
+  await reconcilePartyBalances();
+  const repairedInvoice = await db.invoices.get(invoice.id);
+  assert.equal(repairedInvoice?.deletedAt, undefined);
+  assert.equal(repairedInvoice?.amountPaid, 70);
+  assert.equal(repairedInvoice?.amountDue, 30);
+  assert.equal((await db.parties.get(party.id))?.currentBalance, 30);
+  await db.delete();
+});
+
+test("cloud configuration is device-bound and disconnect overrides stored settings", async () => {
+  await db.delete();
+  await db.open();
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, String(value)); },
+    removeItem: (key: string) => { values.delete(key); },
+    clear: () => values.clear(),
+    key: (index: number) => [...values.keys()][index] ?? null,
+    get length() { return values.size; },
+  };
+  const existing = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
+  try {
+    const original = {
+      url: "https://example.supabase.co",
+      key: "public-anon-key",
+      syncCode: "first-business-code-1234567890",
+    };
+    await configureCloud(original);
+    assert.deepEqual(getCloudConfig(), original);
+    await db.items.put({ ...sampleItems[0], id: "cloud-bound-item" });
+    await assert.rejects(
+      () => configureCloud({ ...original, syncCode: "second-business-code-1234567890" }),
+      /another cloud business/,
+    );
+    const activeClient = supabaseClient();
+    assert.ok(activeClient);
+    let stopped = 0;
+    let signedOut = 0;
+    activeClient.removeAllChannels = async () => { throw new Error("channel cleanup failed"); };
+    activeClient.auth.stopAutoRefresh = async () => { stopped += 1; };
+    activeClient.auth.signOut = async () => { signedOut += 1; return { error: null }; };
+    await clearCloudConfig();
+    assert.equal(stopped, 1);
+    assert.equal(signedOut, 1);
+    assert.deepEqual(getCloudConfig(), { url: "", key: "", syncCode: "" });
+  } finally {
+    if (existing) Object.defineProperty(globalThis, "localStorage", existing);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+    await db.delete();
+  }
+});
+
+test("restricted DOM storage cannot crash offline startup or half-bind a cloud business", async () => {
+  await db.delete();
+  await db.open();
+  const existingStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const envKeys = ["NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_ANON_KEY"] as const;
+  const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  for (const key of envKeys) delete process.env[key];
+  const deniedStorage = {
+    getItem: () => { throw new DOMException("storage denied", "SecurityError"); },
+    setItem: () => { throw new DOMException("storage denied", "SecurityError"); },
+    removeItem: () => { throw new DOMException("storage denied", "SecurityError"); },
+  };
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: deniedStorage,
+  });
+  try {
+    assert.deepEqual(getCloudConfig(), { url: "", key: "", syncCode: "" });
+    await assert.rejects(
+      () => configureCloud({
+        url: "https://restricted.supabase.co",
+        key: "public-anon-key",
+        syncCode: "restricted-storage-code-1234567890",
+      }),
+      /could not be saved/,
+    );
+    assert.equal(
+      await db.meta.get("cloud-business-fingerprint-v1"),
+      undefined,
+    );
+  } finally {
+    for (const key of envKeys) {
+      const value = previousEnv[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    if (existingStorage)
+      Object.defineProperty(globalThis, "localStorage", existingStorage);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+    await db.delete();
+  }
+});
+
+test("cloud configuration rolls back when writing succeeds but clearing the disconnect tombstone fails", async () => {
+  await db.delete();
+  await db.open();
+  const configKey = "mantu-supabase-config-v1";
+  const disabledKey = "mantu-supabase-disabled-v1";
+  const original = {
+    url: "https://original.supabase.co",
+    key: "original-public-key",
+    syncCode: "original-business-code-1234567890",
+  };
+  const replacement = {
+    url: "https://replacement.supabase.co",
+    key: "replacement-public-key",
+    syncCode: "replacement-business-code-1234567890",
+  };
+  const values = new Map<string, string>([
+    [configKey, JSON.stringify(original)],
+    [disabledKey, "true"],
+  ]);
+  let rejectRemovals = true;
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      values.set(key, String(value));
+    },
+    removeItem: (key: string) => {
+      if (rejectRemovals)
+        throw new DOMException("remove denied", "SecurityError");
+      values.delete(key);
+    },
+    clear: () => values.clear(),
+    key: (index: number) => [...values.keys()][index] ?? null,
+    get length() {
+      return values.size;
+    },
+  };
+  const existing = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: storage,
+  });
+  try {
+    assert.deepEqual(getCloudConfig(), { url: "", key: "", syncCode: "" });
+    await assert.rejects(
+      () => configureCloud(replacement),
+      /could not be saved/,
+    );
+    assert.equal(values.get(configKey), JSON.stringify(original));
+    assert.equal(values.get(disabledKey), "true");
+    assert.equal(
+      await db.meta.get("cloud-business-fingerprint-v1"),
+      undefined,
+    );
+
+    rejectRemovals = false;
+    await configureCloud(replacement);
+    assert.deepEqual(getCloudConfig(), replacement);
+    await clearCloudConfig();
+  } finally {
+    if (existing) Object.defineProperty(globalThis, "localStorage", existing);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+    await db.delete();
+  }
+});
+
+test("a disconnect that cannot persist remains disabled for the current session", async () => {
+  await db.delete();
+  await db.open();
+  const values = new Map<string, string>();
+  let rejectWrites = false;
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      if (rejectWrites)
+        throw new DOMException("write denied", "SecurityError");
+      values.set(key, String(value));
+    },
+    removeItem: (key: string) => {
+      if (rejectWrites)
+        throw new DOMException("remove denied", "SecurityError");
+      values.delete(key);
+    },
+    clear: () => values.clear(),
+    key: (index: number) => [...values.keys()][index] ?? null,
+    get length() {
+      return values.size;
+    },
+  };
+  const existing = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: storage,
+  });
+  const config = {
+    url: "https://disconnect.supabase.co",
+    key: "disconnect-public-key",
+    syncCode: "disconnect-business-code-1234567890",
+  };
+  try {
+    await configureCloud(config);
+    assert.ok(supabaseClient());
+    rejectWrites = true;
+    await assert.rejects(
+      () => clearCloudConfig(),
+      /stopped for this session/,
+    );
+    assert.deepEqual(getCloudConfig(), { url: "", key: "", syncCode: "" });
+    assert.equal(supabaseClient(), null);
+
+    // Reset the module-level fail-closed state for following tests after the
+    // simulated device storage becomes writable again.
+    rejectWrites = false;
+    await configureCloud(config);
+    await clearCloudConfig();
+  } finally {
+    if (existing) Object.defineProperty(globalThis, "localStorage", existing);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+    await db.delete();
+  }
+});
+
+test("client-public environment variables cannot embed a tenant credential", async () => {
+  await db.delete();
+  await db.open();
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, String(value)); },
+    removeItem: (key: string) => { values.delete(key); },
+    clear: () => values.clear(),
+    key: (index: number) => [...values.keys()][index] ?? null,
+    get length() { return values.size; },
+  };
+  const existingStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const envKeys = [
+    "NEXT_PUBLIC_SUPABASE_URL",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+    "NEXT_PUBLIC_SUPABASE_SYNC_CODE",
+  ] as const;
+  const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
+  process.env.NEXT_PUBLIC_SUPABASE_URL = "https://env-project.supabase.co";
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "env-public-anon-key";
+  process.env.NEXT_PUBLIC_SUPABASE_SYNC_CODE = "sentinel-private-code-must-be-ignored";
+  try {
+    assert.deepEqual(getCloudConfig(), {
+      url: "https://env-project.supabase.co",
+      key: "env-public-anon-key",
+      syncCode: "",
+    });
+    assert.equal(supabaseClient(), null);
+  } finally {
+    for (const key of envKeys) {
+      const value = previousEnv[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    if (existingStorage) Object.defineProperty(globalThis, "localStorage", existingStorage);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+    await db.delete();
+  }
+});
+
+test("cloud tenant changes wait for an active sync and recheck downloaded data", async () => {
+  await db.delete();
+  await db.open();
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, String(value)); },
+    removeItem: (key: string) => { values.delete(key); },
+    clear: () => values.clear(),
+    key: (index: number) => [...values.keys()][index] ?? null,
+    get length() { return values.size; },
+  };
+  const existingStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
+  const codeA = "tenant-a-business-code-1234567890";
+  const configA = {
+    url: "https://tenant-a.supabase.co",
+    key: "tenant-a-public-key",
+    syncCode: codeA,
+  };
+  let releasePull!: () => void;
+  const pullGate = new Promise<void>((resolve) => { releasePull = resolve; });
+  let signalPullStarted!: () => void;
+  const pullStarted = new Promise<void>((resolve) => { signalPullStarted = resolve; });
+  let signaled = false;
+  const stamp = "2026-08-09T12:00:00.000Z";
+  const delayedClient = {
+    auth: {
+      getSession: async () => ({ data: { session: { user: { user_metadata: { sync_code: codeA } } } } }),
+      signOut: async () => ({ error: null }),
+      signInAnonymously: async () => ({ data: { session: null }, error: null }),
+    },
+    from: (table: string) => ({
+      upsert: async () => ({ data: null, error: null }),
+      select: async () => {
+        if (!signaled) { signaled = true; signalPullStarted(); }
+        await pullGate;
+        return {
+          data: table === "parties" ? [{
+            id: "tenant-a-party",
+            name: "Tenant A Buyer",
+            code_name: "TENANT-A",
+            phone: "",
+            address: "",
+            type: "customer",
+            price_tier: "wholesale",
+            opening_balance: 0,
+            current_balance: 0,
+            notes: "",
+            tags: [],
+            created_at: stamp,
+            updated_at: stamp,
+          }] : [],
+          error: null,
+        };
+      },
+    }),
+  } as unknown as Parameters<typeof syncWithClient>[0];
+  try {
+    await configureCloud(configA);
+    const syncing = syncWithClient(delayedClient);
+    await pullStarted;
+    let switchSettled = false;
+    const switching = configureCloud({
+      url: "https://tenant-b.supabase.co",
+      key: "tenant-b-public-key",
+      syncCode: "tenant-b-business-code-1234567890",
+    }).finally(() => { switchSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(switchSettled, false);
+    releasePull();
+    assert.equal(await syncing, "synced");
+    await assert.rejects(switching, /another cloud business/);
+    assert.equal((await db.parties.get("tenant-a-party"))?.name, "Tenant A Buyer");
+    assert.deepEqual(getCloudConfig(), configA);
+  } finally {
+    if (existingStorage) Object.defineProperty(globalThis, "localStorage", existingStorage);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+    await db.delete();
+  }
 });
 
 test("ledger reconciliation also rebuilds supplier purchase payables", async () => {

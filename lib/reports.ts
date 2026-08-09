@@ -122,7 +122,7 @@ export function buildPartySalesReport(invoices: Invoice[], parties: Party[], ran
     const row = rows.get(key) || {
       partyId: invoice.partyId,
       partyName: party?.name || invoice.partyName || "Cash customer",
-      codeName: party?.codeName || "CASH",
+      codeName: party ? party.codeName : "CASH",
       bills: 0,
       revenue: 0,
       paid: 0,
@@ -153,12 +153,18 @@ export function buildItemProfitReport(invoices: Invoice[], items: Item[], range:
       };
       const taxable = taxableForLine(line);
       existing.row.revenueBeforeGst = roundMoney(existing.row.revenueBeforeGst + taxable);
-      if (!item || item.purchasePrice <= 0) {
+      const costPerUnit =
+        line.unitCost != null
+          ? line.unitCost
+          : item
+            ? convertUnitRate(item.purchasePrice, item.baseUnit, line.unit)
+            : null;
+      if (costPerUnit == null || costPerUnit <= 0) {
         existing.row.cost = null;
         existing.row.profit = null;
         existing.row.marginPercent = null;
       } else if (existing.row.cost !== null) {
-        const cost = roundMoney(convertUnitRate(item.purchasePrice, item.baseUnit, line.unit) * line.qty);
+        const cost = roundMoney(costPerUnit * line.qty);
         existing.row.cost = roundMoney(existing.row.cost + cost);
         existing.row.profit = roundMoney(existing.row.revenueBeforeGst - existing.row.cost);
         existing.row.marginPercent = existing.row.revenueBeforeGst > 0 ? roundMoney(existing.row.profit / existing.row.revenueBeforeGst * 100) : 0;
@@ -251,7 +257,7 @@ export function buildDeadStockReport(invoices: Invoice[], items: Item[], asOfDat
       lastSaleDate,
       daysWithoutSale,
       currentStock: item.currentStock,
-      stockValue: item.currentStock == null ? null : roundMoney(item.currentStock * item.purchasePrice)
+      stockValue: item.currentStock == null || item.purchasePrice <= 0 ? null : roundMoney(item.currentStock * item.purchasePrice)
     };
   }).filter((row) => row.daysWithoutSale == null || row.daysWithoutSale >= inactiveDays)
     .sort((a, b) => (b.daysWithoutSale ?? Number.MAX_SAFE_INTEGER) - (a.daysWithoutSale ?? Number.MAX_SAFE_INTEGER) || a.itemName.localeCompare(b.itemName));

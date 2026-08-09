@@ -1,22 +1,34 @@
 import {
   db,
+  isValidLocalDate,
   makeId,
   nowIso,
+  priceKey,
   type ActivityLog,
+  type BillingCustomerDraft,
   type DailyClose,
   type Expense,
   type Invoice,
   type InvoiceCharge,
   type InvoiceLine,
+  type InvoicePaymentAllocation,
   type Item,
+  type Language,
   type Party,
+  type PartyItemPrice,
   type Payment,
   type PaymentChannel,
   type Unit,
 } from "./db";
-import { roundMoney } from "./billing";
+import {
+  invoiceInitialPaymentBreakdown,
+  normalizePartyIdentity,
+  normalizePhoneDigits,
+  roundMoney,
+} from "./billing";
 
 export const OWNER_PIN_META = "owner-pin-sha256-v1";
+const OWNER_PIN_LOCKOUT_META = "owner-pin-lockout-v1";
 export const BILL_DRAFT_META = "bill-draft-v1";
 export const WORKSPACE_META = "workspace-preferences-v1";
 export const PRINTER_PROFILES_META = "printer-profiles-v1";
@@ -44,9 +56,12 @@ export interface BillDraft {
   draftId: string;
   savedAt: string;
   partyId?: string;
+  customerDraft?: BillingCustomerDraft;
   lines: InvoiceLine[];
   paid: number;
   paymentMode: PaymentChannel;
+  splitPayment?: boolean;
+  paymentBreakdown?: InvoicePaymentAllocation[];
   paymentPlan: "full" | "partial" | "credit";
   documentType: "sale" | "quotation";
   gstEnabled: boolean;
@@ -71,6 +86,90 @@ export const defaultMessageTemplates: MessageTemplates = {
   payment: "Payment of {{paid}} received from {{party_name}} on {{payment_date}}. Remaining balance: {{due}}. Thank you — {{shop_name}}.",
   catalogue: "Sharing the latest {{shop_name}} price catalogue.",
 };
+
+export const localizedDefaultMessageTemplates: Record<Language, MessageTemplates> = {
+  en: defaultMessageTemplates,
+  hi: {
+    invoice:
+      "नमस्ते {{party_name}}, {{shop_name}} का बिल {{invoice_number}} कुल {{total}} है। पेमेंट {{paid}}; बाकी {{due}}।",
+    quotation:
+      "नमस्ते {{party_name}}, {{shop_name}} का कोटेशन {{invoice_number}} कुल {{total}} है।",
+    due:
+      "नमस्ते {{party_name}} ({{party_code}}), {{shop_name}} में आपका बाकी {{due}} है। स्टेटमेंट चाहिए तो हमसे संपर्क करें।",
+    payment:
+      "{{party_name}} से {{payment_date}} को {{paid}} का पेमेंट मिला। बाकी: {{due}}। धन्यवाद — {{shop_name}}।",
+    catalogue: "{{shop_name}} का नया प्राइस कैटलॉग शेयर किया जा रहा है।",
+  },
+  bn: {
+    invoice:
+      "নমস্কার {{party_name}}, {{shop_name}}-এর বিল {{invoice_number}}-এর মোট {{total}}। পেমেন্ট {{paid}}; বাকি {{due}}।",
+    quotation:
+      "নমস্কার {{party_name}}, {{shop_name}}-এর কোটেশন {{invoice_number}}-এর মোট {{total}}।",
+    due:
+      "নমস্কার {{party_name}} ({{party_code}}), {{shop_name}}-এ আপনার বাকি {{due}}। স্টেটমেন্ট চাইলে আমাদের সঙ্গে যোগাযোগ করুন।",
+    payment:
+      "{{party_name}}-এর কাছ থেকে {{payment_date}} তারিখে {{paid}} পেমেন্ট পাওয়া গেছে। বাকি: {{due}}। ধন্যবাদ — {{shop_name}}।",
+    catalogue: "{{shop_name}}-এর নতুন প্রাইস ক্যাটালগ শেয়ার করা হচ্ছে।",
+  },
+};
+
+export function messageTemplatesForLanguage(
+  language: Language,
+  templates: MessageTemplates,
+): MessageTemplates {
+  const defaults = localizedDefaultMessageTemplates[language];
+  return {
+    invoice:
+      templates.invoice === defaultMessageTemplates.invoice
+        ? defaults.invoice
+        : templates.invoice,
+    quotation:
+      templates.quotation === defaultMessageTemplates.quotation
+        ? defaults.quotation
+        : templates.quotation,
+    due:
+      templates.due === defaultMessageTemplates.due
+        ? defaults.due
+        : templates.due,
+    payment:
+      templates.payment === defaultMessageTemplates.payment
+        ? defaults.payment
+        : templates.payment,
+    catalogue:
+      templates.catalogue === defaultMessageTemplates.catalogue
+        ? defaults.catalogue
+        : templates.catalogue,
+  };
+}
+
+export function canonicalizeMessageTemplates(
+  language: Language,
+  templates: MessageTemplates,
+): MessageTemplates {
+  const localized = localizedDefaultMessageTemplates[language];
+  return {
+    invoice:
+      templates.invoice === localized.invoice
+        ? defaultMessageTemplates.invoice
+        : templates.invoice,
+    quotation:
+      templates.quotation === localized.quotation
+        ? defaultMessageTemplates.quotation
+        : templates.quotation,
+    due:
+      templates.due === localized.due
+        ? defaultMessageTemplates.due
+        : templates.due,
+    payment:
+      templates.payment === localized.payment
+        ? defaultMessageTemplates.payment
+        : templates.payment,
+    catalogue:
+      templates.catalogue === localized.catalogue
+        ? defaultMessageTemplates.catalogue
+        : templates.catalogue,
+  };
+}
 
 export function safeJsonParse<T>(value: unknown, fallback: T): T {
   try { return value ? JSON.parse(String(value)) as T : fallback; } catch { return fallback; }
@@ -140,6 +239,14 @@ function sha256Bytes(message: Uint8Array) {
   return output;
 }
 
+/** Deterministic SHA-256 for identifiers; works in WebViews without SubtleCrypto. */
+export function sha256Hex(value: string) {
+  return Array.from(
+    sha256Bytes(new TextEncoder().encode(value)),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
 function concatBytes(...chunks: Uint8Array[]) {
   const output = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
   let offset = 0;
@@ -199,7 +306,10 @@ export async function setOwnerPin(pin: string) {
   const salt = Array.from(saltBytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
   const iterations = 120_000;
   const hash = await hashOwnerPin(pin, salt, iterations);
-  await db.meta.put({ key: OWNER_PIN_META, value: JSON.stringify({ version: 1, salt, iterations, hash }) });
+  await db.transaction("rw", db.meta, async () => {
+    await db.meta.put({ key: OWNER_PIN_META, value: JSON.stringify({ version: 1, salt, iterations, hash }) });
+    await db.meta.delete(OWNER_PIN_LOCKOUT_META);
+  });
 }
 
 export async function ownerPinConfigured() {
@@ -207,12 +317,34 @@ export async function ownerPinConfigured() {
 }
 
 export async function verifyOwnerPin(pin: string) {
+  const now = Date.now();
+  const lockout = safeJsonParse<{ failures?: number; lockedUntil?: number }>(
+    (await db.meta.get(OWNER_PIN_LOCKOUT_META))?.value,
+    {},
+  );
+  if (Number(lockout.lockedUntil || 0) > now) {
+    const seconds = Math.max(1, Math.ceil((Number(lockout.lockedUntil) - now) / 1000));
+    throw new Error(`Owner PIN is temporarily locked. Try again in ${seconds} seconds.`);
+  }
   const saved = safeJsonParse<{ salt?: string; iterations?: number; hash?: string }>(
     (await db.meta.get(OWNER_PIN_META))?.value,
     {},
   );
   if (!saved.salt || !saved.hash) return false;
-  return saved.hash === await hashOwnerPin(pin, saved.salt, saved.iterations || 120_000);
+  const matches = saved.hash === await hashOwnerPin(pin, saved.salt, saved.iterations || 120_000);
+  if (matches) {
+    await db.meta.delete(OWNER_PIN_LOCKOUT_META);
+    return true;
+  }
+  const failures = Math.max(0, Number(lockout.failures || 0)) + 1;
+  const cooldown = failures >= 5
+    ? Math.min(15 * 60_000, 30_000 * 2 ** Math.min(5, failures - 5))
+    : 0;
+  await db.meta.put({
+    key: OWNER_PIN_LOCKOUT_META,
+    value: JSON.stringify({ failures, lockedUntil: cooldown ? now + cooldown : 0 }),
+  });
+  return false;
 }
 
 export async function saveBillDraft(draft: Omit<BillDraft, "version" | "savedAt">) {
@@ -256,21 +388,20 @@ export function withVariantFamily(tags: string[], family: string) {
   return family.trim() ? [...clean, `family:${family.trim()}`] : clean;
 }
 
-const normal = (value: string) => value.toLowerCase().replace(/[^a-z0-9\u0900-\u097f\u0980-\u09ff]/g, "");
 export function partyDuplicateCandidates(candidate: Pick<Party, "id" | "name" | "phone" | "codeName">, parties: Party[]) {
-  const name = normal(candidate.name);
-  const phone = candidate.phone.replace(/\D/g, "");
+  const name = normalizePartyIdentity(candidate.name);
+  const phone = normalizePhoneDigits(candidate.phone);
   return parties.filter((party) => party.id !== candidate.id && !party.tags.some((tag) => tag.startsWith("mergedInto:")) && (
-    (name.length > 3 && normal(party.name) === name) ||
-    (phone.length >= 8 && party.phone.replace(/\D/g, "") === phone) ||
+    (name.length > 3 && normalizePartyIdentity(party.name) === name) ||
+    (phone.length >= 8 && normalizePhoneDigits(party.phone) === phone) ||
     (candidate.codeName && party.codeName.toLowerCase() === candidate.codeName.toLowerCase())
   ));
 }
 
 export function itemDuplicateCandidates(candidate: Pick<Item, "id" | "name" | "skuCode">, items: Item[]) {
-  const name = normal(candidate.name);
+  const name = normalizePartyIdentity(candidate.name);
   return items.filter((item) => item.id !== candidate.id && item.isActive && (
-    (name.length > 3 && normal(item.name) === name) ||
+    (name.length > 3 && normalizePartyIdentity(item.name) === name) ||
     (candidate.skuCode && item.skuCode.toLowerCase() === candidate.skuCode.toLowerCase())
   ));
 }
@@ -291,24 +422,74 @@ export async function mergeParties(sourceId: string, targetId: string, actor: Ac
   return db.transaction("rw", [db.parties, db.invoices, db.payments, db.accountEntries, db.partyItemPrices, db.activityLogs], async () => {
     const [source, target] = await Promise.all([db.parties.get(sourceId), db.parties.get(targetId)]);
     if (!source || !target) throw new Error("Party could not be found.");
+    if (source.tags.some((tag) => tag.startsWith("mergedInto:")))
+      throw new Error("This source party has already been merged.");
+    if (target.tags.some((tag) => tag.startsWith("mergedInto:")))
+      throw new Error("Choose an active party as the merge target.");
     if (source.type !== target.type) throw new Error("Customers and suppliers cannot be merged together.");
     const stamp = nowIso();
     const sourcePrices = await db.partyItemPrices.where("partyId").equals(sourceId).toArray();
     for (const price of sourcePrices) {
       const targetKey = `${targetId}::${price.itemId}`;
       const existing = await db.partyItemPrices.get(targetKey);
-      const keepSource = !existing || (price.lockedPrice && !existing.lockedPrice) || (!existing.lockedPrice && price.updatedAt > existing.updatedAt);
-      if (keepSource) await db.partyItemPrices.put({ ...price, id: targetKey, partyId: targetId, updatedAt: stamp, isSynced: false });
-      await db.partyItemPrices.delete(price.id);
+      await db.partyItemPrices.put(existing
+        ? mergedPriceHistory(price, existing, targetId, price.itemId, stamp)
+        : { ...price, id: targetKey, partyId: targetId, updatedAt: stamp, isSynced: false });
+      // Keep the source-side row as historical data. Cloud sync has no hard-delete
+      // tombstones, so deleting it locally would allow the remote copy to return on
+      // the next pull. The merged source party is hidden by its mergedInto tag.
+      await db.partyItemPrices.update(price.id, { updatedAt: stamp, isSynced: false });
     }
     for (const invoice of await db.invoices.where("partyId").equals(sourceId).toArray()) await db.invoices.update(invoice.id, { partyId: targetId, updatedAt: stamp, isSynced: false });
     for (const payment of await db.payments.where("partyId").equals(sourceId).toArray()) await db.payments.update(payment.id, { partyId: targetId, updatedAt: stamp, isSynced: false });
     for (const entry of await db.accountEntries.where("partyId").equals(sourceId).toArray()) await db.accountEntries.update(entry.id, { partyId: targetId, updatedAt: stamp, isSynced: false });
     await db.parties.update(targetId, { currentBalance: roundMoney(target.currentBalance + source.currentBalance), openingBalance: roundMoney(target.openingBalance + source.openingBalance), updatedAt: stamp, isSynced: false });
-    await db.parties.update(sourceId, { currentBalance: 0, openingBalance: 0, tags: [...source.tags.filter((tag) => !tag.startsWith("mergedInto:")), `mergedInto:${targetId}`], notes: `${source.notes}${source.notes ? "\n" : ""}Merged into ${target.name} (${target.codeName})`, updatedAt: stamp, isSynced: false });
+    const targetLabel = target.codeName ? `${target.name} (${target.codeName})` : target.name;
+    await db.parties.update(sourceId, { currentBalance: 0, openingBalance: 0, tags: [...source.tags.filter((tag) => !tag.startsWith("mergedInto:")), `mergedInto:${targetId}`], notes: `${source.notes}${source.notes ? "\n" : ""}Merged into ${targetLabel}`, updatedAt: stamp, isSynced: false });
     await logActivity({ action: "party.merge", entityType: "party", entityId: targetId, description: `Merged ${source.name} into ${target.name}`, actor, metadata: { sourceId } });
     return targetId;
   });
+}
+
+function mergedPriceHistory(
+  source: PartyItemPrice,
+  target: PartyItemPrice,
+  targetPartyId: string,
+  targetItemId: string,
+  stamp: string,
+): PartyItemPrice {
+  const sourceHasHistory = source.timesSold > 0 || Boolean(source.lastSoldDate);
+  const targetHasHistory = target.timesSold > 0 || Boolean(target.lastSoldDate);
+  let remembered = target;
+  if (sourceHasHistory && !targetHasHistory) {
+    remembered = source;
+  } else if (sourceHasHistory && targetHasHistory) {
+    const ordered = [target, source].sort((left, right) =>
+      left.lastSoldDate.localeCompare(right.lastSoldDate)
+      || left.updatedAt.localeCompare(right.updatedAt)
+      || left.id.localeCompare(right.id));
+    const [earlier, later] = ordered;
+    remembered = {
+      ...later,
+      // Match the sale transition: a locked remembered price followed by
+      // another locked sale keeps the earlier price. Any unlocked boundary
+      // accepts the later product's most recent remembered price.
+      lastPrice: earlier.lockedPrice && later.lockedPrice
+        ? earlier.lastPrice
+        : later.lastPrice,
+      lockedPrice: later.lockedPrice,
+    };
+  }
+  return {
+    ...remembered,
+    id: priceKey(targetPartyId, targetItemId),
+    partyId: targetPartyId,
+    itemId: targetItemId,
+    lastSoldDate: [source.lastSoldDate, target.lastSoldDate].sort().at(-1) || "",
+    timesSold: Math.max(0, source.timesSold) + Math.max(0, target.timesSold),
+    updatedAt: stamp,
+    isSynced: false,
+  };
 }
 
 export async function mergeItems(sourceId: string, targetId: string, actor: ActivityLog["actor"] = "owner") {
@@ -316,19 +497,28 @@ export async function mergeItems(sourceId: string, targetId: string, actor: Acti
   return db.transaction("rw", [db.items, db.partyItemPrices, db.activityLogs], async () => {
     const [source, target] = await Promise.all([db.items.get(sourceId), db.items.get(targetId)]);
     if (!source || !target) throw new Error("Product could not be found.");
+    if (!source.isActive) throw new Error("This source product has already been merged or archived.");
+    if (!target.isActive) throw new Error("Choose an active product as the merge target.");
     if (source.baseUnit !== target.baseUnit) throw new Error("Products with different base units cannot be merged.");
     const stamp = nowIso();
     for (const price of await db.partyItemPrices.where("itemId").equals(sourceId).toArray()) {
       const targetKey = `${price.partyId}::${targetId}`;
       const existing = await db.partyItemPrices.get(targetKey);
-      const keepSource = !existing || (price.lockedPrice && !existing.lockedPrice) || (!existing.lockedPrice && price.updatedAt > existing.updatedAt);
-      if (keepSource) await db.partyItemPrices.put({ ...price, id: targetKey, itemId: targetId, updatedAt: stamp, isSynced: false });
-      await db.partyItemPrices.delete(price.id);
+      await db.partyItemPrices.put(existing
+        ? mergedPriceHistory(price, existing, price.partyId, targetId, stamp)
+        : { ...price, id: targetKey, itemId: targetId, updatedAt: stamp, isSynced: false });
+      // Retaining the source row prevents a synced price from being resurrected
+      // after an item merge. The inactive alias item keeps it out of normal sales.
+      await db.partyItemPrices.update(price.id, { updatedAt: stamp, isSynced: false });
     }
-    const stock = source.currentStock == null && target.currentStock == null
+    const stock = source.currentStock == null || target.currentStock == null
       ? null
-      : roundMoney((source.currentStock || 0) + (target.currentStock || 0));
-    await db.items.update(targetId, { currentStock: stock, saleCount: target.saleCount + source.saleCount, updatedAt: stamp, isSynced: false });
+      : roundMoney(source.currentStock + target.currentStock);
+    const lastSoldDate = [source.lastSoldDate, target.lastSoldDate]
+      .filter((value): value is string => Boolean(value))
+      .sort()
+      .at(-1);
+    await db.items.update(targetId, { currentStock: stock, saleCount: target.saleCount + source.saleCount, lastSoldDate, updatedAt: stamp, isSynced: false });
     await db.items.update(sourceId, { isActive: false, festivalTags: [...source.festivalTags.filter((tag) => !tag.startsWith("aliasOf:")), `aliasOf:${targetId}`], updatedAt: stamp, isSynced: false });
     await logActivity({ action: "item.merge", entityType: "item", entityId: targetId, description: `Merged ${source.name} into ${target.name}`, actor, metadata: { sourceId } });
     return targetId;
@@ -336,38 +526,74 @@ export async function mergeItems(sourceId: string, targetId: string, actor: Acti
 }
 
 export function renderMessageTemplate(template: string, values: Record<string, string | number | undefined>) {
-  return template.replace(/{{\s*([a-z_]+)\s*}}/g, (_, key: string) => values[key] == null ? "" : String(values[key]));
+  return template
+    .replace(/{{\s*([a-z_]+)\s*}}/g, (_, key: string) => values[key] == null ? "" : String(values[key]))
+    .replace(/\(\s*\)/g, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([,.;:])/g, "$1")
+    .trim();
 }
 
 export interface DailyCashSummary {
   date: string;
   sales: number;
   invoiceCash: number;
+  invoiceCashOut: number;
   customerCash: number;
   supplierCash: number;
   expensesCash: number;
   upiIn: number;
   bankIn: number;
+  chequeIn: number;
   expectedCash: number;
 }
 
 export function dailyCashSummary(date: string, invoices: Invoice[], payments: Payment[], expenses: Expense[], openingCash = 0, parties: Party[] = []): DailyCashSummary {
   const partyType = new Map(parties.map((party) => [party.id, party.type]));
-  const sales = invoices.filter((x) => x.type === "sale" && !x.deletedAt && x.date === date).reduce((sum, x) => sum + x.grandTotal, 0);
-  const invoiceCash = invoices.filter((x) => x.type === "sale" && !x.deletedAt && x.date === date && x.paymentReceivedMode === "cash").reduce((sum, x) => sum + x.amountPaid, 0);
+  const allocatedByInvoice = new Map<string, number>();
+  for (const payment of payments) for (const allocation of payment.allocatedTo) {
+    allocatedByInvoice.set(
+      allocation.invoiceId,
+      roundMoney((allocatedByInvoice.get(allocation.invoiceId) || 0) + allocation.amount),
+    );
+  }
+  const receivedVia = (invoice: Invoice, mode: PaymentChannel) => {
+    return invoiceInitialPaymentBreakdown(
+      invoice,
+      allocatedByInvoice.get(invoice.id) || 0,
+    )
+      .filter((entry) => entry.mode === mode)
+      .reduce((sum, entry) => roundMoney(sum + entry.amount), 0);
+  };
+  const datedInvoices = invoices.filter((x) => !x.deletedAt && x.date === date);
+  const sales = datedInvoices.filter((x) => x.type === "sale").reduce((sum, x) => sum + x.grandTotal, 0);
+  const invoiceCash = datedInvoices.filter((x) => x.type === "sale" || x.type === "purchase_return").reduce((sum, x) => sum + receivedVia(x, "cash"), 0);
+  const invoiceCashOut = datedInvoices.filter((x) => x.type === "purchase" || x.type === "sale_return").reduce((sum, x) => sum + receivedVia(x, "cash"), 0);
   const customerCash = payments.filter((x) => x.date === date && x.mode === "cash" && partyType.get(x.partyId) !== "supplier").reduce((sum, x) => sum + x.amount, 0);
   const supplierCash = payments.filter((x) => x.date === date && x.mode === "cash" && partyType.get(x.partyId) === "supplier").reduce((sum, x) => sum + x.amount, 0);
   const expensesCash = expenses.filter((x) => x.date === date && !x.deletedAt && x.paymentMode === "cash").reduce((sum, x) => sum + x.amount, 0);
-  const upiIn = invoices.filter((x) => x.type === "sale" && !x.deletedAt && x.date === date && x.paymentReceivedMode === "upi").reduce((sum, x) => sum + x.amountPaid, 0) + payments.filter((x) => x.date === date && x.mode === "upi" && partyType.get(x.partyId) !== "supplier").reduce((sum, x) => sum + x.amount, 0);
-  const bankIn = invoices.filter((x) => x.type === "sale" && !x.deletedAt && x.date === date && x.paymentReceivedMode === "bank").reduce((sum, x) => sum + x.amountPaid, 0) + payments.filter((x) => x.date === date && x.mode === "bank" && partyType.get(x.partyId) !== "supplier").reduce((sum, x) => sum + x.amount, 0);
-  return { date, sales: roundMoney(sales), invoiceCash: roundMoney(invoiceCash), customerCash: roundMoney(customerCash), supplierCash, expensesCash: roundMoney(expensesCash), upiIn: roundMoney(upiIn), bankIn: roundMoney(bankIn), expectedCash: roundMoney(openingCash + invoiceCash + customerCash - supplierCash - expensesCash) };
+  const upiIn = datedInvoices.filter((x) => x.type === "sale" || x.type === "purchase_return").reduce((sum, x) => sum + receivedVia(x, "upi"), 0) + payments.filter((x) => x.date === date && x.mode === "upi" && partyType.get(x.partyId) !== "supplier").reduce((sum, x) => sum + x.amount, 0);
+  const bankIn = datedInvoices.filter((x) => x.type === "sale" || x.type === "purchase_return").reduce((sum, x) => sum + receivedVia(x, "bank"), 0) + payments.filter((x) => x.date === date && x.mode === "bank" && partyType.get(x.partyId) !== "supplier").reduce((sum, x) => sum + x.amount, 0);
+  const chequeIn = datedInvoices.filter((x) => x.type === "sale" || x.type === "purchase_return").reduce((sum, x) => sum + receivedVia(x, "cheque"), 0) + payments.filter((x) => x.date === date && x.mode === "cheque" && partyType.get(x.partyId) !== "supplier").reduce((sum, x) => sum + x.amount, 0);
+  return { date, sales: roundMoney(sales), invoiceCash: roundMoney(invoiceCash), invoiceCashOut: roundMoney(invoiceCashOut), customerCash: roundMoney(customerCash), supplierCash, expensesCash: roundMoney(expensesCash), upiIn: roundMoney(upiIn), bankIn: roundMoney(bankIn), chequeIn: roundMoney(chequeIn), expectedCash: roundMoney(openingCash + invoiceCash + customerCash - invoiceCashOut - supplierCash - expensesCash) };
 }
 
 export async function saveDailyClose(input: Omit<DailyClose, "id" | "closedAt" | "updatedAt" | "discrepancy">) {
+  if (!isValidLocalDate(input.date)) throw new Error("Choose a valid closing date.");
+  if (!Number.isFinite(input.openingCash) || input.openingCash < 0)
+    throw new Error("Opening cash must be a finite amount of zero or more.");
+  if (!Number.isFinite(input.expectedCash))
+    throw new Error("Expected cash could not be calculated. Check the day's entries.");
+  if (!Number.isFinite(input.countedCash) || input.countedCash < 0)
+    throw new Error("Counted cash must be a finite amount of zero or more.");
   const existing = await db.dailyCloses.get(`close:${input.date}`);
   const stamp = nowIso();
   const row: DailyClose = {
     ...input,
+    openingCash: roundMoney(input.openingCash),
+    expectedCash: roundMoney(input.expectedCash),
+    countedCash: roundMoney(input.countedCash),
+    notes: input.notes.trim(),
     id: `close:${input.date}`,
     discrepancy: roundMoney(input.countedCash - input.expectedCash),
     closedAt: existing?.closedAt || stamp,

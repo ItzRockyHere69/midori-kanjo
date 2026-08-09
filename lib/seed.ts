@@ -102,57 +102,24 @@ export const samplePrices: PartyItemPrice[] = [
   { id: "p-kolkata-balloon::i-balloon-pack", partyId: "p-kolkata-balloon", itemId: "i-balloon-pack", lastPrice: 95, lastSoldDate: "2026-07-31", timesSold: 12, lockedPrice: true, updatedAt: stamp, isSynced: false }
 ];
 
-const legacyItemIds = [
-  "i-mm12-red", "i-mm12-gold", "i-mm12-green", "i-mm12-silver", "i-mm18-red", "i-mm18-gold", "i-mm18-white", "i-mm18-pink",
-  "i-mukut-sm", "i-mukut-lg", "i-chunri", "i-idol-necklace", "i-durga-shringar", "i-kali-garland", "i-led-warm", "i-toran",
-  "i-rangoli", "i-diya", "i-kandil", "i-tree2", "i-star", "i-tinsel", "i-snow", "i-balloon", "i-banner", "i-foil", "i-hats", "i-flag", "i-bunting", "i-wrist"
-];
-const legacyPartyIds = ["p-ganesh", "p-tara", "p-newindia", "p-saha", "p-raj", "p-das", "p-city", "p-bharat"];
-
 export async function seedIfNeeded() {
   if (await db.meta.get("seeded-v3")) return;
-  if (await db.meta.get("seeded-v2")) {
-    await db.transaction("rw", [db.parties, db.meta], async () => {
-      const existing = await db.parties.bulkGet(sampleSuppliers.map((entry) => entry.id));
-      await db.parties.bulkPut(sampleSuppliers.filter((_, index) => !existing[index]));
-      await db.meta.put({ key: "seeded-v3", value: true });
-    });
-    return;
-  }
-  await db.transaction("rw", [db.categories, db.items, db.parties, db.partyItemPrices, db.invoices, db.payments, db.meta], async () => {
-    const invoices = await db.invoices.toArray();
-    const payments = await db.payments.toArray();
-    const referencedItems = new Set(invoices.flatMap((invoice) => invoice.lineItems.map((line) => line.itemId)));
-    const referencedParties = new Set([...invoices.map((invoice) => invoice.partyId).filter(Boolean), ...payments.map((payment) => payment.partyId)]);
-    const newItemIds = new Set(sampleItems.map((entry) => entry.id));
-    const newPartyIds = new Set([...sampleParties, ...sampleSuppliers].map((entry) => entry.id));
-    const existingSampleItems = await db.items.bulkGet(sampleItems.map((entry) => entry.id));
+  await db.transaction("rw", [db.categories, db.items, db.parties, db.partyItemPrices, db.meta], async () => {
+    const parties = [...sampleParties, ...sampleSuppliers];
+    const [existingCategories, existingItems, existingParties, existingPrices] = await Promise.all([
+      db.categories.bulkGet(sampleCategories.map((entry) => entry.id)),
+      db.items.bulkGet(sampleItems.map((entry) => entry.id)),
+      db.parties.bulkGet(parties.map((entry) => entry.id)),
+      db.partyItemPrices.bulkGet(samplePrices.map((entry) => entry.id)),
+    ]);
 
-    for (const id of legacyItemIds) {
-      if (newItemIds.has(id)) continue;
-      if (referencedItems.has(id)) await db.items.update(id, { isActive: false, updatedAt: stamp });
-      else await db.items.delete(id);
-    }
-    for (const id of legacyPartyIds) {
-      if (newPartyIds.has(id) || referencedParties.has(id)) continue;
-      await db.parties.delete(id);
-    }
-
-    await db.categories.bulkPut(sampleCategories);
-    await db.items.bulkPut(sampleItems.map((entry, index) => {
-      const existing = existingSampleItems[index];
-      return existing ? {
-        ...entry,
-        imageUrl: existing.imageUrl,
-        currentStock: existing.currentStock,
-        lowStockAlert: existing.lowStockAlert,
-        saleCount: Math.max(entry.saleCount, existing.saleCount),
-        lastSoldDate: existing.lastSoldDate || entry.lastSoldDate,
-        createdAt: existing.createdAt
-      } : entry;
-    }));
-    await db.parties.bulkPut([...sampleParties, ...sampleSuppliers]);
-    await db.partyItemPrices.bulkPut(samplePrices);
+    // Seed upgrades must be additive. These rows are editable business data
+    // after first launch, so replacing a matching seed ID would erase the
+    // owner's catalogue, contact, balance or negotiated-price changes.
+    await db.categories.bulkAdd(sampleCategories.filter((_, index) => !existingCategories[index]));
+    await db.items.bulkAdd(sampleItems.filter((_, index) => !existingItems[index]));
+    await db.parties.bulkAdd(parties.filter((_, index) => !existingParties[index]));
+    await db.partyItemPrices.bulkAdd(samplePrices.filter((_, index) => !existingPrices[index]));
     await db.meta.put({ key: "seeded-v1", value: true });
     await db.meta.put({ key: "seeded-v2", value: true });
     await db.meta.put({ key: "seeded-v3", value: true });

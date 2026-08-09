@@ -44,12 +44,24 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
+    // Prevent unrelated or accidentally named VITE_* values from being
+    // serialized into hosted client code.
+    envPrefix: ["VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY"],
     server: {
       host: "0.0.0.0",
       allowedHosts: ["terminal.local"],
-      ...(isCodexSeatbeltSandbox
-        ? { watch: { useFsEvents: false, usePolling: true } }
-        : {}),
+      watch: {
+        ignored: [
+          "**/.sites-runtime/**",
+          "**/.wrangler/**",
+          "**/dist/**",
+          "**/mobile-dist/**",
+          "**/android/app/build/**",
+        ],
+        ...(isCodexSeatbeltSandbox
+          ? { useFsEvents: false, usePolling: true }
+          : {}),
+      },
     },
     plugins: [
       vinext(),

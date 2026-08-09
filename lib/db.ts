@@ -3,7 +3,7 @@ import Dexie, { type EntityTable } from "dexie";
 export type Language = "en" | "bn" | "hi";
 export type PriceTier = "retail" | "wholesale" | "bulk" | "special";
 export type Unit = "piece" | "dozen" | "gross" | "bundle" | "box" | "packet";
-export type PaymentMode = "cash" | "upi" | "bank" | "credit" | "mixed";
+export type PaymentMode = "cash" | "upi" | "bank" | "cheque" | "credit" | "mixed";
 export type PaymentChannel = Exclude<PaymentMode, "credit" | "mixed">;
 export type InvoiceType = "sale" | "purchase" | "sale_return" | "purchase_return" | "quotation";
 export type InvoiceChargeCode = "carrier" | "packing" | "big_box";
@@ -26,6 +26,13 @@ export interface Party {
   createdAt: string;
   updatedAt: string;
   isSynced: boolean;
+}
+
+export interface BillingCustomerDraft {
+  name: string;
+  codeName?: string;
+  phone?: string;
+  address?: string;
 }
 
 export interface Item {
@@ -77,6 +84,9 @@ export interface PartyItemPrice {
 export interface InvoiceLine {
   itemId: string;
   itemName: string;
+  /** Optional localized snapshots preserve the wording used when the bill was saved. */
+  itemNameHi?: string;
+  itemNameBn?: string;
   skuCode: string;
   hsnCode: string;
   qty: number;
@@ -88,6 +98,8 @@ export interface InvoiceLine {
   gstRate: number;
   gstAmount: number;
   amount: number;
+  /** Cost captured in the sold unit when the document was created. */
+  unitCost?: number;
   lastPriceLabel?: string;
   lockPrice?: boolean;
 }
@@ -96,6 +108,12 @@ export interface InvoiceCharge {
   code: InvoiceChargeCode;
   label: string;
   amount: number;
+}
+
+export interface InvoicePaymentAllocation {
+  mode: PaymentChannel;
+  amount: number;
+  reference?: string;
 }
 
 export interface Invoice {
@@ -114,10 +132,14 @@ export interface Invoice {
   otherChargesTotal?: number;
   roundOff: number;
   grandTotal: number;
+  /** Amount received while the invoice itself was created (before later Payment events). */
+  initialAmountPaid?: number;
   amountPaid: number;
   amountDue: number;
   paymentMode: PaymentMode;
   paymentReceivedMode?: PaymentChannel;
+  /** Exact tender amounts received when the document was created. */
+  paymentBreakdown?: InvoicePaymentAllocation[];
   notes: string;
   isSynced: boolean;
   createdAt: string;
@@ -239,9 +261,7 @@ class BurrabazarDB extends Dexie {
       parties: "&id, name, codeName, phone, address, type, priceTier, currentBalance, isSynced, updatedAt"
     }).upgrade((transaction) => transaction.table("parties").toCollection().modify((stored: Omit<Party,"codeName"> & { codeName?: string }) => {
       if (stored.codeName?.trim()) return;
-      const nameCode = String(stored.name || "PARTY").toUpperCase().replace(/[^A-Z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,8).replace(/-$/, "") || "PARTY";
-      const idCode = String(stored.id || "000").replace(/[^a-z0-9]/gi,"").slice(-4).toUpperCase().padStart(4,"0");
-      stored.codeName = `${stored.type === "supplier" ? "SUP" : "CUS"}-${nameCode}-${idCode}`;
+      stored.codeName = "";
       stored.updatedAt = new Date().toISOString();
       stored.isSynced = false;
     }));
@@ -261,6 +281,19 @@ export const nowIso = () => new Date().toISOString();
 export const localDate = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+export const isValidLocalDate = (value: string) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day
+  );
 };
 export const makeId = () => globalThis.crypto?.randomUUID?.() || `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 export const priceKey = (partyId: string, itemId: string) => `${partyId}::${itemId}`;

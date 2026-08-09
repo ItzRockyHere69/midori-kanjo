@@ -6,12 +6,12 @@ export const metadata: Metadata = {
   description: "Offline-first wholesale billing, party khata and festival-decor inventory for Burrabazar traders.",
   manifest: "/manifest.webmanifest",
   applicationName: "Midori Kanjo",
-  appleWebApp: { capable: true, statusBarStyle: "default", title: "Midori Kanjo" },
+  appleWebApp: { capable: true, statusBarStyle: "black-translucent", title: "Midori Kanjo" },
   icons: { icon: [{ url: "/app-icon.svg", type: "image/svg+xml" }, { url: "/app-icon-192.png", sizes: "192x192", type: "image/png" }], apple: "/app-icon-180.png" },
   other: { "codex-preview": "development" }
 };
 
-export const viewport: Viewport = { width: "device-width", initialScale: 1, maximumScale: 1, viewportFit: "cover", themeColor: "#014921" };
+export const viewport: Viewport = { width: "device-width", initialScale: 1, viewportFit: "cover", themeColor: "#014921" };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const themeScript = `(() => {

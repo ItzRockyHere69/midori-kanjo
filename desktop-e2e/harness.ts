@@ -171,7 +171,7 @@ const harness: DesktopE2EHarness = {
   async configureCloud(config) {
     await db.open();
     overrideOnlineState(false);
-    configureCloud(config);
+    await configureCloud(config);
   },
 
   snapshot,
@@ -220,7 +220,7 @@ const harness: DesktopE2EHarness = {
     const partyResult = await client.from("parties").delete().eq("id", ids.partyId);
     if (partyResult.error) throw partyResult.error;
     const remaining = await remoteCounts(ids);
-    clearCloudConfig();
+    await clearCloudConfig();
     return remaining;
   },
 };

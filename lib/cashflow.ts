@@ -1,5 +1,5 @@
-import { db, localDate, makeId, nowIso, type AccountEntry, type Expense, type ExpenseCategory, type ExpensePaymentMode, type Invoice, type Party, type Payment } from "./db";
-import { roundMoney } from "./billing";
+import { db, isValidLocalDate, localDate, makeId, nowIso, type AccountEntry, type Expense, type ExpenseCategory, type ExpensePaymentMode, type Invoice, type Party, type Payment } from "./db";
+import { invoiceInitialPaymentBreakdown, roundMoney } from "./billing";
 
 export const expenseCategoryLabels: Record<ExpenseCategory, string> = {
   refreshments: "Tea & coffee",
@@ -15,6 +15,8 @@ export interface CashFlowMovement {
   createdAt: string;
   direction: "in" | "out";
   source: "sale" | "purchase" | "sale_return" | "purchase_return" | "customer_payment" | "supplier_payment" | "misc_expense";
+  partyId?: string | null;
+  expenseCategory?: ExpenseCategory;
   title: string;
   details: string;
   mode: string;
@@ -52,13 +54,15 @@ export function inDateRange(date: string, fromDate: string, toDate: string) {
 
 export async function recordExpense(input: { category: ExpenseCategory; amount: number; date?: string; description?: string; paymentMode: ExpensePaymentMode; reference?: string }) {
   if (!Number.isFinite(input.amount) || input.amount <= 0) throw new Error("Enter a valid expense amount.");
+  const amount = roundMoney(input.amount);
+  if (amount < 0.01) throw new Error("Expense amount must be at least ₹0.01.");
   const date = input.date || localDate();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(new Date(`${date}T00:00:00`).getTime())) throw new Error("Choose a valid expense date.");
+  if (!isValidLocalDate(date)) throw new Error("Choose a valid expense date.");
   const timestamp = nowIso();
   const expense: Expense = {
     id: makeId(),
     category: input.category,
-    amount: roundMoney(input.amount),
+    amount,
     date,
     description: input.description?.trim() || expenseCategoryLabels[input.category],
     paymentMode: input.paymentMode,
@@ -103,15 +107,21 @@ export function buildCashFlowReport(input: { invoices: Invoice[]; payments: Paym
   let receivedWithBills = 0;
   let paidWithPurchases = 0;
   for (const invoice of periodInvoices) {
-    const initialPaid = roundMoney(Math.max(0, invoice.amountPaid - (allocations.get(invoice.id) || 0)));
+    const breakdown = invoiceInitialPaymentBreakdown(
+      invoice,
+      allocations.get(invoice.id) || 0,
+    );
+    const initialPaid = roundMoney(
+      breakdown.reduce((sum, entry) => sum + entry.amount, 0),
+    );
     if (!initialPaid) continue;
     if (invoice.type === "sale" || invoice.type === "purchase_return") {
       const source = invoice.type === "sale" ? "sale" : "purchase_return";
-      movements.push({ id: `invoice-${invoice.id}`, date: invoice.date, createdAt: invoice.createdAt, direction: "in", source, title: invoice.type === "sale" ? `Sale ${invoice.invoiceNumber}` : `Purchase return ${invoice.invoiceNumber}`, details: invoice.partyName, mode: invoice.paymentReceivedMode || invoice.paymentMode, amount: initialPaid });
+      breakdown.forEach((entry, index) => movements.push({ id: `invoice-${invoice.id}-${index}`, date: invoice.date, createdAt: invoice.createdAt, direction: "in", source, partyId: invoice.partyId || null, title: invoice.type === "sale" ? `Sale ${invoice.invoiceNumber}` : `Purchase return ${invoice.invoiceNumber}`, details: [invoice.partyName, entry.reference].filter(Boolean).join(" · "), mode: entry.mode, amount: entry.amount }));
       receivedWithBills = roundMoney(receivedWithBills + initialPaid);
     } else if (invoice.type === "purchase" || invoice.type === "sale_return") {
       const source = invoice.type === "purchase" ? "purchase" : "sale_return";
-      movements.push({ id: `invoice-${invoice.id}`, date: invoice.date, createdAt: invoice.createdAt, direction: "out", source, title: invoice.type === "purchase" ? `Purchase ${invoice.invoiceNumber}` : `Sale return ${invoice.invoiceNumber}`, details: invoice.partyName, mode: invoice.paymentReceivedMode || invoice.paymentMode, amount: initialPaid });
+      breakdown.forEach((entry, index) => movements.push({ id: `invoice-${invoice.id}-${index}`, date: invoice.date, createdAt: invoice.createdAt, direction: "out", source, partyId: invoice.partyId || null, title: invoice.type === "purchase" ? `Purchase ${invoice.invoiceNumber}` : `Sale return ${invoice.invoiceNumber}`, details: [invoice.partyName, entry.reference].filter(Boolean).join(" · "), mode: entry.mode, amount: entry.amount }));
       paidWithPurchases = roundMoney(paidWithPurchases + initialPaid);
     }
   }
@@ -141,7 +151,7 @@ export function buildCashFlowReport(input: { invoices: Invoice[]; payments: Paym
   const expenseMap = new Map<ExpenseCategory, number>();
   for (const expense of activeExpenses) {
     expenseMap.set(expense.category, roundMoney((expenseMap.get(expense.category) || 0) + expense.amount));
-    movements.push({ id: `expense-${expense.id}`, date: expense.date, createdAt: expense.createdAt, direction: "out", source: "misc_expense", title: expense.description, details: expenseCategoryLabels[expense.category] + (expense.reference ? ` · ${expense.reference}` : ""), mode: expense.paymentMode, amount: expense.amount });
+    movements.push({ id: `expense-${expense.id}`, date: expense.date, createdAt: expense.createdAt, direction: "out", source: "misc_expense", expenseCategory: expense.category, title: expense.description, details: expenseCategoryLabels[expense.category] + (expense.reference ? ` · ${expense.reference}` : ""), mode: expense.paymentMode, amount: expense.amount });
   }
   const miscellaneousExpenses = roundMoney(activeExpenses.reduce((sum, expense) => sum + expense.amount, 0));
   const moneyIn = roundMoney(receivedWithBills + customerPayments);

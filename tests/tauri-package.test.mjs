@@ -32,7 +32,14 @@ test("desktop icons and window persistence plugin are configured", async () => {
   const cargo = await read("src-tauri/Cargo.toml");
   assert.match(rust, /tauri_plugin_window_state/);
   assert.match(rust, /cfg\(feature = "desktop-e2e"\)/);
-  assert.match(cargo, /tauri-plugin-wdio-webdriver = "1"/);
+  assert.match(
+    cargo,
+    /desktop-e2e = \["dep:tauri-plugin-wdio-webdriver"\]/,
+  );
+  assert.match(
+    cargo,
+    /tauri-plugin-wdio-webdriver = \{ version = "1", optional = true \}/,
+  );
 });
 
 test("production frontend is offline-local and excludes the runner harness", async () => {

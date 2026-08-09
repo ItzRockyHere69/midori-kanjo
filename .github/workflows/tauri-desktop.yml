@@ -51,27 +51,25 @@ jobs:
       CARGO_TERM_COLOR: always
       MIDORI_TAURI_BINARY: ${{ github.workspace }}/${{ matrix.binary_path }}
       MIDORI_E2E_RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
-      MIDORI_E2E_SUPABASE_URL: ${{ secrets.MIDORI_E2E_SUPABASE_URL }}
-      MIDORI_E2E_SUPABASE_ANON_KEY: ${{ secrets.MIDORI_E2E_SUPABASE_ANON_KEY }}
-      MIDORI_E2E_SYNC_CODE: ${{ secrets.MIDORI_E2E_SYNC_CODE }}
 
     steps:
       - name: Check out the single shared codebase
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
 
       - name: Set up Rust targets
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
+          toolchain: stable
           targets: ${{ matrix.rust_targets }}
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ./src-tauri -> target
 
@@ -84,11 +82,24 @@ jobs:
       - name: Lint shared application
         run: npm run lint
 
+      - name: Type-check shared application
+        run: npx tsc --noEmit --incremental false
+
+      - name: Test platform, security and migration contracts
+        run: npm run test:platform
+
+      - name: Test clean mobile and Android packaging
+        run: npm run test:mobile
+
       - name: Test shared billing and sync logic
         run: npm run test:unit
 
       - name: Validate native sync-test secrets
         if: ${{ inputs.run_native_offline_sync_test }}
+        env:
+          MIDORI_E2E_SUPABASE_URL: ${{ secrets.MIDORI_E2E_SUPABASE_URL }}
+          MIDORI_E2E_SUPABASE_ANON_KEY: ${{ secrets.MIDORI_E2E_SUPABASE_ANON_KEY }}
+          MIDORI_E2E_SYNC_CODE: ${{ secrets.MIDORI_E2E_SYNC_CODE }}
         run: node scripts/require-desktop-e2e-env.mjs
 
       - name: Build native runner test binary
@@ -97,15 +108,19 @@ jobs:
 
       - name: Test offline create, restart, reconnect and idempotent sync
         if: ${{ inputs.run_native_offline_sync_test }}
+        env:
+          MIDORI_E2E_SUPABASE_URL: ${{ secrets.MIDORI_E2E_SUPABASE_URL }}
+          MIDORI_E2E_SUPABASE_ANON_KEY: ${{ secrets.MIDORI_E2E_SUPABASE_ANON_KEY }}
+          MIDORI_E2E_SYNC_CODE: ${{ secrets.MIDORI_E2E_SYNC_CODE }}
         run: npm run test:tauri:e2e
 
       - name: Build production installer
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         with:
           args: ${{ matrix.tauri_args }}
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_path }}

@@ -4,7 +4,6 @@
   "description": "Minimal permissions for the Midori Kanjo desktop window",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "wdio-webdriver:default"
+    "core:default"
   ]
 }

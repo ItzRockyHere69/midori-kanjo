@@ -158,6 +158,11 @@ if (process.argv.includes("--self-test")) {
               ? "no-cache"
               : "public, max-age=31536000, immutable",
           "X-Content-Type-Options": "nosniff",
+          "X-Frame-Options": "DENY",
+          "Referrer-Policy": "no-referrer",
+          "Permissions-Policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+          "Content-Security-Policy":
+            "default-src 'self'; connect-src 'self' https: wss:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; frame-src 'self' blob:; object-src 'self' blob:; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
         },
       });
     } catch {

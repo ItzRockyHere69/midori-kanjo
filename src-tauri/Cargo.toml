@@ -8,7 +8,8 @@ edition = "2021"
 rust-version = "1.77.2"
 
 [features]
-desktop-e2e = []
+default = []
+desktop-e2e = ["dep:tauri-plugin-wdio-webdriver"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
@@ -16,9 +17,9 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-window-state = "2"
-# Registered only in the dedicated runner test build. Production installers do
-# not start a WebDriver server.
-tauri-plugin-wdio-webdriver = "1"
+# The dependency and its embedded HTTP server exist only in the dedicated
+# runner-test build selected by `--features desktop-e2e`.
+tauri-plugin-wdio-webdriver = { version = "1", optional = true }
 
 [profile.release]
 codegen-units = 1

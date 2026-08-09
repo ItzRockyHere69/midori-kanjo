@@ -5,6 +5,8 @@ Phase 1 is a mobile-first, installable billing PWA for a wholesale festival-deco
 ## Phase 1 included
 
 - One-screen wholesale billing with large touch controls
+- Five-action phone navigation (Bill, Parties, Items, Reports and More), with Dues and Miscellaneous kept one tap inside More
+- Notch, home-indicator, gesture-bar and landscape-safe layouts across compact phones, tablets and desktop windows
 - Search across English, Hindi, Bengali and SKU codes, including fuzzy matches
 - Six sample customers, two sample suppliers and 14 supplied festival-decoration items across eight business categories
 - Full offline product editor with item-specific photo upload, compression and thumbnails
@@ -80,8 +82,8 @@ Android packaging validation:
 npm run test:mobile
 ```
 
-Build an installable debug APK on a machine with Android Studio, Android SDK 34 and
-Java 17 installed:
+Build an installable debug APK on a machine with Android Studio, Android SDK 35 and
+Java 17 installed. The repository pins AGP 8.6.1 and the Gradle 8.7 wrapper:
 
 ```bash
 npm run mobile:android:debug
@@ -91,22 +93,69 @@ The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`. A pub
 Play Store build requires the owner's signing key and store account; those secrets
 must never be committed to this repository.
 
+The current Android package targets API 35. Google Play requires new apps and app
+updates to target Android 16 / API 36 beginning **2026-08-31**, so the compile/target
+SDK and validated Android build toolchain must be upgraded before a submission on
+or after that date.
+
 The hosted PWA remains the zero-install phone option. In Android Chrome, open the
 site, choose **Install app** (or **Add to Home screen**), and accept the prompt. It
 uses the same IndexedDB data model and offline service-worker shell.
 
-The 21-test core regression suite exercises a complete dozen/piece/packet/bundle bill, explicit full/part/pay-later behavior, a ₹10,000 bill with ₹5,000 automatically added to customer Dues, inline item and customer creation, negotiated PartyItemPrice memory, three-bill offline reconnect with idempotent cloud upserts, unique device-safe invoice numbers, A4/A5/thermal invoice generation, unit conversion, GST calculations, cash/credit behavior, product-photo isolation, searchable dues, dated payments, receivables, payables, miscellaneous expenses, exact-date cash-flow exports, all seven advanced report engines, branded catalogue PDFs, quotation isolation and duplicate-safe conversion, plus prevention of overpayments, duplicate sync records, double-counted receipts or stale-balance updates.
+The core regression suite exercises billing, offline recovery, tenant-safe sync, payment reconciliation, historical-cost reporting, quotations, backups and the complete cash-flow/ledger model, including prevention of overpayments, duplicate sync records, deleted paid bills, double-counted receipts and stale-balance updates.
 
 ## Supabase connection
 
-1. Create a dedicated Supabase project and enable anonymous sign-ins under Authentication.
-2. Run `supabase/schema.sql` in the Supabase SQL editor.
-3. In **More → Cloud backup**, enter the project URL and anon public key, then generate a private business sync code.
-4. Use exactly the same URL, key and sync code on every trusted device. Keep the sync code private.
+### Fresh project
 
-For managed builds, copy `.env.example` to `.env.local` and set the same three values before building. The database policies bind every row to the strong sync code carried in the anonymous session, so another authenticated device cannot list or modify the business data without that code.
+1. Create a dedicated, blank Supabase project and enable anonymous sign-ins under Authentication.
+2. Run `supabase/schema.sql` once in the Supabase SQL editor. It is the consolidated fresh-install schema; do not replay the migration directory over the same blank install.
+3. In **More → Cloud backup**, enter the project URL and anon public key, then generate a private business sync code after owner-PIN unlock.
+4. Enter that same private code separately on every trusted device. Keep it out of source control, build logs and client-public environment variables.
 
-The local tables are pushed with idempotent `upsert` operations keyed by stable IDs, then remote changes are pulled into IndexedDB. Realtime database events trigger another sync. Without these environment values, the app remains fully usable on one device and correctly shows Offline.
+For managed builds, `.env.local` may prefill only the public Supabase URL and anon key. Enter the private sync code separately on each trusted device after owner-PIN unlock; never place it in a `VITE_` or `NEXT_PUBLIC_` variable because those values are extractable from client bundles. Do not configure a raw `business_id`: the database derives a SHA-256 tenant identifier from the authenticated session and stores only that identifier in synced rows.
+
+### Existing project and migration history
+
+Back up the Supabase database and make an in-app data export before changing an
+existing project. If the remote migration history already records later
+`20260808...` migrations but does not record the newly added fresh-install baseline,
+do not execute the baseline against the populated database. Link the Supabase CLI,
+inspect both histories, and record only that baseline as already applied:
+
+```bash
+supabase link --project-ref <project-ref>
+supabase migration list
+supabase migration repair 202608080000 --status applied
+supabase db push --include-all --dry-run
+```
+
+Review the dry run. It should schedule the unapplied hardening migration
+`202608091900_harden_multi_tenant_sync.sql` (and no unexplained migration). Then run:
+
+```bash
+supabase db push --include-all
+supabase migration list
+```
+
+`migration repair` changes migration history only; it does not execute SQL. Use it
+for the baseline only after confirming the populated project already has the older
+schema, and never mark the hardening migration applied unless its SQL completed.
+Stop and reconcile unexpected history instead of guessing. A fresh project created
+from `schema.sql` does not need this legacy rollout.
+
+Remote changes are pulled into IndexedDB before local unsynced rows are uploaded with tenant-scoped idempotent keys. Realtime database events trigger another sync. Without a per-device private code, the app remains fully usable on one device and correctly shows Offline.
+
+Mutable cloud rows currently resolve concurrent edits with client-clock
+last-write-wins. Immutable payment events are reconciled, but there is no server-side
+compare-and-swap/revision check for other mutable rows yet; operators should avoid
+editing the same record concurrently on devices with inaccurate clocks.
+
+## Native release prerequisites
+
+- Android release distribution requires a private signing key and Play Console account, plus an API 36 toolchain before the 2026-08-31 target-SDK deadline.
+- Local Tauri builds require Rust and the target platform's native tools (MSVC on Windows or Xcode on macOS). Public Windows distribution still needs commercial code signing; public macOS distribution needs Apple signing credentials and notarization.
+- Unsigned internal installers can trigger SmartScreen or Gatekeeper. Automated packaging does not replace acceptance testing on the intended computers, phones, printers and shop network.
 
 ## Billing assumptions
 

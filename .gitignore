@@ -38,6 +38,7 @@ yarn-error.log*
 next-env.d.ts
 /dist/
 /mobile-dist/
+/.mobile-build-lock/
 /.wrangler/
 /.sites-runtime/
 /outputs/
