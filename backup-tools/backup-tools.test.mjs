@@ -28,13 +28,17 @@ const expectedBusinessId = "7bdebe348faeda556a3005c310de23f8744f21cd7a0b3c9d8a74
 const databaseUrl = "postgresql://backup_user:do-not-log-this-password@example.invalid:5432/postgres";
 
 const headers = Object.freeze({
+  "categories.csv": "business_id,id,name,parent_id,festival_season,created_at,updated_at",
   "parties.csv": "business_id,id,name,code_name,phone,address,gstin,type,price_tier,opening_balance,current_balance,notes,tags,created_at,updated_at",
   "items.csv": "business_id,id,name,name_hi,name_bn,sku_code,category_id,base_unit,conversion_rate,purchase_price,price_retail,price_wholesale,price_bulk,current_stock,low_stock_alert,festival_tags,hsn_code,gst_rate,image_url,is_active,sale_count,last_sold_date,created_at,updated_at",
   "party_item_prices.csv": "business_id,id,party_id,item_id,last_price,last_sold_date,times_sold,locked_price,updated_at",
-  "invoices.csv": "business_id,id,invoice_number,party_id,party_name,party_gstin,date,type,line_items,subtotal,discount_total,gst_total,other_charges,other_charges_total,round_off,grand_total,initial_amount_paid,amount_paid,amount_due,payment_mode,payment_received_mode,notes,deleted_at,created_at,updated_at",
+  "invoices.csv": "business_id,id,invoice_number,party_id,party_name,party_gstin,date,type,line_items,subtotal,discount_total,gst_total,other_charges,other_charges_total,round_off,grand_total,initial_amount_paid,amount_paid,amount_due,payment_mode,payment_received_mode,payment_breakdown,return_details,notes,deleted_at,created_at,updated_at",
   "payments.csv": "business_id,id,party_id,amount,date,mode,reference,allocated_to,created_at,updated_at",
   "account_entries.csv": "business_id,id,party_id,kind,amount,date,note,reference,created_at,updated_at",
   "expenses.csv": "business_id,id,user_id,category,amount,date,description,payment_mode,reference,deleted_at,created_at,updated_at",
+  "count_sessions.csv": "business_id,id,category_id,category_name,status,item_ids,started_at,completed_at,updated_at",
+  "count_session_lines.csv": "business_id,id,session_id,item_id,item_name,sku_code,base_unit,system_stock_at_start,counted_stock,counted_at,created_at,updated_at",
+  "stock_movements.csv": "business_id,id,item_id,kind,reason,note,qty_change,stock_before,stock_after,applied,entry_qty,entry_unit,pack_count,units_per_pack,contained_unit,ref_invoice_id,source_invoice_id,count_session_id,party_id,supplier_reference,date,actor,created_at,updated_at",
 });
 
 const checkedFiles = [...Object.keys(headers), "SENSITIVE_DATA_MANIFEST.txt"];
@@ -124,7 +128,7 @@ function makeRestoreArchive(context, name = "restore data ' [safe]") {
   for (const file of Object.keys(headers)) copyFileSync(join(context.fixturesDir, file), join(dataDir, file));
   writeFileSync(
     join(dataDir, "SENSITIVE_DATA_MANIFEST.txt"),
-    "MIDORI KANJO SENSITIVE BUSINESS DATA EXPORT\nFormat: midori-kanjo-supabase-business-data-v2\n",
+    "MIDORI KANJO SENSITIVE BUSINESS DATA EXPORT\nFormat: midori-kanjo-supabase-business-data-v3\n",
     { mode: 0o600 },
   );
   writeChecksums(dataDir);
@@ -163,8 +167,9 @@ test("export hashes the tenant, uses one repeatable-read snapshot, and checksums
   assert.match(sql, /BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;/);
   assert.match(sql, /AS tenant_has_rows \\gset/);
   assert.ok(sql.indexOf("AS tenant_has_rows") < sql.indexOf("\\copy (SELECT"));
-  assert.equal((sql.match(/^\\copy \(SELECT/gm) || []).length, 7);
-  assert.equal((sql.match(/current_setting\('midori\.export_business_id'\)/g) || []).length >= 14, true);
+  assert.equal((sql.match(/^\\copy \(SELECT/gm) || []).length, 11);
+  assert.equal((sql.match(/current_setting\('midori\.export_business_id'\)/g) || []).length >= 22, true);
+  assert.match(sql, /payment_received_mode,\s*payment_breakdown,\s*return_details,\s*notes/);
   assert.doesNotMatch(sql, /SELECT \*/);
   assert.doesNotMatch(readFileSync(join(outputDir, "SENSITIVE_DATA_MANIFEST.txt"), "utf8"), new RegExp(syncCode));
 });
@@ -207,10 +212,11 @@ test("restore verifies first, then stages and rebinds in one locked serializable
   const insertAt = sql.indexOf("INSERT INTO public.parties");
   assert.ok(beginAt >= 0 && beginAt < lockAt && lockAt < emptyAt && emptyAt < copyAt && copyAt < insertAt);
   assert.match(sql, /IN SHARE ROW EXCLUSIVE MODE;/);
-  assert.equal((sql.match(/CREATE TEMP TABLE restore_/g) || []).length, 7);
-  assert.equal((sql.match(/^\\copy pg_temp\.restore_/gm) || []).length, 7);
-  assert.equal((sql.match(/INSERT INTO public\./g) || []).length, 7);
-  assert.equal((sql.match(/current_setting\('midori\.restore_business_id'\)/g) || []).length, 7);
+  assert.equal((sql.match(/CREATE TEMP TABLE restore_/g) || []).length, 11);
+  assert.equal((sql.match(/^\\copy pg_temp\.restore_/gm) || []).length, 11);
+  assert.equal((sql.match(/INSERT INTO public\./g) || []).length, 11);
+  assert.equal((sql.match(/current_setting\('midori\.restore_business_id'\)/g) || []).length, 11);
+  assert.match(sql, /payment_received_mode,\s*payment_breakdown,\s*return_details,\s*notes/);
   assert.match(sql, /count\(DISTINCT business_id\) = 1/);
   assert.match(sql, /AS counts_match \\gset/);
   assert.doesNotMatch(sql, /UPDATE public\.[a-z_]+ SET business_id/i);

@@ -19,8 +19,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-shared:
+    name: Shared billing, Android and desktop contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the single shared codebase
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Validate Tauri packaging configuration
+        run: npm run test:tauri:config
+
+      - name: Lint shared application
+        run: npm run lint
+
+      - name: Type-check shared application
+        run: npx tsc --noEmit --incremental false
+
+      - name: Test platform, security and migration contracts
+        run: npm run test:platform
+
+      - name: Test clean mobile and Android packaging
+        run: npm run test:mobile
+
+      - name: Test shared billing and sync logic
+        run: npm run test:unit
+
   build-desktop:
     name: ${{ matrix.label }}
+    needs: validate-shared
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -33,19 +69,23 @@ jobs:
             rust_targets: x86_64-pc-windows-msvc
             tauri_args: --bundles msi,nsis
             binary_path: src-tauri/target/release/midori-kanjo.exe
-            artifact_name: midori-kanjo-windows-x64-installers
+            artifact_name: midori-kanjo-v0.1.2-windows-x64-installers
             artifact_path: |
               src-tauri/target/release/bundle/msi/*.msi
               src-tauri/target/release/bundle/nsis/*-setup.exe
+              SHA256SUMS-windows.txt
+              src-tauri/Cargo.lock
           - id: macos-universal
             label: macOS · Universal DMG
             os: macos-latest
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             tauri_args: --target universal-apple-darwin --bundles dmg
             binary_path: src-tauri/target/release/midori-kanjo
-            artifact_name: midori-kanjo-macos-universal-dmg
+            artifact_name: midori-kanjo-v0.1.2-macos-universal-dmg
             artifact_path: |
               src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              SHA256SUMS-macos.txt
+              src-tauri/Cargo.lock
 
     env:
       CARGO_TERM_COLOR: always
@@ -76,23 +116,8 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
-      - name: Validate Tauri packaging configuration
-        run: npm run test:tauri:config
-
-      - name: Lint shared application
-        run: npm run lint
-
-      - name: Type-check shared application
-        run: npx tsc --noEmit --incremental false
-
-      - name: Test platform, security and migration contracts
-        run: npm run test:platform
-
-      - name: Test clean mobile and Android packaging
-        run: npm run test:mobile
-
-      - name: Test shared billing and sync logic
-        run: npm run test:unit
+      - name: Resolve Rust dependencies reproducibly for this release
+        run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
 
       - name: Validate native sync-test secrets
         if: ${{ inputs.run_native_offline_sync_test }}
@@ -119,10 +144,39 @@ jobs:
         with:
           args: ${{ matrix.tauri_args }}
 
+      - name: Verify Windows installer pair and checksums
+        if: ${{ matrix.id == 'windows-x64' }}
+        shell: pwsh
+        run: |
+          $installers = @(
+            Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi"
+            Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe"
+          )
+          if ($installers.Count -ne 2) { throw "Expected one MSI and one NSIS installer." }
+          $lines = $installers | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $lines | Set-Content -Encoding ascii SHA256SUMS-windows.txt
+
+      - name: Verify universal Mac app, DMG and checksum
+        if: ${{ matrix.id == 'macos-universal' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="src-tauri/target/universal-apple-darwin/release/bundle/macos/Midori Kanjo.app"
+          binary_path="$app_path/Contents/MacOS/midori-kanjo"
+          architectures="$(lipo -archs "$binary_path")"
+          [[ "$architectures" == *arm64* && "$architectures" == *x86_64* ]]
+          dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' -print -quit)"
+          test -n "$dmg_path"
+          hdiutil verify "$dmg_path"
+          shasum -a 256 "$dmg_path" > SHA256SUMS-macos.txt
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_path }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30

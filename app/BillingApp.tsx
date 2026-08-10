@@ -13,6 +13,7 @@ import {
   type Expense,
   type ExpenseCategory,
   type ExpensePaymentMode,
+  type FestivalEntry,
   type Invoice,
   type InvoiceCharge,
   type InvoiceChargeCode,
@@ -58,10 +59,17 @@ import {
   buildCashFlowReport,
   dateRangeLabel,
   expenseCategoryLabels,
+  inDateRange,
   recordExpense,
   removeExpense,
   restoreExpense,
 } from "../lib/cashflow";
+import {
+  buildDashboardTrendBuckets,
+  buildSalesSettlementReport,
+  dashboardPeriodRange,
+  type DashboardPeriod,
+} from "../lib/report-dashboard";
 import {
   formatLocalizedDate,
   formatLocalizedDateTime,
@@ -73,6 +81,16 @@ import {
   localizedUnitName,
   t,
 } from "../lib/i18n";
+import {
+  applyInterfaceScale,
+  interfaceScaleOptions,
+  INTERFACE_SCALE_META,
+  parseInterfaceScale,
+  readInterfaceScaleCache,
+  readInterfaceScaleCacheValue,
+  writeInterfaceScaleCache,
+  type InterfaceScale,
+} from "../lib/interface-scale";
 import {
   type BusinessSettings,
   type InvoiceFormat,
@@ -91,6 +109,18 @@ import {
   partyStatementLabel,
 } from "../lib/due-statement-export";
 import {
+  DuesBackupError,
+  importedDueActivityLabel,
+  previewDuesBackupRestore,
+  restoreDuesBackup,
+} from "../lib/due-backup";
+import {
+  DuesLedgerError,
+  previewDuesLedgerRestore,
+  restoreDuesLedger,
+} from "../lib/dues-ledger-archive";
+import {
+  isCapacitorApp,
   isNativeApp,
   openExternalUrl,
   shareNativeBlob,
@@ -118,6 +148,7 @@ import {
   defaultPrinterProfiles,
   defaultWorkspace,
   loadBillDraft,
+  isRestorableArchivedItem,
   logActivity,
   messageTemplatesForLanguage,
   mergeItems,
@@ -130,6 +161,7 @@ import {
   FAVOURITE_ITEMS_META,
   readJsonMeta,
   renderMessageTemplate,
+  restoreArchivedItem,
   saveBillDraft,
   variantFamily,
   withVariantFamily,
@@ -149,8 +181,34 @@ import {
   SyncCenterSheet,
 } from "./QolPanels";
 import { seedIfNeeded } from "../lib/seed";
-import AdvancedReports from "./AdvancedReports";
+import AdvancedReports, { type ReportKey } from "./AdvancedReports";
 import DotmSquare12 from "./DotmSquare12";
+import InventoryWorkspace, {
+  type InventoryOverlay,
+  type InventoryRoute,
+} from "./InventoryWorkspace";
+import { inventoryText } from "./inventory-copy";
+import {
+  applyTheme,
+  type AppTheme,
+  writeThemeCache,
+} from "../lib/theme";
+import FestivalWorkspace from "./FestivalWorkspace";
+import DueBackupSheet, {
+  type DueBackupPreviewSession,
+  type DueBackupSession,
+} from "./DueBackupSheet";
+import { dueBackupCopy } from "./due-backup-copy";
+import MasterBackupPanel from "./MasterBackupPanel";
+import {
+  ensureFestivalCalendar,
+  festivalEntryName,
+  festivalKeysForItem,
+  FESTIVAL_DEFINITIONS,
+  withFestivalKeys,
+  type FestivalKey,
+} from "../lib/festivals";
+import { festivalCopy, festivalText } from "./festival-copy";
 
 type Tab = "bill" | "parties" | "dues" | "items" | "misc" | "reports" | "more";
 type Sheet =
@@ -167,8 +225,11 @@ type Sheet =
   | "syncCenter"
   | "receipt"
   | "preview"
+  | "dueBackup"
   | null;
 type PartyEditorOrigin = "bill" | "parties" | "dues";
+type ProductEditorOrigin = "catalogue" | "inventoryInward";
+type ItemsMode = "catalogue" | "inventory" | "festival";
 type PadState = {
   title: string;
   value: number;
@@ -177,7 +238,7 @@ type PadState = {
 } | null;
 type DraftInvoiceCharge = InvoiceCharge & { enabled: boolean };
 type CounterDocument = "sale" | "quotation";
-type Theme = "light" | "dark";
+type Theme = AppTheme;
 
 const tr = (language: Language, en: string, hi: string, bn: string) =>
   language === "hi" ? hi : language === "bn" ? bn : en;
@@ -257,8 +318,12 @@ export default function BillingApp() {
   const [ready, setReady] = useState(false);
   const [startupError, setStartupError] = useState("");
   const [tab, setTab] = useState<Tab>("bill");
+  const [reportsInitialView, setReportsInitialView] = useState<ReportKey>("daily");
   const [language, setLanguage] = useState<Language>("en");
   const [theme, setTheme] = useState<Theme | null>(null);
+  const [interfaceScale, setInterfaceScale] = useState<InterfaceScale>(() =>
+    readInterfaceScaleCache(),
+  );
   const [ownerMode, setOwnerMode] = useState(false);
   const [ownerConfigured, setOwnerConfigured] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspacePreferences>(defaultWorkspace);
@@ -273,7 +338,7 @@ export default function BillingApp() {
   const [draftId, setDraftId] = useState(() => makeId());
   const [undoAction, setUndoAction] = useState<{ label: string; run: () => void } | null>(null);
   const [syncInfo, setSyncInfo] = useState<SyncDiagnostics>({
-    pending: { parties: 0, items: 0, prices: 0, invoices: 0, payments: 0, dues: 0, expenses: 0 },
+    pending: { categories: 0, parties: 0, items: 0, prices: 0, invoices: 0, payments: 0, dues: 0, expenses: 0, countSessions: 0, countLines: 0, stockMovements: 0 },
     totalPending: 0,
     conflictCount: 0,
   });
@@ -284,6 +349,12 @@ export default function BillingApp() {
   const [cloudRevision, setCloudRevision] = useState(0);
   const [pending, setPending] = useState(0);
   const [sheet, setSheet] = useState<Sheet>(null);
+  const [itemsMode, setItemsMode] = useState<ItemsMode>("catalogue");
+  const [inventoryRoute, setInventoryRoute] = useState<InventoryRoute>({ page: "hub" });
+  const [inventoryOverlay, setInventoryOverlay] = useState<InventoryOverlay>(null);
+  const [productEditorOrigin, setProductEditorOrigin] = useState<ProductEditorOrigin>("catalogue");
+  const [inventoryDraftItemId, setInventoryDraftItemId] = useState("");
+  const ownerIntentRef = useRef<null | (() => void)>(null);
   const [pad, setPad] = useState<PadState>(null);
   const [party, setParty] = useState<Party | undefined>();
   const [customerDraft, setCustomerDraft] =
@@ -306,6 +377,10 @@ export default function BillingApp() {
   const [editingItem, setEditingItem] = useState<Item | null>(null);
   const [selectedParty, setSelectedParty] = useState<Party | null>(null);
   const [selectedDueParty, setSelectedDueParty] = useState<Party | null>(null);
+  const [dueBackupSession, setDueBackupSession] = useState<DueBackupSession>(null);
+  const [dueBackupRestoring, setDueBackupRestoring] = useState(false);
+  const dueBackupRestoringRef = useRef(false);
+  const masterBackupRestoringRef = useRef(false);
   const [newPartyType, setNewPartyType] = useState<Party["type"]>("customer");
   const [partyEditorOrigin, setPartyEditorOrigin] =
     useState<PartyEditorOrigin>("parties");
@@ -317,6 +392,8 @@ export default function BillingApp() {
   const savingRef = useRef(false);
   const previousTabRef = useRef<Tab>("bill");
   const themeTransitionTimerRef = useRef<number | null>(null);
+  const interfaceScaleTransitionTimerRef = useRef<number | null>(null);
+  const interfaceScaleSaveTimerRef = useRef<number | null>(null);
   const [installEvent, setInstallEvent] = useState<InstallPromptEvent>();
 
   const parties = useLiveQuery(
@@ -332,6 +409,11 @@ export default function BillingApp() {
   const reportItems = useLiveQuery(() => db.items.toArray(), [], []);
   const categories = useLiveQuery(
     () => db.categories.orderBy("name").toArray(),
+    [],
+    [],
+  );
+  const festivalEntries = useLiveQuery(
+    () => db.festivalEntries.orderBy("startDate").toArray(),
     [],
     [],
   );
@@ -400,12 +482,27 @@ export default function BillingApp() {
       try {
         await seedIfNeeded();
         await reconcilePartyBalances();
-        const [storedLanguage, storedFormat, storedBusiness, storedGstEnabled, storedGstRate, storedWorkspace, storedProfiles, storedTemplates, storedFavourites, storedDraft, pinConfigured] = await Promise.all([
+        await ensureFestivalCalendar();
+        const [
+          storedLanguage,
+          storedFormat,
+          storedBusiness,
+          storedGstEnabled,
+          storedGstRate,
+          storedInterfaceScale,
+          storedWorkspace,
+          storedProfiles,
+          storedTemplates,
+          storedFavourites,
+          storedDraft,
+          pinConfigured,
+        ] = await Promise.all([
           db.meta.get("language"),
           db.meta.get("invoice-format"),
           db.meta.get("business-settings"),
           db.meta.get("bill-gst-enabled"),
           db.meta.get("bill-gst-rate"),
+          db.meta.get(INTERFACE_SCALE_META),
           readJsonMeta(WORKSPACE_META, defaultWorkspace),
           readJsonMeta(PRINTER_PROFILES_META, defaultPrinterProfiles),
           readJsonMeta(MESSAGE_TEMPLATES_META, defaultMessageTemplates),
@@ -436,6 +533,13 @@ export default function BillingApp() {
           setGstRate(
             Math.min(25, Math.max(0, Number(storedGstRate.value) || 18)),
           );
+        const loadedInterfaceScale =
+          readInterfaceScaleCacheValue() ??
+          parseInterfaceScale(storedInterfaceScale?.value) ??
+          100;
+        setInterfaceScale(loadedInterfaceScale);
+        applyInterfaceScale(loadedInterfaceScale);
+        writeInterfaceScaleCache(loadedInterfaceScale);
         const nextWorkspace = normalizeWorkspace(storedWorkspace);
         setWorkspace(nextWorkspace);
         setTab(nextWorkspace.startTab as Tab);
@@ -564,12 +668,16 @@ export default function BillingApp() {
   }, []);
   useEffect(() => {
     if (!theme) return;
-    document.documentElement.dataset.theme = theme;
-    window.localStorage.setItem("mantu-theme", theme);
+    applyTheme(theme);
+    writeThemeCache(theme);
     document
       .querySelector('meta[name="theme-color"]')
       ?.setAttribute("content", theme === "dark" ? "#101713" : "#014921");
   }, [theme]);
+  useEffect(() => {
+    applyInterfaceScale(interfaceScale);
+    writeInterfaceScaleCache(interfaceScale);
+  }, [interfaceScale]);
   useEffect(() => {
     previousTabRef.current = tab;
   }, [tab]);
@@ -631,12 +739,15 @@ export default function BillingApp() {
   }, []);
   useEffect(() => {
     if (!ownerMode) return;
-    let timer = window.setTimeout(() => setOwnerMode(false), 10 * 60 * 1000);
+    const expireOwnerMode = () => {
+      if (!masterBackupRestoringRef.current) setOwnerMode(false);
+    };
+    let timer = window.setTimeout(expireOwnerMode, 10 * 60 * 1000);
     const activity = () => {
       window.clearTimeout(timer);
-      timer = window.setTimeout(() => setOwnerMode(false), 10 * 60 * 1000);
+      timer = window.setTimeout(expireOwnerMode, 10 * 60 * 1000);
     };
-    const hidden = () => { if (document.hidden) setOwnerMode(false); };
+    const hidden = () => { if (document.hidden && !masterBackupRestoringRef.current) setOwnerMode(false); };
     document.addEventListener("visibilitychange", hidden);
     window.addEventListener("pointerdown", activity, { passive: true });
     window.addEventListener("keydown", activity);
@@ -648,6 +759,15 @@ export default function BillingApp() {
     };
   }, [ownerMode]);
   useEffect(() => {
+    const blockUnloadDuringRestore = (event: BeforeUnloadEvent) => {
+      if (!dueBackupRestoringRef.current && !masterBackupRestoringRef.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", blockUnloadDuringRestore);
+    return () => window.removeEventListener("beforeunload", blockUnloadDuringRestore);
+  }, []);
+  useEffect(() => {
     if (!ready) return;
     void syncDiagnostics().then(setSyncInfo).catch(() => undefined);
   }, [ready, pending, syncState]);
@@ -655,23 +775,52 @@ export default function BillingApp() {
     () => () => {
       if (themeTransitionTimerRef.current !== null)
         window.clearTimeout(themeTransitionTimerRef.current);
+      if (interfaceScaleTransitionTimerRef.current !== null)
+        window.clearTimeout(interfaceScaleTransitionTimerRef.current);
+      if (interfaceScaleSaveTimerRef.current !== null)
+        window.clearTimeout(interfaceScaleSaveTimerRef.current);
       document.documentElement.classList.remove("theme-transitioning");
+      document.documentElement.classList.remove("interface-scale-transitioning");
     },
     [],
   );
   useEffect(() => {
-    if (!isNativeApp()) return;
+    if (!isCapacitorApp()) return;
     let disposed = false;
     let listener: { remove: () => Promise<void> } | undefined;
     void import("@capacitor/app")
       .then(({ App }) =>
         App.addListener("backButton", () => {
+          if (masterBackupRestoringRef.current) return;
           if (pad) {
             setPad(null);
             return;
           }
           if (sheet) {
+            if (sheet === "dueBackup" && dueBackupRestoringRef.current) return;
+            if (sheet === "ownerPin") ownerIntentRef.current = null;
             setSheet(null);
+            return;
+          }
+          if (inventoryOverlay) {
+            setInventoryOverlay(null);
+            setInventoryDraftItemId("");
+            return;
+          }
+          if (tab === "items" && itemsMode === "festival") {
+            setItemsMode("catalogue");
+            return;
+          }
+          if (tab === "items" && itemsMode === "inventory" && inventoryRoute.page === "count" && inventoryRoute.reviewOpen) {
+            setInventoryRoute({ ...inventoryRoute, reviewOpen: false });
+            return;
+          }
+          if (tab === "items" && itemsMode === "inventory" && inventoryRoute.page !== "hub") {
+            setInventoryRoute({ page: "hub" });
+            return;
+          }
+          if (tab === "items" && itemsMode === "inventory") {
+            setItemsMode("catalogue");
             return;
           }
           if (selectedParty) {
@@ -709,7 +858,76 @@ export default function BillingApp() {
       disposed = true;
       if (listener) void listener.remove();
     };
-  }, [language, lines.length, pad, selectedDueParty, selectedParty, sheet, tab]);
+  }, [inventoryOverlay, inventoryRoute, itemsMode, language, lines.length, pad, selectedDueParty, selectedParty, sheet, tab]);
+
+  function requestInventoryOwner(resume: () => void) {
+    if (ownerMode) {
+      resume();
+      return;
+    }
+    ownerIntentRef.current = resume;
+    setSheet("ownerPin");
+  }
+
+  function closeDueBackup() {
+    if (dueBackupRestoringRef.current) return;
+    setDueBackupSession(null);
+    setDueBackupRestoring(false);
+    setSheet(null);
+  }
+
+  function confirmDuesBackupRestore(session: DueBackupPreviewSession) {
+    if (dueBackupRestoringRef.current) return;
+    const { fileName } = session;
+    const execute = async () => {
+      if (dueBackupRestoringRef.current) return;
+      dueBackupRestoringRef.current = true;
+      setSheet("dueBackup");
+      setDueBackupRestoring(true);
+      try {
+        const result = session.mode === "complete"
+          ? await restoreDuesLedger(session.preview.envelope)
+          : await restoreDuesBackup(session.preview.envelope);
+        if (session.mode === "legacy")
+          await reconcilePartyBalances().catch(() => undefined);
+        setDueBackupSession({ step: "result", mode: session.mode, fileName, result } as DueBackupSession);
+        setToast(tr(
+          language,
+          `${result.importedCount} customer ${session.mode === "complete" ? "histories" : "balances"} restored offline.`,
+          `${result.importedCount} कस्टमर ${session.mode === "complete" ? "की पूरी हिस्ट्री" : "बैलेंस"} ऑफलाइन रिस्टोर हुए।`,
+          `${result.importedCount}টি ক্রেতার ${session.mode === "complete" ? "সম্পূর্ণ ইতিহাস" : "ব্যালেন্স"} অফলাইনে ফিরিয়ে আনা হয়েছে।`,
+        ));
+        void queueSync();
+      } catch (cause) {
+        if (session.mode === "complete") {
+          const refreshed = await previewDuesLedgerRestore(session.preview.envelope).catch(() => session.preview);
+          setDueBackupSession({ step: "preview", mode: "complete", fileName, preview: refreshed });
+        } else {
+          const refreshed = await previewDuesBackupRestore(session.preview.envelope).catch(() => session.preview);
+          setDueBackupSession({ step: "preview", mode: "legacy", fileName, preview: refreshed });
+        }
+        setToast(
+          cause instanceof DuesBackupError || cause instanceof DuesLedgerError
+            ? tr(
+                language,
+                "The dues restore was stopped safely. Review the conflicts and try again.",
+                "बाकी रिस्टोर सुरक्षित रूप से रोक दिया गया। टकराव जाँचकर फिर कोशिश करें।",
+                "বাকি ফিরিয়ে আনা নিরাপদে বন্ধ হয়েছে। দ্বন্দ্ব দেখে আবার চেষ্টা করুন।",
+              )
+            : tr(
+                language,
+                "The balances could not be restored.",
+                "बैलेंस रिस्टोर नहीं हुए।",
+                "ব্যালেন্স ফিরিয়ে আনা যায়নি।",
+              ),
+        );
+      } finally {
+        dueBackupRestoringRef.current = false;
+        setDueBackupRestoring(false);
+      }
+    };
+    requestInventoryOwner(() => void execute());
+  }
 
   async function chooseParty(next?: Party | BillingCustomerDraft) {
     const existing = next && "id" in next ? next : undefined;
@@ -844,6 +1062,11 @@ export default function BillingApp() {
     const displayName = localizedItemName(language, item);
     setEditingItem(null);
     setSheet(null);
+    if (productEditorOrigin === "inventoryInward" && mode === "created") {
+      setInventoryDraftItemId(item.id);
+      setItemsMode("inventory");
+      setInventoryOverlay("inward");
+    }
     setPending(await pendingCount());
     setToast(
       mode === "created"
@@ -856,6 +1079,38 @@ export default function BillingApp() {
     void syncNow(setSyncState)
       .then(() => pendingCount())
       .then(setPending);
+  }
+
+  async function restoreProduct(item: Item) {
+    try {
+      const restored = await restoreArchivedItem(
+        item.id,
+        ownerMode ? "owner" : "staff",
+      );
+      setPending(await pendingCount());
+      setToast(
+        tr(
+          language,
+          `${localizedItemName(language, restored)} restored to active products`,
+          `${localizedItemName(language, restored)} फिर से चालू प्रोडक्ट में आ गया`,
+          `${localizedItemName(language, restored)} আবার চালু পণ্যে ফিরে এসেছে`,
+        ),
+      );
+      void syncNow(setSyncState)
+        .then(() => pendingCount())
+        .then(setPending);
+    } catch (error) {
+      setToast(
+        language === "en" && error instanceof Error
+          ? error.message
+          : tr(
+              language,
+              "Could not restore this product.",
+              "यह प्रोडक्ट वापस नहीं लाया जा सका।",
+              "এই পণ্য ফিরিয়ে আনা যায়নি।",
+            ),
+      );
+    }
   }
 
   async function expenseChanged(message: string) {
@@ -980,6 +1235,18 @@ export default function BillingApp() {
               mode: paymentMode,
               amount: paymentPlan === "full" ? bill.grandTotal : paid,
             } satisfies InvoicePaymentAllocation];
+      const receivedNow = paymentPlan === "credit"
+        ? 0
+        : splitPayment
+          ? roundMoney(
+              tenderBreakdown.reduce(
+                (sum, entry) => sum + roundMoney(entry.amount),
+                0,
+              ),
+            )
+          : paymentPlan === "full"
+            ? bill.grandTotal
+            : paid;
       invoice =
         counterDocument === "quotation"
           ? await saveQuotation({ party, customerDraft, lines, otherCharges: appliedCharges, idempotencyKey: draftId })
@@ -988,8 +1255,12 @@ export default function BillingApp() {
               party,
               customerDraft,
               lines,
-              paid,
-              paymentMode: paymentPlan === "credit" ? "credit" : paymentMode,
+              paid: receivedNow,
+              paymentMode: paymentPlan === "credit"
+                ? "credit"
+                : splitPayment
+                  ? "mixed"
+                  : paymentMode,
               paymentBreakdown: tenderBreakdown,
               paymentPlan,
               otherCharges: appliedCharges,
@@ -1203,6 +1474,43 @@ export default function BillingApp() {
     setTheme(next);
   }
 
+  function changeInterfaceScale(next: InterfaceScale) {
+    if (!interfaceScaleOptions.includes(next) || next === interfaceScale) return;
+    const root = document.documentElement;
+    const reduceMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    if (!reduceMotion) {
+      root.classList.add("interface-scale-transitioning");
+      if (interfaceScaleTransitionTimerRef.current !== null)
+        window.clearTimeout(interfaceScaleTransitionTimerRef.current);
+      interfaceScaleTransitionTimerRef.current = window.setTimeout(() => {
+        root.classList.remove("interface-scale-transitioning");
+        interfaceScaleTransitionTimerRef.current = null;
+      }, 260);
+    }
+
+    applyInterfaceScale(next);
+    writeInterfaceScaleCache(next);
+    setInterfaceScale(next);
+
+    if (interfaceScaleSaveTimerRef.current !== null)
+      window.clearTimeout(interfaceScaleSaveTimerRef.current);
+    interfaceScaleSaveTimerRef.current = window.setTimeout(() => {
+      interfaceScaleSaveTimerRef.current = null;
+      void savePreference(INTERFACE_SCALE_META, next).catch(() => {
+        setToast(
+          tr(
+            language,
+            "Interface size changed for now, but could not be saved on this device.",
+            "इंटरफ़ेस का साइज़ अभी बदल गया है, लेकिन इस डिवाइस में सेव नहीं हुआ।",
+            "ইন্টারফেসের আকার এখন বদলেছে, কিন্তু এই ডিভাইসে সেভ হয়নি।",
+          ),
+        );
+      });
+    }, 180);
+  }
+
   const previousTab = previousTabRef.current;
   const pageDirection =
     previousTab === tab
@@ -1327,13 +1635,23 @@ export default function BillingApp() {
               onSplitPayment={(enabled) => {
                 setSplitPayment(enabled);
                 if (!enabled) {
+                  const firstTender = paymentBreakdown.find((entry) => entry.amount > 0);
+                  if (firstTender) setPaymentMode(firstTender.mode);
                   setPaymentBreakdown([]);
-                  setPaid(0);
+                  if (paymentPlan === "full") setPaid(0);
                 }
               }}
               onPaymentBreakdown={(next) => {
-                setPaymentBreakdown(next);
-                setPaid(roundMoney(next.reduce((sum, entry) => sum + entry.amount, 0)));
+                const normalized = next.map((entry) => ({
+                  ...entry,
+                  amount: roundMoney(entry.amount),
+                }));
+                setPaymentBreakdown(normalized);
+                setPaid(
+                  roundMoney(
+                    normalized.reduce((sum, entry) => sum + entry.amount, 0),
+                  ),
+                );
               }}
               onSave={finishSale}
             />
@@ -1390,32 +1708,104 @@ export default function BillingApp() {
                 setSelectedParty(next);
                 setSheet("payment");
               }}
+              onBackup={() => {
+                setDueBackupSession(null);
+                setSheet("dueBackup");
+              }}
               onToast={(message) => { setToast(message); void queueSync(); }}
             />
           )}
           {tab === "items" && (
-            <ItemsScreen
-              items={items}
-              language={language}
-              ownerMode={ownerMode}
-              onOwnerMode={(enabled) => {
-                if (!enabled) setOwnerMode(false);
-                else setSheet("ownerPin");
-              }}
-              onAdd={(item) => {
-                addItem(item);
-                setTab("bill");
-              }}
-              onCreate={() => {
-                setEditingItem(null);
-                setSheet("product");
-              }}
-              onEdit={(item) => {
-                setEditingItem(item);
-                setSheet("product");
-              }}
-              onPhoto={updateItemPhoto}
-            />
+            itemsMode === "inventory" ? (
+              <InventoryWorkspace
+                items={items}
+                allItems={reportItems}
+                parties={parties}
+                invoices={invoices}
+                categories={categories}
+                language={language}
+                ownerMode={ownerMode}
+                route={inventoryRoute}
+                overlay={inventoryOverlay}
+                onRoute={setInventoryRoute}
+                onOverlay={(next) => {
+                  setInventoryOverlay(next);
+                  if (next !== "inward") setInventoryDraftItemId("");
+                }}
+                onBackCatalogue={() => {
+                  setInventoryOverlay(null);
+                  setInventoryDraftItemId("");
+                  setInventoryRoute({ page: "hub" });
+                  setItemsMode("catalogue");
+                }}
+                onChanged={(message) => {
+                  setToast(message);
+                  void queueSync();
+                }}
+                onRequestOwner={requestInventoryOwner}
+                preferredItemId={inventoryDraftItemId}
+                onCreateProduct={() => {
+                  setProductEditorOrigin("inventoryInward");
+                  setEditingItem(null);
+                  setSheet("product");
+                }}
+                onClose={() => setInventoryOverlay(null)}
+              />
+            ) : itemsMode === "festival" ? (
+              <FestivalWorkspace
+                items={reportItems}
+                categories={categories}
+                invoices={invoices}
+                language={language}
+                ownerMode={ownerMode}
+                onBackCatalogue={() => setItemsMode("catalogue")}
+                onOpenReports={() => {
+                  setReportsInitialView("dead");
+                  setItemsMode("catalogue");
+                  setTab("reports");
+                }}
+                onChanged={(message) => {
+                  setToast(message);
+                  void queueSync();
+                }}
+              />
+            ) : (
+              <ItemsScreen
+                items={items}
+                archivedItems={reportItems.filter(isRestorableArchivedItem)}
+                language={language}
+                ownerMode={ownerMode}
+                onOwnerMode={(enabled) => {
+                  if (!enabled) setOwnerMode(false);
+                  else setSheet("ownerPin");
+                }}
+                onInventory={() => {
+                  setInventoryRoute({ page: "hub" });
+                  setInventoryOverlay(null);
+                  setItemsMode("inventory");
+                }}
+                onFestival={() => {
+                  setInventoryOverlay(null);
+                  setItemsMode("festival");
+                }}
+                onAdd={(item) => {
+                  addItem(item);
+                  setTab("bill");
+                }}
+                onCreate={() => {
+                  setProductEditorOrigin("catalogue");
+                  setEditingItem(null);
+                  setSheet("product");
+                }}
+                onEdit={(item) => {
+                  setProductEditorOrigin("catalogue");
+                  setEditingItem(item);
+                  setSheet("product");
+                }}
+                onRestore={restoreProduct}
+                onPhoto={updateItemPhoto}
+              />
+            )
           )}
           {tab === "misc" && (
             <MiscellaneousScreen
@@ -1435,7 +1825,12 @@ export default function BillingApp() {
               items={reportItems}
               language={language}
               ownerMode={ownerMode}
+              cloudConfigured={isCloudConfigured()}
+              initialAdvancedReport={reportsInitialView}
               onOwnerUnlock={() => setSheet("ownerPin")}
+              onMasterRestoringChange={(restoring) => {
+                masterBackupRestoringRef.current = restoring;
+              }}
               business={business}
               format={invoiceFormat}
               catalogueTemplate={outgoingMessageTemplates.catalogue}
@@ -1454,6 +1849,7 @@ export default function BillingApp() {
             <MoreScreen
               language={language}
               theme={theme || "light"}
+              interfaceScale={interfaceScale}
               format={invoiceFormat}
               business={business}
               invoices={invoices}
@@ -1464,6 +1860,7 @@ export default function BillingApp() {
               onCloudDisconnect={disconnectCloud}
               onLanguage={changeLanguage}
               onTheme={changeTheme}
+              onInterfaceScale={changeInterfaceScale}
               onFormat={(next) => {
                 setInvoiceFormat(next);
                 savePreference("invoice-format", next);
@@ -1486,8 +1883,25 @@ export default function BillingApp() {
               }}
               onInstall={() => void promptInstall()}
               onToast={(message) => { setToast(message); void queueSync(); }}
+              onInventory={() => {
+                setSelectedParty(null);
+                setSelectedDueParty(null);
+                setInventoryOverlay(null);
+                setInventoryRoute({ page: "hub" });
+                setItemsMode("inventory");
+                setTab("items");
+              }}
+              onFestival={() => {
+                setSelectedParty(null);
+                setSelectedDueParty(null);
+                setInventoryOverlay(null);
+                setItemsMode("festival");
+                setTab("items");
+              }}
               onNavigate={(next) => {
+                if (next === "reports") setReportsInitialView("daily");
                 setTab(next);
+                if (next === "items") setItemsMode("catalogue");
                 if (next !== "parties") setSelectedParty(null);
                 if (next !== "dues") setSelectedDueParty(null);
               }}
@@ -1548,7 +1962,13 @@ export default function BillingApp() {
           language={language}
           workspace={workspace}
           onChange={(next) => {
+            if (next === "reports") setReportsInitialView("daily");
             setTab(next);
+            if (next === "items") setItemsMode("catalogue");
+            else {
+              setInventoryOverlay(null);
+              setInventoryRoute({ page: "hub" });
+            }
             if (next !== "parties") setSelectedParty(null);
             if (next !== "dues") setSelectedDueParty(null);
           }}
@@ -1597,12 +2017,17 @@ export default function BillingApp() {
         <ProductEditor
           item={editingItem}
           categories={categories}
+          festivalEntries={festivalEntries}
           language={language}
           ownerMode={ownerMode}
           onPad={setPad}
           onClose={() => {
             setEditingItem(null);
             setSheet(null);
+            if (productEditorOrigin === "inventoryInward") {
+              setItemsMode("inventory");
+              setInventoryOverlay("inward");
+            }
           }}
           onSaved={productSaved}
         />
@@ -1710,6 +2135,23 @@ export default function BillingApp() {
           }}
         />
       )}
+      {sheet === "dueBackup" && (
+        <DueBackupSheet
+          parties={parties}
+          invoices={invoices}
+          payments={payments}
+          accountEntries={accountEntries}
+          business={business}
+          language={language}
+          ownerMode={ownerMode}
+          session={dueBackupSession}
+          restoring={dueBackupRestoring}
+          onSession={setDueBackupSession}
+          onConfirm={confirmDuesBackupRestore}
+          onClose={closeDueBackup}
+          onToast={setToast}
+        />
+      )}
       {sheet === "invoice" && lastInvoice && (
         <InvoiceSaved
           invoice={lastInvoice}
@@ -1728,11 +2170,17 @@ export default function BillingApp() {
         <OwnerPinSheet
           language={language}
           configured={ownerConfigured}
-          onClose={() => setSheet(null)}
+          onClose={() => {
+            ownerIntentRef.current = null;
+            setSheet(null);
+          }}
           onUnlocked={() => {
             setOwnerConfigured(true);
             setOwnerMode(true);
             setSheet(null);
+            const resume = ownerIntentRef.current;
+            ownerIntentRef.current = null;
+            resume?.();
           }}
           onToast={setToast}
         />
@@ -1883,10 +2331,10 @@ function AppHeader({
           M
         </div>
         <div className="app-header-brand-copy min-w-0">
-          <h1 className="truncate text-[14px] font-black tracking-tight md:text-[15px]">
+          <h1 className="truncate text-[0.875rem] font-black tracking-tight md:text-[0.9375rem]">
             Midori Kanjo
           </h1>
-          <p className="truncate text-[9px] font-semibold text-[#6d7973] md:text-[10px]">
+          <p className="truncate text-[0.5625rem] font-semibold text-[#6d7973] md:text-[0.625rem]">
             {tr(
               language,
               "Made by Sayan Finance",
@@ -1966,7 +2414,7 @@ function AppHeader({
             <option value="bn">বাং</option>
           </select>
         </label>
-        <button type="button" onClick={onSync} aria-label={label} title={label} className="app-sync-button flex min-h-10 items-center gap-2 rounded-full border border-[#ded9ce] bg-white px-2.5 py-2 text-[10px] font-extrabold md:px-3">
+        <button type="button" onClick={onSync} aria-label={label} title={label} className="app-sync-button flex min-h-10 items-center gap-2 rounded-full border border-[#ded9ce] bg-white px-2.5 py-2 text-[0.625rem] font-extrabold md:px-3">
           <span
             className={`h-2.5 w-2.5 rounded-full ${color} ${state === "syncing" ? "animate-pulse" : ""}`}
           />
@@ -2064,12 +2512,21 @@ function BillScreen({
   const isQuotation = documentType === "quotation";
   const taxable = Math.max(0, bill.subtotal - bill.discountTotal);
   const hasCustomer = Boolean(party || customerDraft?.name.trim());
-  const splitMatchesTotal = Math.abs(paid - bill.grandTotal) < 0.01;
+  const splitMatchesTotal =
+    Math.abs(roundMoney(paid - bill.grandTotal)) < 0.01;
+  const splitHasMultipleMethods =
+    paymentBreakdown.filter((entry) => entry.amount > 0).length >= 2;
+  const splitDifference = roundMoney(bill.grandTotal - paid);
+  const splitRemaining = Math.max(0, splitDifference);
+  const splitOver = Math.max(0, -splitDifference);
   const paymentReady =
     isQuotation ||
-    (paymentPlan === "full" ? !splitPayment || splitMatchesTotal :
+    (paymentPlan === "full" ? !splitPayment || (splitMatchesTotal && splitHasMultipleMethods) :
       hasCustomer &&
-        (paymentPlan === "credit" || (paid > 0 && paid < bill.grandTotal)));
+        (paymentPlan === "credit" ||
+          (paid > 0 &&
+            paid < bill.grandTotal &&
+            (!splitPayment || splitHasMultipleMethods))));
   const projectedBalance = (party?.currentBalance || 0) + bill.amountDue;
   const documentLabel = isQuotation
     ? t(language, "newQuotation")
@@ -2082,7 +2539,13 @@ function BillScreen({
       mode,
       amount: 0,
     };
-    const nextEntry = { ...current, ...patch };
+    const nextEntry = {
+      ...current,
+      ...patch,
+      ...(patch.amount === undefined
+        ? {}
+        : { amount: roundMoney(patch.amount) }),
+    };
     const next = paymentBreakdown.filter((entry) => entry.mode !== mode);
     if (nextEntry.amount > 0 || nextEntry.reference?.trim()) next.push(nextEntry);
     next.sort((a, b) => paymentChannels.indexOf(a.mode) - paymentChannels.indexOf(b.mode));
@@ -2092,7 +2555,7 @@ function BillScreen({
     <section className="bill-screen mx-auto max-w-5xl px-3 py-4 md:px-7 md:py-6">
       <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <p className="text-[11px] font-black uppercase tracking-[.15em] text-[#d86f29]">
+          <p className="text-[0.6875rem] font-black uppercase tracking-[.15em] text-[#d86f29]">
             {t(language, "fastCounter")}
           </p>
           <h2 className="mt-1 text-2xl font-black">{documentLabel}</h2>
@@ -2102,7 +2565,7 @@ function BillScreen({
             type="button"
             aria-pressed={!isQuotation}
             onClick={() => onDocumentType("sale")}
-            className={`min-h-10 rounded-lg px-3 text-[10px] font-black ${!isQuotation ? "bg-[#014921] text-white" : "text-[#66736d]"}`}
+            className={`min-h-10 rounded-lg px-3 text-[0.625rem] font-black ${!isQuotation ? "bg-[#014921] text-white" : "text-[#66736d]"}`}
           >
             {t(language, "saleBill")}
           </button>
@@ -2110,14 +2573,14 @@ function BillScreen({
             type="button"
             aria-pressed={isQuotation}
             onClick={() => onDocumentType("quotation")}
-            className={`min-h-10 rounded-lg px-3 text-[10px] font-black ${isQuotation ? "bg-[#ef7d32] text-white" : "text-[#66736d]"}`}
+            className={`min-h-10 rounded-lg px-3 text-[0.625rem] font-black ${isQuotation ? "bg-[#ef7d32] text-white" : "text-[#66736d]"}`}
           >
             {t(language, "quotation")}
           </button>
         </div>
-        {draftSavedAt && <span className="rounded-full bg-[#f4faf0] px-3 py-2 text-[9px] font-black text-[#267055]">✓ {tr(language, "Draft saved", "ड्राफ्ट सेव हुआ", "ড্রাফ্ট সেভ হয়েছে")} {formatLocalizedDateTime(draftSavedAt, language, { hour: "2-digit", minute: "2-digit" })}</span>}
+        {draftSavedAt && <span className="rounded-full bg-[#f4faf0] px-3 py-2 text-[0.5625rem] font-black text-[#267055]">✓ {tr(language, "Draft saved", "ड्राफ्ट सेव हुआ", "ড্রাফ্ট সেভ হয়েছে")} {formatLocalizedDateTime(draftSavedAt, language, { hour: "2-digit", minute: "2-digit" })}</span>}
       </div>
-      <div className="bill-workspace-grid grid gap-4 md:grid-cols-[1.45fr_.75fr]">
+      <div className="bill-workspace-grid grid gap-4 xl:grid-cols-[1.45fr_.75fr]">
         <div>
           <div className="mb-3 grid grid-cols-[minmax(0,1fr)_108px] gap-2">
             <button
@@ -2125,7 +2588,7 @@ function BillScreen({
               className="flex min-h-16 min-w-0 items-center justify-between rounded-2xl border-2 border-[#d8d4c9] bg-white px-4 text-left shadow-sm active:scale-[.99]"
             >
               <div className="min-w-0">
-                <span className="text-[10px] font-extrabold uppercase tracking-wide text-[#728079]">
+                <span className="text-[0.625rem] font-extrabold uppercase tracking-wide text-[#728079]">
                   {t(language, "customer")}
                 </span>
                 <div
@@ -2139,7 +2602,7 @@ function BillScreen({
                   </div>
                 )}
                 {!party && customerDraft && (
-                  <div className="mt-1 truncate text-[10px] font-semibold text-[#267055]">
+                  <div className="mt-1 truncate text-[0.625rem] font-semibold text-[#267055]">
                     {tr(language, "New customer · saves with bill", "नया कस्टमर · बिल के साथ सेव होगा", "নতুন কাস্টমার · বিলের সঙ্গে সেভ হবে")}
                   </div>
                 )}
@@ -2149,7 +2612,7 @@ function BillScreen({
             <button
               type="button"
               onClick={onNewCustomer}
-              className="flex min-h-16 flex-col items-center justify-center rounded-2xl border border-[#8fbd9f] bg-[#f4faf0] px-2 text-center text-[10px] font-black leading-tight text-[#014921]"
+              className="flex min-h-16 flex-col items-center justify-center rounded-2xl border border-[#8fbd9f] bg-[#f4faf0] px-2 text-center text-[0.625rem] font-black leading-tight text-[#014921]"
             >
               <span className="mb-1 text-xl leading-none text-[#309d4b]">
                 ＋
@@ -2157,7 +2620,7 @@ function BillScreen({
               {t(language, "newCustomer")}
             </button>
           </div>
-          {party && partySummary && <div className="mb-3 grid grid-cols-2 gap-2 rounded-2xl border border-[#e2e2db] bg-[#f7f5ef] p-3 sm:grid-cols-4"><div><span className="field-caption">{tr(language, "Price tier", "रेट ग्रुप", "রেট গ্রুপ")}</span><strong className="mt-1 block text-[11px] capitalize">{localizedPriceTierName(language, partySummary.tier)}</strong></div><div><span className="field-caption">{tr(language, "Last bill", "पिछला बिल", "আগের বিল")}</span><strong className="mt-1 block text-[11px]">{partySummary.latestInvoice ? `${formatLocalizedDate(partySummary.latestInvoice.date, language, { day: "2-digit", month: "short" })} · ${formatMoney(partySummary.latestInvoice.grandTotal)}` : tr(language, "None", "कोई नहीं", "কিছু নেই")}</strong></div><div><span className="field-caption">{t(language, "lastPayment")}</span><strong className="mt-1 block text-[11px]">{partySummary.latestPayment ? `${formatLocalizedDate(partySummary.latestPayment.date, language, { day: "2-digit", month: "short" })} · ${formatMoney(partySummary.latestPayment.amount)}` : tr(language, "None", "कोई नहीं", "কিছু নেই")}</strong></div><button type="button" disabled={!partySummary.latestInvoice} onClick={onRepeat} className="min-h-11 rounded-lg border border-[#014921] bg-white px-2 text-[9px] font-black text-[#014921] disabled:opacity-40">↻ {tr(language, "Repeat last bill", "पिछला बिल दोहराएँ", "আগের বিল আবার নিন")}</button></div>}
+          {party && partySummary && <div className="mb-3 grid grid-cols-2 gap-2 rounded-2xl border border-[#e2e2db] bg-[#f7f5ef] p-3 sm:grid-cols-4"><div><span className="field-caption">{tr(language, "Price tier", "रेट ग्रुप", "রেট গ্রুপ")}</span><strong className="mt-1 block text-[0.6875rem] capitalize">{localizedPriceTierName(language, partySummary.tier)}</strong></div><div><span className="field-caption">{tr(language, "Last bill", "पिछला बिल", "আগের বিল")}</span><strong className="mt-1 block text-[0.6875rem]">{partySummary.latestInvoice ? `${formatLocalizedDate(partySummary.latestInvoice.date, language, { day: "2-digit", month: "short" })} · ${formatMoney(partySummary.latestInvoice.grandTotal)}` : tr(language, "None", "कोई नहीं", "কিছু নেই")}</strong></div><div><span className="field-caption">{t(language, "lastPayment")}</span><strong className="mt-1 block text-[0.6875rem]">{partySummary.latestPayment ? `${formatLocalizedDate(partySummary.latestPayment.date, language, { day: "2-digit", month: "short" })} · ${formatMoney(partySummary.latestPayment.amount)}` : tr(language, "None", "कोई नहीं", "কিছু নেই")}</strong></div><button type="button" disabled={!partySummary.latestInvoice} onClick={onRepeat} className="min-h-11 rounded-lg border border-[#014921] bg-white px-2 text-[0.5625rem] font-black text-[#014921] disabled:opacity-40">↻ {tr(language, "Repeat last bill", "पिछला बिल दोहराएँ", "আগের বিল আবার নিন")}</button></div>}
           <button
             onClick={onItem}
             className="mb-3 flex min-h-14 w-full items-center gap-3 rounded-2xl bg-[#ef7d32] px-4 text-left font-black text-white shadow-lg shadow-orange-900/10 active:scale-[.99]"
@@ -2168,7 +2631,7 @@ function BillScreen({
               {items.length} {t(language, "items")}
             </span>
           </button>
-          {quickItems.length > 0 && <div className="mb-3"><div className="mb-2 flex items-center justify-between"><p className="field-caption">{language === "hi" ? "क्विक आइटम · पसंदीदा पहले" : language === "bn" ? "কুইক আইটেম · পছন্দেরগুলো আগে" : "Quick products · favourites first"}</p><span className="text-[8px] text-[#747573]">{language === "hi" ? "पिन करने के लिए ☆ दबाएँ" : language === "bn" ? "পিন করতে ☆ চাপুন" : "Tap ☆ to pin"}</span></div><div className="grid grid-cols-2 gap-2 sm:grid-cols-4">{quickItems.map((item) => <div key={item.id} className="relative"><button type="button" onClick={() => onQuickItem(item)} className="flex min-h-[76px] w-full items-center gap-2 rounded-xl border border-[#e2e2db] bg-white p-2 pr-12 text-left"><ProductThumb item={item} language={language} className="h-10 w-10"/><span className="min-w-0"><strong className="block truncate text-[10px]">{localizedItemName(language, item)}</strong><span className="mt-1 block text-[8px] text-[#747573]">{item.skuCode}</span></span></button><button type="button" aria-label={`${favouriteItemIds.includes(item.id) ? (language === "hi" ? "पसंदीदा से हटाएँ" : language === "bn" ? "পছন্দের তালিকা থেকে সরান" : "Remove favourite") : (language === "hi" ? "पसंदीदा में जोड़ें" : language === "bn" ? "পছন্দের তালিকায় যোগ করুন" : "Add favourite")}: ${localizedItemName(language, item)}`} onClick={() => onFavourite(item)} className="absolute right-1 top-1 grid h-11 w-11 place-items-center rounded-lg bg-[#f4faf0] text-base text-[#014921]">{favouriteItemIds.includes(item.id) ? "★" : "☆"}</button></div>)}</div></div>}
+          {quickItems.length > 0 && <div className="mb-3"><div className="mb-2 flex items-center justify-between"><p className="field-caption">{language === "hi" ? "क्विक आइटम · पसंदीदा पहले" : language === "bn" ? "কুইক আইটেম · পছন্দেরগুলো আগে" : "Quick products · favourites first"}</p><span className="text-[0.5rem] text-[#747573]">{language === "hi" ? "पिन करने के लिए ☆ दबाएँ" : language === "bn" ? "পিন করতে ☆ চাপুন" : "Tap ☆ to pin"}</span></div><div className="grid grid-cols-2 gap-2 sm:grid-cols-4">{quickItems.map((item) => <div key={item.id} className="relative"><button type="button" onClick={() => onQuickItem(item)} className="flex min-h-[76px] w-full items-center gap-2 rounded-xl border border-[#e2e2db] bg-white p-2 pr-12 text-left"><ProductThumb item={item} language={language} className="h-10 w-10"/><span className="min-w-0"><strong className="block truncate text-[0.625rem]">{localizedItemName(language, item)}</strong><span className="mt-1 block text-[0.5rem] text-[#747573]">{item.skuCode}</span></span></button><button type="button" aria-label={`${favouriteItemIds.includes(item.id) ? (language === "hi" ? "पसंदीदा से हटाएँ" : language === "bn" ? "পছন্দের তালিকা থেকে সরান" : "Remove favourite") : (language === "hi" ? "पसंदीदा में जोड़ें" : language === "bn" ? "পছন্দের তালিকায় যোগ করুন" : "Add favourite")}: ${localizedItemName(language, item)}`} onClick={() => onFavourite(item)} className="absolute right-1 top-1 grid h-11 w-11 place-items-center rounded-lg bg-[#f4faf0] text-base text-[#014921]">{favouriteItemIds.includes(item.id) ? "★" : "☆"}</button></div>)}</div></div>}
           <GstControl
             language={language}
             enabled={gstEnabled}
@@ -2208,7 +2671,7 @@ function BillScreen({
             </div>
           )}
         </div>
-        <aside className="bill-summary-panel h-fit rounded-3xl border border-[#ddd7ca] bg-white p-4 shadow-sm md:sticky md:top-24">
+        <aside className="bill-summary-panel h-fit rounded-3xl border border-[#ddd7ca] bg-white p-4 shadow-sm xl:sticky xl:top-24">
           <h3 className="text-sm font-black">
             {isQuotation
               ? t(language, "quotationSummary")
@@ -2219,7 +2682,7 @@ function BillScreen({
               <strong className="text-xs text-[#014921]">
                 {t(language, "estimateOnly")}
               </strong>
-              <p className="mt-1 text-[9px] font-semibold leading-4 text-[#66736d]">
+              <p className="mt-1 text-[0.5625rem] font-semibold leading-4 text-[#66736d]">
                 {t(language, "estimateHelp")}
               </p>
             </div>
@@ -2245,7 +2708,7 @@ function BillScreen({
                             apply: onPaid,
                           });
                       }}
-                      className={`min-h-12 rounded-xl border px-1 text-[10px] font-black ${paymentPlan === plan ? "border-[#014921] bg-[#014921] text-white" : "border-[#ddd7ca] bg-white text-[#40544c]"}`}
+                      className={`min-h-12 rounded-xl border px-1 text-[0.625rem] font-black ${paymentPlan === plan ? "border-[#014921] bg-[#014921] text-white" : "border-[#ddd7ca] bg-white text-[#40544c]"}`}
                     >
                       {t(
                         language,
@@ -2282,25 +2745,50 @@ function BillScreen({
               )}
               {paymentPlan !== "credit" && (
                 <>
-                  <div className="mb-2 mt-3 flex items-center justify-between gap-2">
+                  <div className="mb-2 mt-3">
                     <p className="field-caption">
                       {tr(language, "Payment method", "पेमेंट का तरीका", "পেমেন্টের মাধ্যম")}
                     </p>
-                    <button
-                      type="button"
-                      aria-pressed={splitPayment}
-                      onClick={() => {
-                        const enabled = !splitPayment;
-                        onSplitPayment(enabled);
-                        if (enabled) {
+                    <div className="mt-2 grid grid-cols-2 rounded-xl border border-[#d8d2c6] bg-[#f6f3ec] p-1">
+                      <button
+                        type="button"
+                        aria-pressed={!splitPayment}
+                        onClick={() => onSplitPayment(false)}
+                        className={`min-h-11 rounded-lg px-2 text-[0.625rem] font-black transition-colors duration-200 ${!splitPayment ? "bg-[#173f35] text-white shadow-sm" : "text-[#53635c]"}`}
+                      >
+                        {tr(language, "One method", "एक तरीका", "একটি মাধ্যম")}
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={splitPayment}
+                        onClick={() => {
+                          if (splitPayment) return;
+                          onSplitPayment(true);
                           const seedAmount = paymentPlan === "full" ? bill.grandTotal : paid;
                           onPaymentBreakdown(seedAmount > 0 ? [{ mode: paymentMode, amount: seedAmount }] : []);
-                        }
-                      }}
-                      className={`min-h-9 rounded-lg border px-2 text-[9px] font-black ${splitPayment ? "border-[#ef7d32] bg-[#fff0df] text-[#9a4f22]" : "border-[#d8d2c6] bg-white text-[#53635c]"}`}
-                    >
-                      {tr(language, "Split payment", "अलग-अलग पेमेंट", "ভাগ করে পেমেন্ট")}
-                    </button>
+                        }}
+                        className={`min-h-11 rounded-lg px-2 text-[0.625rem] font-black transition-colors duration-200 ${splitPayment ? "bg-[#ef7d32] text-white shadow-sm" : "text-[#53635c]"}`}
+                      >
+                        {tr(language, "Split methods", "कई तरीकों से", "একাধিক মাধ্যমে")}
+                      </button>
+                    </div>
+                    {splitPayment && (
+                      <p className="mt-2 text-[0.5625rem] font-semibold leading-4 text-[#66736d]">
+                        {paymentPlan === "full"
+                          ? tr(
+                              language,
+                              "Use two or more methods for this bill. This settles the bill now and creates no due.",
+                              "इस बिल के लिए दो या अधिक तरीके इस्तेमाल करें। बिल अभी पूरा चुक जाएगा और कोई उधार नहीं बनेगा।",
+                              "এই বিলের জন্য দুই বা তার বেশি মাধ্যম ব্যবহার করুন। বিল এখনই পুরো মিটবে, কোনো বাকি তৈরি হবে না।",
+                            )
+                          : tr(
+                              language,
+                              "Receive through two or more methods now. Only the unpaid balance will be added to dues.",
+                              "अभी दो या अधिक तरीकों से रकम लें। केवल बाकी रकम उधार में जाएगी।",
+                              "এখন দুই বা তার বেশি মাধ্যমে টাকা নিন। শুধু বাকি অংশ বাকিতে যোগ হবে।",
+                            )}
+                      </p>
+                    )}
                   </div>
                   {!splitPayment ? (
                     <div className="grid grid-cols-4 gap-2">
@@ -2310,7 +2798,7 @@ function BillScreen({
                           key={mode}
                           aria-pressed={paymentMode === mode}
                           onClick={() => onMode(mode)}
-                          className={`min-h-10 rounded-xl border text-[10px] font-black uppercase ${paymentMode === mode ? "border-[#173f35] bg-[#173f35] text-white" : "border-[#ddd7ca] bg-white"}`}
+                          className={`min-h-11 rounded-xl border text-[0.625rem] font-black uppercase ${paymentMode === mode ? "border-[#173f35] bg-[#173f35] text-white" : "border-[#ddd7ca] bg-white"}`}
                         >
                           {t(language, mode)}
                         </button>
@@ -2320,67 +2808,133 @@ function BillScreen({
                     <div className="space-y-2 rounded-2xl border border-[#e2ddd3] bg-[#faf8f3] p-2.5">
                       {paymentChannels.map((mode) => {
                         const allocation = paymentBreakdown.find((entry) => entry.mode === mode);
+                        const currentAmount = allocation?.amount || 0;
+                        const otherAllocated = roundMoney(paid - currentAmount);
+                        const balanceForMode = roundMoney(
+                          Math.max(0, bill.grandTotal - otherAllocated),
+                        );
                         return (
                           <div key={mode} className="rounded-xl border border-[#e1ddd4] bg-white p-2">
                             <div className="flex items-center gap-2">
-                              <strong className="min-w-16 text-[10px] uppercase text-[#40544c]">
+                              <strong className="min-w-16 text-[0.625rem] uppercase text-[#40544c]">
                                 {t(language, mode)}
                               </strong>
                               <button
                                 type="button"
                                 onClick={() => onPad({
                                   title: `${t(language, mode)} · ${t(language, "amountReceived")}`,
-                                  value: allocation?.amount || 0,
+                                  value: currentAmount,
                                   decimal: true,
                                   apply: (amount) => updateTender(mode, { amount }),
                                 })}
-                                className="ml-auto min-h-10 min-w-28 rounded-lg bg-[#eef5ee] px-3 text-right text-sm font-black text-[#173f35]"
+                                aria-label={tr(
+                                  language,
+                                  `${t(language, mode)} amount ${formatMoney(currentAmount)}`,
+                                  `${t(language, mode)} रकम ${formatMoney(currentAmount)}`,
+                                  `${t(language, mode)} পরিমাণ ${formatMoney(currentAmount)}`,
+                                )}
+                                className="ml-auto min-h-11 min-w-28 rounded-lg bg-[#eef5ee] px-3 text-right text-sm font-black text-[#173f35]"
                               >
-                                {formatMoney(allocation?.amount || 0)}
+                                {formatMoney(currentAmount)}
                               </button>
                             </div>
+                            {paymentPlan === "full" && bill.grandTotal > 0 && (
+                              <div className="mt-2 flex flex-wrap justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    updateTender(mode, {
+                                      amount: roundMoney(bill.grandTotal / 2),
+                                    })
+                                  }
+                                  aria-label={tr(
+                                    language,
+                                    `Set ${t(language, mode)} to half of the bill`,
+                                    `${t(language, mode)} को बिल की आधी रकम पर रखें`,
+                                    `${t(language, mode)}-এ বিলের অর্ধেক রাখুন`,
+                                  )}
+                                  className="min-h-11 rounded-lg border border-[#d8d2c6] px-3 text-[0.5625rem] font-black text-[#53635c]"
+                                >
+                                  50%
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={Math.abs(balanceForMode - currentAmount) < 0.01}
+                                  onClick={() =>
+                                    updateTender(mode, { amount: balanceForMode })
+                                  }
+                                  aria-label={tr(
+                                    language,
+                                    `Use the remaining bill balance for ${t(language, mode)}`,
+                                    `बिल की बाकी रकम ${t(language, mode)} में रखें`,
+                                    `বিলের বাকি টাকা ${t(language, mode)}-এ রাখুন`,
+                                  )}
+                                  className="min-h-11 rounded-lg border border-[#8fbd9f] px-3 text-[0.5625rem] font-black text-[#267055] disabled:opacity-40"
+                                >
+                                  {tr(language, "Use balance", "बाकी रकम", "বাকি টাকা")}
+                                </button>
+                              </div>
+                            )}
                             {mode !== "cash" && (
                               <input
                                 value={allocation?.reference || ""}
                                 onChange={(event) => updateTender(mode, { reference: event.target.value })}
                                 maxLength={80}
+                                aria-label={tr(
+                                  language,
+                                  `${t(language, mode)} transaction reference`,
+                                  `${t(language, mode)} ट्रांज़ैक्शन रेफरेंस`,
+                                  `${t(language, mode)} লেনদেনের রেফারেন্স`,
+                                )}
                                 placeholder={mode === "cheque"
                                   ? tr(language, "Cheque number (optional)", "चेक नंबर (ज़रूरी नहीं)", "চেক নম্বর (ঐচ্ছিক)")
                                   : tr(language, "Transaction reference (optional)", "ट्रांज़ैक्शन रेफरेंस (ज़रूरी नहीं)", "লেনদেনের রেফারেন্স (ঐচ্ছিক)")}
-                                className="mt-2 h-9 w-full rounded-lg border border-[#ddd7ca] px-2 text-[10px]"
+                                className="mt-2 min-h-11 w-full rounded-lg border border-[#ddd7ca] px-2 text-[0.625rem]"
                               />
                             )}
                           </div>
                         );
                       })}
-                      <div className="flex items-center justify-between px-1 pt-1 text-[10px] font-black">
+                      <div className="flex items-center justify-between px-1 pt-1 text-[0.625rem] font-black" role="status" aria-live="polite">
                         <span>{tr(language, "Allocated", "बाँटा गया", "ভাগ করা হয়েছে")} {formatMoney(paid)}</span>
-                        <span className={paid > bill.grandTotal ? "text-red-700" : "text-[#9a4f22]"}>
-                          {tr(language, "Left", "बाकी", "বাকি")} {formatMoney(Math.max(0, bill.grandTotal - paid))}
+                        <span className={splitOver > 0 ? "text-red-700" : "text-[#9a4f22]"}>
+                          {splitOver > 0
+                            ? tr(language, "Over", "ज़्यादा", "বেশি")
+                            : tr(language, "Left", "बाकी", "বাকি")} {formatMoney(splitOver || splitRemaining)}
                         </span>
                       </div>
                     </div>
                   )}
                 </>
               )}
+              {splitPayment && !splitHasMultipleMethods && bill.grandTotal > 0 && (
+                <p className="mt-3 rounded-xl bg-[#fff0df] p-2.5 text-[0.625rem] font-black text-[#9a4f22]" role="alert">
+                  {tr(
+                    language,
+                    "Enter amounts for at least two payment methods, or choose One method.",
+                    "कम से कम दो पेमेंट तरीकों में रकम डालें, या एक तरीका चुनें।",
+                    "কমপক্ষে দুইটি পেমেন্ট মাধ্যমে টাকা লিখুন, অথবা একটি মাধ্যম বেছে নিন।",
+                  )}
+                </p>
+              )}
               {paymentPlan !== "full" && !hasCustomer && (
                 <button
                   type="button"
                   onClick={onParty}
-                  className="mt-3 min-h-11 w-full rounded-xl border border-[#e5a46f] bg-[#fff0df] px-3 text-[10px] font-black text-[#9a4f22]"
+                  className="mt-3 min-h-11 w-full rounded-xl border border-[#e5a46f] bg-[#fff0df] px-3 text-[0.625rem] font-black text-[#9a4f22]"
                 >
                   ⚠ {t(language, "selectCustomerForDue")}
                 </button>
               )}
               {paymentPlan === "partial" && hasCustomer && paid <= 0 && (
-                <p className="mt-3 rounded-xl bg-[#fff0df] p-2.5 text-[10px] font-black text-[#9a4f22]">
+                <p className="mt-3 rounded-xl bg-[#fff0df] p-2.5 text-[0.625rem] font-black text-[#9a4f22]" role="alert">
                   {t(language, "enterPartPayment")}
                 </p>
               )}
               {paymentPlan === "partial" &&
                 paid >= bill.grandTotal &&
                 bill.grandTotal > 0 && (
-                  <p className="mt-3 rounded-xl bg-[#fff0df] p-2.5 text-[10px] font-black text-[#9a4f22]">
+                  <p className="mt-3 rounded-xl bg-[#fff0df] p-2.5 text-[0.625rem] font-black text-[#9a4f22]" role="alert">
                     {language === "hi"
                       ? `पार्ट पेमेंट ${formatMoney(bill.grandTotal)} से कम होना चाहिए। इसके बजाय पूरा पेमेंट चुनें।`
                       : language === "bn"
@@ -2389,7 +2943,7 @@ function BillScreen({
                   </p>
                 )}
               {paymentPlan === "full" && splitPayment && !splitMatchesTotal && bill.grandTotal > 0 && (
-                <p className="mt-3 rounded-xl bg-[#fff0df] p-2.5 text-[10px] font-black text-[#9a4f22]">
+                <p className="mt-3 rounded-xl bg-[#fff0df] p-2.5 text-[0.625rem] font-black text-[#9a4f22]" role="alert">
                   {tr(
                     language,
                     `Split amounts must total ${formatMoney(bill.grandTotal)} for full payment.`,
@@ -2400,7 +2954,7 @@ function BillScreen({
               )}
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <div className="rounded-xl bg-[#eaf4ee] p-3">
-                  <span className="block text-[8px] font-black uppercase text-[#567268]">
+                  <span className="block text-[0.5rem] font-black uppercase text-[#567268]">
                     {t(language, "receivedNow")}
                   </span>
                   <strong className="mt-1 block text-sm text-[#267055]">
@@ -2408,16 +2962,24 @@ function BillScreen({
                   </strong>
                 </div>
                 <div className="rounded-xl bg-[#fff0df] p-3">
-                  <span className="block text-[8px] font-black uppercase text-[#8c694e]">
-                    {t(language, "addedToDues")}
+                  <span className="block text-[0.5rem] font-black uppercase text-[#8c694e]">
+                    {paymentPlan === "full" && splitPayment
+                      ? splitOver > 0
+                        ? tr(language, "Over allocated", "ज़्यादा बाँटा", "বেশি ভাগ করা")
+                        : tr(language, "Still to allocate", "अभी बाँटना बाकी", "এখনও ভাগ করা বাকি")
+                      : t(language, "addedToDues")}
                   </span>
                   <strong className="mt-1 block text-sm text-[#b75b2b]">
-                    {formatMoney(bill.amountDue)}
+                    {formatMoney(
+                      paymentPlan === "full" && splitPayment
+                        ? splitOver || splitRemaining
+                        : bill.amountDue,
+                    )}
                   </strong>
                 </div>
               </div>
               {hasCustomer && bill.amountDue > 0 && (
-                <div className="mt-2 flex items-center justify-between rounded-xl border border-[#e1d8c8] bg-[#faf8f2] p-3 text-[10px]">
+                <div className="mt-2 flex items-center justify-between rounded-xl border border-[#e1d8c8] bg-[#faf8f2] p-3 text-[0.625rem]">
                   <span className="font-bold text-[#66736d]">
                     {t(language, "balanceAfterBill")}
                   </span>
@@ -2542,7 +3104,7 @@ function GstControl({
             <strong className="block text-xs">
               {t(language, "gstOnBill")}
             </strong>
-            <span className="block truncate text-[9px] font-semibold text-[#707873]">
+            <span className="block truncate text-[0.5625rem] font-semibold text-[#707873]">
               {enabled
                 ? `${rate}% ${t(language, "gstApplied")}`
                 : t(language, "gstOff")}
@@ -2550,7 +3112,7 @@ function GstControl({
           </span>
         </button>
         <div className="text-right">
-          <span className="block text-[8px] font-black uppercase tracking-wide text-[#7b827e]">
+          <span className="block text-[0.5rem] font-black uppercase tracking-wide text-[#7b827e]">
             {t(language, "gst")}
           </span>
           <strong className="text-sm text-[#014921]">
@@ -2594,7 +3156,7 @@ function GstControl({
           {custom ? `${rate}%` : t(language, "manual")}
         </button>
       </div>
-      <div className="mt-2 flex items-center justify-between text-[9px] font-semibold text-[#707873]">
+      <div className="mt-2 flex items-center justify-between text-[0.5625rem] font-semibold text-[#707873]">
         <span>
           {t(language, "taxable")}: {formatMoney(taxable)}
         </span>
@@ -2640,7 +3202,7 @@ function OtherChargesControl({
       <div className="flex items-center justify-between">
         <div>
           <h4 className="text-xs font-black">{t(language, "otherCharges")}</h4>
-          <p className="mt-1 text-[9px] font-semibold text-[#748078]">
+          <p className="mt-1 text-[0.5625rem] font-semibold text-[#748078]">
             {t(language, "chargeHelp")}
           </p>
         </div>
@@ -2680,10 +3242,10 @@ function OtherChargesControl({
                 }
                 className="min-h-11 min-w-0 flex-1 text-left"
               >
-                <strong className="block truncate text-[11px]">
+                <strong className="block truncate text-[0.6875rem]">
                   {t(language, labelKey[charge.code])}
                 </strong>
-                <span className="mt-0.5 block text-[9px] font-semibold text-[#78817c]">
+                <span className="mt-0.5 block text-[0.5625rem] font-semibold text-[#78817c]">
                   {charge.enabled
                     ? charge.amount > 0
                       ? formatMoney(charge.amount)
@@ -2696,7 +3258,7 @@ function OtherChargesControl({
                   <button
                     type="button"
                     onClick={() => editAmount(charge)}
-                    className="min-h-11 rounded-lg bg-[#fff0df] px-2.5 text-[10px] font-black text-[#a95721]"
+                    className="min-h-11 rounded-lg bg-[#fff0df] px-2.5 text-[0.625rem] font-black text-[#a95721]"
                   >
                     {charge.amount > 0
                       ? formatMoney(charge.amount)
@@ -2792,10 +3354,10 @@ function BillLine({
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <h3 className="truncate text-[14px] font-black">
+              <h3 className="truncate text-[0.875rem] font-black">
                 {displayName}
               </h3>
-              <p className="mt-1 text-[10px] font-bold text-[#78827d]">
+              <p className="mt-1 text-[0.625rem] font-bold text-[#78827d]">
                 {line.skuCode} · GST {line.gstRate}%
               </p>
             </div>
@@ -2828,7 +3390,7 @@ function BillLine({
                       `${displayName}-কে ${lastPriceLabel}-এ লক করুন`,
                     )
               }
-              className={`mt-2 inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-extrabold ${line.lockPrice ? "bg-[#fff0da] text-[#a7591f]" : "bg-[#eaf4ee] text-[#286c52]"}`}
+              className={`mt-2 inline-flex items-center gap-1 rounded-full px-2 py-1 text-[0.625rem] font-extrabold ${line.lockPrice ? "bg-[#fff0da] text-[#a7591f]" : "bg-[#eaf4ee] text-[#286c52]"}`}
             >
               {line.lockPrice ? "🔒" : "↺"} {lastPriceLabel}
             </button>
@@ -2962,7 +3524,7 @@ function BillLine({
             )}
             aria-pressed={line.qty === value}
             onClick={() => onLine(index, { qty: value })}
-            className={`min-h-9 min-w-10 shrink-0 rounded-lg border px-2 text-[9px] font-black ${line.qty === value ? "border-[#014921] bg-[#014921] text-white" : "border-[#d8d4c9] bg-[#f7f5ef]"}`}
+            className={`min-h-9 min-w-10 shrink-0 rounded-lg border px-2 text-[0.5625rem] font-black ${line.qty === value ? "border-[#014921] bg-[#014921] text-white" : "border-[#d8d4c9] bg-[#f7f5ef]"}`}
           >
             {value}
           </button>
@@ -3119,7 +3681,7 @@ function BottomNav({
       className={`app-nav-item min-w-0 flex items-center justify-center rounded-xl font-extrabold ${
         desktop
           ? "min-h-12 flex-row justify-start gap-3 px-3 text-sm"
-          : "flex-col gap-1 text-[9px]"
+          : "flex-col gap-1 text-[0.5625rem]"
       } ${activeTab === key ? "active" : ""}`}
     >
       <span className="app-nav-icon grid place-items-center" aria-hidden="true">
@@ -3141,12 +3703,12 @@ function BottomNav({
         aria-label={tr(language, "Main navigation", "मुख्य नेविगेशन", "মূল নেভিগেশন")}
         className="app-main-nav app-main-nav-desktop fixed inset-y-[64px] left-0 z-40 hidden w-[220px] auto-rows-min content-start border-r border-[#d7d1c5] bg-[#fbfaf6] px-3 py-5 md:grid"
       >
-        <p className="mb-3 px-3 text-[10px] font-black uppercase tracking-[.16em] text-[#a29f97]">
+        <p className="mb-3 px-3 text-[0.625rem] font-black uppercase tracking-[.16em] text-[#a29f97]">
           {t(language, "workspace")}
         </p>
         {tabs.map((entry) => tabButton(entry, tab, true))}
         <div className="mt-auto rounded-2xl bg-[#173f35] p-4 text-white">
-          <p className="text-[9px] font-black uppercase tracking-[.14em] text-[#aac0b8]">
+          <p className="text-[0.5625rem] font-black uppercase tracking-[.14em] text-[#aac0b8]">
             {t(language, "counterReady")}
           </p>
           <p className="mt-2 text-xs font-bold">{t(language, "offlineReady")}</p>
@@ -3232,7 +3794,7 @@ function PartyPicker({
         >
           <div>
             <strong>{t(language, "cashCustomer")}</strong>
-            <p className="mt-1 text-[10px] text-[#748078]">{tr(language, "No ledger balance", "खाते में कोई बैलेंस नहीं", "খাতায় কোনো ব্যালেন্স নেই")}</p>
+            <p className="mt-1 text-[0.625rem] text-[#748078]">{tr(language, "No ledger balance", "खाते में कोई बैलेंस नहीं", "খাতায় কোনো ব্যালেন্স নেই")}</p>
           </div>
           <span>›</span>
         </button>
@@ -3295,15 +3857,15 @@ function PartyPicker({
                 <div className="flex items-center gap-2">
                   <strong className="truncate text-sm">{party.name}</strong>
                   {party.codeName && (
-                    <span className="shrink-0 rounded-lg bg-[#e7f3ec] px-2 py-1 text-[8px] font-black text-[#25684f]">
+                    <span className="shrink-0 rounded-lg bg-[#e7f3ec] px-2 py-1 text-[0.5rem] font-black text-[#25684f]">
                       {party.codeName}
                     </span>
                   )}
                 </div>
-                <p className="mt-1 truncate text-[10px] font-semibold text-[#748078]">
+                <p className="mt-1 truncate text-[0.625rem] font-semibold text-[#748078]">
                   {party.address || tr(language, "No address", "पता नहीं", "ঠিকানা নেই")}
                 </p>
-                <p className="mt-1 text-[9px] text-[#8a928e]">
+                <p className="mt-1 text-[0.5625rem] text-[#8a928e]">
                   {party.phone || tr(language, "No phone", "फोन नहीं", "ফোন নেই")} · {localizedPriceTierName(language, party.priceTier)}
                 </p>
               </div>
@@ -3311,7 +3873,7 @@ function PartyPicker({
                 <span className="text-xs font-black text-[#b75d26]">
                   {formatMoney(party.currentBalance)}
                 </span>
-                <p className="text-[9px] text-[#8a928e]">{tr(language, "outstanding", "बकाया", "বাকি")}</p>
+                <p className="text-[0.5625rem] text-[#8a928e]">{tr(language, "outstanding", "बकाया", "বাকি")}</p>
               </div>
             </button>
           ))}
@@ -3347,7 +3909,7 @@ function DueCustomerPicker({
         <p className="text-xs font-black text-[#014921]">
           {tr(language, "Choose the customer who owes this amount.", "जिस कस्टमर पर यह रकम बाकी है, उसे चुनें।", "যে কাস্টমারের এই টাকা বাকি, তাকে বাছুন।")}
         </p>
-        <p className="mt-1 text-[10px] font-semibold text-[#66736d]">
+        <p className="mt-1 text-[0.625rem] font-semibold text-[#66736d]">
           {tr(language, "You can choose any saved customer, even when their current balance is zero.", "बैलेंस शून्य हो तब भी किसी सेव कस्टमर को चुन सकते हैं।", "ব্যালেন্স শূন্য হলেও যেকোনো সেভ করা কাস্টমার বাছতে পারেন।")}
         </p>
       </div>
@@ -3381,15 +3943,15 @@ function DueCustomerPicker({
               <div className="flex items-center gap-2">
                 <strong className="truncate text-sm">{party.name}</strong>
                 {party.codeName && (
-                  <span className="shrink-0 rounded-lg bg-[#e7f3ec] px-2 py-1 text-[8px] font-black text-[#25684f]">
+                  <span className="shrink-0 rounded-lg bg-[#e7f3ec] px-2 py-1 text-[0.5rem] font-black text-[#25684f]">
                     {party.codeName}
                   </span>
                 )}
               </div>
-              <p className="mt-1 truncate text-[10px] font-semibold text-[#748078]">
+              <p className="mt-1 truncate text-[0.625rem] font-semibold text-[#748078]">
                 {party.address || tr(language, "No address saved", "पता सेव नहीं है", "ঠিকানা সেভ নেই")}
               </p>
-              <p className="mt-1 text-[9px] text-[#8a928e]">
+              <p className="mt-1 text-[0.5625rem] text-[#8a928e]">
                 {party.phone || tr(language, "No phone", "फोन नहीं", "ফোন নেই")}
               </p>
             </div>
@@ -3397,7 +3959,7 @@ function DueCustomerPicker({
               <strong className="text-xs text-[#b75d26]">
                 {formatMoney(party.currentBalance)}
               </strong>
-              <p className="mt-1 text-[9px] text-[#8a928e]">{tr(language, "current due", "अभी का बकाया", "এখনকার বাকি")} ›</p>
+              <p className="mt-1 text-[0.5625rem] text-[#8a928e]">{tr(language, "current due", "अभी का बकाया", "এখনকার বাকি")} ›</p>
             </div>
           </button>
         ))}
@@ -3475,7 +4037,7 @@ function ItemPicker({
           placeholder={t(language, "searchItem")}
         />
       </label>
-      <p className="my-3 text-[10px] font-black uppercase tracking-[.14em] text-[#7d8782]">
+      <p className="my-3 text-[0.625rem] font-black uppercase tracking-[.14em] text-[#7d8782]">
         {query
           ? tr(language, `${matches.length} matches`, `${matches.length} नतीजे`, `${matches.length}টি মিল`)
           : t(language, "recentItems")}
@@ -3504,10 +4066,10 @@ function ItemPicker({
             <ProductThumb item={item} language={language} />
             <div className="min-w-0 flex-1">
               <strong className="block truncate text-sm">{localizedItemName(language, item)}</strong>
-              <p className="mt-1 truncate text-[10px] text-[#727f78]">
+              <p className="mt-1 truncate text-[0.625rem] text-[#727f78]">
                 {localizedItemSecondaryName(language, item) || item.skuCode}
               </p>
-              <p className="mt-1 text-[9px] font-bold text-[#9a6a49]">
+              <p className="mt-1 text-[0.5625rem] font-bold text-[#9a6a49]">
                 {item.skuCode} · {tr(language, "per", "प्रति", "প্রতি")} {localizedUnitName(language, item.baseUnit)}
               </p>
             </div>
@@ -3515,7 +4077,7 @@ function ItemPicker({
               <strong className="text-sm">
                 {formatMoney(item.priceWholesale)}
               </strong>
-              <p className="mt-1 text-[9px] text-[#758079]">{tr(language, "Stock", "स्टॉक", "স্টক")} —</p>
+              <p className="mt-1 text-[0.5625rem] text-[#758079]">{tr(language, "Stock", "स्टॉक", "স্টক")} —</p>
             </div>
           </button>
           <button type="button" onClick={() => onFavourite(item)} aria-label={`${favouriteItemIds.includes(item.id) ? tr(language, "Remove favourite", "पसंदीदा से हटाएँ", "পছন্দের তালিকা থেকে সরান") : tr(language, "Add favourite", "पसंदीदा में जोड़ें", "পছন্দের তালিকায় যোগ করুন")}: ${localizedItemName(language, item)}`} className="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-lg bg-[#f4faf0] text-[#014921]">{favouriteItemIds.includes(item.id) ? "★" : "☆"}</button>
@@ -3547,6 +4109,7 @@ function DraftProductPhoto({ imageUrl, language }: { imageUrl?: string; language
 function ProductEditor({
   item,
   categories,
+  festivalEntries,
   language,
   ownerMode,
   onPad,
@@ -3555,6 +4118,7 @@ function ProductEditor({
 }: {
   item: Item | null;
   categories: Category[];
+  festivalEntries: FestivalEntry[];
   language: Language;
   ownerMode: boolean;
   onPad: (state: PadState) => void;
@@ -3569,6 +4133,10 @@ function ProductEditor({
     item?.categoryId || "cat-uncategorized",
   );
   const [unit, setUnit] = useState<Unit>(item?.baseUnit || "piece");
+  const [lowStockEnabled, setLowStockEnabled] = useState(item?.lowStockAlert != null);
+  const [lowStockThreshold, setLowStockThreshold] = useState(
+    item?.lowStockAlert == null ? "" : String(item.lowStockAlert),
+  );
   const [purchase, setPurchase] = useState(String(item?.purchasePrice || ""));
   const [wholesale, setWholesale] = useState(
     String(item?.priceWholesale || ""),
@@ -3578,10 +4146,27 @@ function ProductEditor({
   const [itemGst, setItemGst] = useState(String(item?.gstRate ?? 18));
   const [hsn, setHsn] = useState(item?.hsnCode || "");
   const [family, setFamily] = useState(item ? variantFamily(item) : "");
+  const [selectedFestivalKeys, setSelectedFestivalKeys] = useState<Set<FestivalKey>>(
+    () => new Set(item ? festivalKeysForItem(item) : []),
+  );
   const [imageUrl, setImageUrl] = useState(item?.imageUrl);
   const [photoBusy, setPhotoBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const productFestivalCopy = festivalCopy(language);
+  const currentFestivalYear = Number(localDate().slice(0, 4));
+  const currentFestivalEntries = festivalEntries
+    .filter((entry) => entry.year === currentFestivalYear)
+    .sort((left, right) => left.startDate.localeCompare(right.startDate));
+  const productFestivalOptions: Array<{ key: FestivalKey; label: string }> = currentFestivalEntries.length
+    ? currentFestivalEntries.map((entry) => ({
+        key: entry.festivalKey as FestivalKey,
+        label: festivalEntryName(entry, language),
+      }))
+    : FESTIVAL_DEFINITIONS.map((definition) => ({
+        key: definition.key,
+        label: language === "hi" ? definition.nameHi : language === "bn" ? definition.nameBn : definition.nameEn,
+      }));
 
   async function choosePhoto(file?: File) {
     if (!file) return;
@@ -3624,6 +4209,23 @@ function ProductEditor({
         setSaving(false);
         return;
       }
+      if (lowStockEnabled && (lowStockThreshold.trim() === "" || !Number.isFinite(Number(lowStockThreshold)) || Number(lowStockThreshold) < 0)) {
+        setError(tr(language, "Enter a valid non-negative low-stock threshold.", "कम-स्टॉक सीमा शून्य या उससे ज्यादा रखें।", "কম-স্টকের সীমা শূন্য বা তার বেশি দিন।"));
+        setSaving(false);
+        return;
+      }
+      if (item && unit !== item.baseUnit) {
+        const [movement, countLine, invoice] = await Promise.all([
+          db.stockMovements.where("itemId").equals(item.id).first(),
+          db.countLines.where("itemId").equals(item.id).first(),
+          db.invoices.filter((entry) => entry.lineItems.some((line) => line.itemId === item.id)).first(),
+        ]);
+        if (item.currentStock !== null || movement || countLine || invoice) {
+          setError(tr(language, "The base unit cannot change after stock or invoice history exists. Create a new product for a different unit.", "स्टॉक या बिल का इतिहास बनने के बाद बेस यूनिट नहीं बदल सकती। दूसरी यूनिट के लिए नया प्रोडक्ट बनाएँ।", "স্টক বা বিলের ইতিহাস তৈরি হলে বেস ইউনিট বদলানো যায় না। অন্য ইউনিটের জন্য নতুন পণ্য বানান।"));
+          setSaving(false);
+          return;
+        }
+      }
       const stamp = nowIso();
       const next: Item = {
         id: item?.id || makeId(),
@@ -3639,8 +4241,11 @@ function ProductEditor({
         priceBulk: Math.max(0, Number(bulk) || Number(wholesale) || 0),
         priceRetail: Math.max(0, Number(retail) || 0),
         currentStock: item?.currentStock ?? null,
-        lowStockAlert: item?.lowStockAlert ?? null,
-        festivalTags: withVariantFamily(item?.festivalTags || [], family),
+        lowStockAlert: lowStockEnabled ? Number(lowStockThreshold) : null,
+        festivalTags: withVariantFamily(
+          withFestivalKeys(item?.festivalTags || [], selectedFestivalKeys),
+          family,
+        ),
         hsnCode: hsn.trim() || undefined,
         gstRate:
           Math.round(Math.min(25, Math.max(0, Number(itemGst) || 0)) * 100) /
@@ -3725,7 +4330,7 @@ function ProductEditor({
                 if (confirm(tr(language, "Remove this product photo?", "यह प्रोडक्ट फोटो हटाएँ?", "এই প্রোডাক্টের ছবি সরাবেন?")))
                   setImageUrl(undefined);
               }}
-              className="mt-2 w-full text-[10px] font-black text-[#8b4840] underline"
+              className="mt-2 w-full text-[0.625rem] font-black text-[#8b4840] underline"
             >
               {tr(language, "Remove photo", "फोटो हटाएँ", "ছবি সরান")}
             </button>
@@ -3785,6 +4390,23 @@ function ProductEditor({
                 ))}
               </select>
             </label>
+            <div className="product-field">
+              <span>{tr(language, "Current stock", "मौजूदा स्टॉक", "এখনকার স্টক")}</span>
+              <output data-stock-state={item?.currentStock === null || !item ? "unknown" : item.currentStock < 0 ? "negative" : "known"} className="inventory-readonly-stock">
+                {!item || item.currentStock === null
+                  ? tr(language, "Unknown", "अनजान", "অজানা")
+                  : `${item.currentStock} ${localizedUnitName(language, item.baseUnit)}`}
+              </output>
+              <small>{tr(language, "Use Inventory to change stock so the audit history stays complete.", "स्टॉक बदलने के लिए इन्वेंटरी इस्तेमाल करें, ताकि पूरा इतिहास रहे।", "স্টক বদলাতে ইনভেন্টরি ব্যবহার করুন, যাতে পুরো ইতিহাস থাকে।")}</small>
+            </div>
+            <div className="product-field">
+              <span>{tr(language, "Low-stock alert", "कम-स्टॉक अलर्ट", "কম-স্টক সতর্কতা")}</span>
+              <label className="inventory-check-row">
+                <input type="checkbox" role="switch" aria-label={tr(language, "Enable low-stock alert", "कम-स्टॉक अलर्ट चालू करें", "কম-স্টক সতর্কতা চালু করুন")} aria-checked={lowStockEnabled} checked={lowStockEnabled} onChange={(event) => setLowStockEnabled(event.target.checked)} />
+                <span>{lowStockEnabled ? tr(language, "Enabled", "चालू", "চালু") : tr(language, "Off", "बंद", "বন্ধ")}</span>
+              </label>
+              {lowStockEnabled && <input aria-label={tr(language, "Low-stock threshold", "कम-स्टॉक सीमा", "কম-স্টক সীমা")} inputMode="decimal" value={lowStockThreshold} onChange={(event) => setLowStockThreshold(event.target.value)} placeholder={`0 ${localizedUnitName(language, unit)}`} required />}
+            </div>
             <label className="product-field">
               <span>{tr(language, "Variant family", "वेरिएंट ग्रुप", "ভ্যারিয়েন্ট গ্রুপ")}</span>
               <input
@@ -3798,6 +4420,30 @@ function ProductEditor({
                 )}
               />
             </label>
+            <fieldset className="festival-product-field md:col-span-2">
+              <legend>{productFestivalCopy.productFestivalTags}</legend>
+              <p>{productFestivalCopy.productFestivalHelp}</p>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {productFestivalOptions.map((option) => (
+                  <label key={option.key}>
+                    <input
+                      type="checkbox"
+                      checked={selectedFestivalKeys.has(option.key)}
+                      onChange={(event) => {
+                        const checked = event.target.checked;
+                        setSelectedFestivalKeys((current) => {
+                          const next = new Set(current);
+                          if (checked) next.add(option.key);
+                          else next.delete(option.key);
+                          return next;
+                        });
+                      }}
+                    />
+                    <span>{option.label}</span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
             <label className="product-field">
               <span>{tr(language, "Sale unit", "बिक्री यूनिट", "বিক্রির ইউনিট")}</span>
               <select
@@ -4024,7 +4670,7 @@ function NumberPad({
       <section ref={panelRef} role="dialog" aria-modal="true" aria-label={state.title} tabIndex={-1} className="number-pad-panel absolute inset-x-0 bottom-0 mx-auto max-w-md rounded-t-[28px] bg-[#fbfaf6] p-4 shadow-2xl">
         <div className="mb-3 flex items-center justify-between">
           <div>
-            <p className="text-[10px] font-black uppercase tracking-wide text-[#758079]">
+            <p className="text-[0.625rem] font-black uppercase tracking-wide text-[#758079]">
               {tr(language, "Enter value", "रकम डालें", "অঙ্ক দিন")}
             </p>
             <h2 className="mt-1 text-sm font-black">{state.title}</h2>
@@ -4240,16 +4886,16 @@ function PartiesScreen({
                 <strong className="truncate">{entry.name}</strong>
                 {entry.codeName && (
                   <span
-                    className={`rounded-full px-2 py-1 text-[8px] font-black uppercase ${entry.type === "supplier" ? "bg-[#fff0df] text-[#a95221]" : "bg-[#e7f3ec] text-[#25684f]"}`}
+                    className={`rounded-full px-2 py-1 text-[0.5rem] font-black uppercase ${entry.type === "supplier" ? "bg-[#fff0df] text-[#a95221]" : "bg-[#e7f3ec] text-[#25684f]"}`}
                   >
                     {entry.codeName}
                   </span>
                 )}
               </div>
-              <p className="mt-1 truncate text-[10px] font-semibold text-[#566760]">
+              <p className="mt-1 truncate text-[0.625rem] font-semibold text-[#566760]">
                 {entry.address || copy.noAddress}
               </p>
-              <p className="mt-1 text-[9px] text-[#768079]">
+              <p className="mt-1 text-[0.5625rem] text-[#768079]">
                 {entry.phone || copy.noPhone}
                 {entry.type === "customer"
                   ? ` · ${copy.tiers[entry.priceTier]}`
@@ -4264,7 +4910,7 @@ function PartiesScreen({
               >
                 {formatMoney(entry.currentBalance)}
               </strong>
-              <p className="mt-1 text-[9px] text-[#818983]">
+              <p className="mt-1 text-[0.5625rem] text-[#818983]">
                 {entry.type === "supplier"
                   ? t(language, "toPay")
                   : t(language, "toCollect")}{" "}
@@ -4740,7 +5386,7 @@ function PartyLedger({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               {party.codeName && (
-                <span className="rounded-lg bg-[#ffb45f] px-2 py-1 text-[9px] font-black uppercase text-[#173f35]">
+                <span className="rounded-lg bg-[#ffb45f] px-2 py-1 text-[0.5625rem] font-black uppercase text-[#173f35]">
                   {party.codeName}
                 </span>
               )}
@@ -4750,19 +5396,19 @@ function PartyLedger({
               </p>
             </div>
             <h2 className="mt-2 text-2xl font-black">{party.name}</h2>
-            <p className="mt-1 truncate text-[10px] text-[#c5d6d0]">
+            <p className="mt-1 truncate text-[0.625rem] text-[#c5d6d0]">
               ⌖ {party.address || copy.noAddress}
             </p>
           </div>
           <span
-            className={`rounded-full px-3 py-1.5 text-[10px] font-black uppercase ${isSupplier ? "bg-[#ef7d32] text-white" : "bg-white/10 text-white"}`}
+            className={`rounded-full px-3 py-1.5 text-[0.625rem] font-black uppercase ${isSupplier ? "bg-[#ef7d32] text-white" : "bg-white/10 text-white"}`}
           >
             {isSupplier ? copy.supplier : copy.customer}
           </span>
         </div>
         <div className="mt-5 flex items-end justify-between">
           <div>
-            <p className="text-[10px] font-bold uppercase text-[#bcd0c8]">
+            <p className="text-[0.625rem] font-bold uppercase text-[#bcd0c8]">
               {isSupplier ? copy.weHaveToPay : copy.customerHasToPay}
             </p>
             <strong className="mt-1 block text-3xl text-[#ffb45f]">
@@ -4812,7 +5458,7 @@ function PartyLedger({
       {editing && (
         <div className="mt-3 rounded-2xl border border-[#ddd7ca] bg-white p-3">
           <h3 className="text-sm font-black">{copy.partyDetails}</h3>
-          <p className="mt-1 text-[10px] text-[#748078]">
+          <p className="mt-1 text-[0.625rem] text-[#748078]">
             {copy.partyDetailsHelp}
           </p>
           <div className="mt-3 grid gap-2 md:grid-cols-2">
@@ -4839,7 +5485,7 @@ function PartyLedger({
                 </button>
               </div>
               {typeLocked && (
-                <p className="mt-2 text-[10px] font-semibold text-[#8a5a36]">
+                <p className="mt-2 text-[0.625rem] font-semibold text-[#8a5a36]">
                   {copy.accountTypeLocked}
                 </p>
               )}
@@ -4931,7 +5577,7 @@ function PartyLedger({
               />
             </label>
           </div>
-          <div className="mt-3 grid grid-cols-2 gap-2">
+          <div className="report-date-grid mt-3">
             <button
               onClick={() => setEditing(false)}
               className="counter-secondary"
@@ -4947,11 +5593,11 @@ function PartyLedger({
       <div className="mb-2 mt-5 flex items-end justify-between">
         <div>
           <h3 className="text-sm font-black">{copy.accountActivity}</h3>
-          <p className="mt-1 text-[10px] text-[#748078]">
+          <p className="mt-1 text-[0.625rem] text-[#748078]">
             {copy.activityHelp}
           </p>
         </div>
-        <span className="text-[10px] font-black text-[#748078]">
+        <span className="text-[0.625rem] font-black text-[#748078]">
           {copy.entries(rows.length)}
         </span>
       </div>
@@ -4965,17 +5611,17 @@ function PartyLedger({
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <span
-                    className={`rounded-full px-2 py-1 text-[9px] font-black ${row.delta < 0 ? "bg-[#e6f4ed] text-[#2c7057]" : "bg-[#fff0df] text-[#b45c25]"}`}
+                    className={`rounded-full px-2 py-1 text-[0.5625rem] font-black ${row.delta < 0 ? "bg-[#e6f4ed] text-[#2c7057]" : "bg-[#fff0df] text-[#b45c25]"}`}
                   >
                     {row.type}
                   </span>
                   <strong className="truncate text-xs">{row.ref}</strong>
                 </div>
-                <p className="mt-1 text-[10px] font-semibold text-[#53635c]">
+                <p className="mt-1 text-[0.625rem] font-semibold text-[#53635c]">
                   {fullInvoiceDate(row.date, language)} ·{" "}
                   {invoiceRecordedTime(row.timestamp, language)}
                 </p>
-                <p className="mt-1 text-[9px] text-[#7a837e]">{row.note}</p>
+                <p className="mt-1 text-[0.5625rem] text-[#7a837e]">{row.note}</p>
               </div>
               <div className="shrink-0 text-right">
                 <strong
@@ -4986,13 +5632,13 @@ function PartyLedger({
                   {row.delta < 0 ? "−" : "+"}
                   {formatMoney(Math.abs(row.delta))}
                 </strong>
-                <p className="mt-1 text-[9px] font-black text-[#53635c]">
+                <p className="mt-1 text-[0.5625rem] font-black text-[#53635c]">
                   {copy.remainingDue} {formatMoney(row.remaining)}
                 </p>
                 {row.invoice && (
                   <button
                     onClick={() => deleteInvoice(row.invoice!)}
-                    className="mt-1 text-[9px] font-bold text-[#b3513b]"
+                    className="mt-1 text-[0.5625rem] font-bold text-[#b3513b]"
                   >
                     {copy.deleteBill}
                   </button>
@@ -5196,7 +5842,7 @@ function PartyEditor({
           />
         </label>
       </div>
-      <p className="mt-3 rounded-xl bg-[#eef5ee] p-3 text-[10px] font-semibold text-[#426252]">
+      <p className="mt-3 rounded-xl bg-[#eef5ee] p-3 text-[0.625rem] font-semibold text-[#426252]">
         {copy.editorHelp}
       </p>
       {error && (
@@ -5283,7 +5929,7 @@ function DueSheet({
           {formatMoney(amount)}
         </strong>
       </button>
-      <p className="mt-2 text-right text-[10px] font-bold text-[#748078]">
+      <p className="mt-2 text-right text-[0.625rem] font-bold text-[#748078]">
         {copy.newBalance}: {formatMoney(party.currentBalance + amount)}
       </p>
       <input
@@ -5398,7 +6044,7 @@ function PaymentSheet({
           {formatMoney(amount)}
         </strong>
       </button>
-      <div className="mt-2 flex justify-between text-[10px] font-bold text-[#748078]">
+      <div className="mt-2 flex justify-between text-[0.625rem] font-bold text-[#748078]">
         <span>
           {copy.outstanding} {formatMoney(party.currentBalance)}
         </span>
@@ -5417,7 +6063,7 @@ function PaymentSheet({
             type="button"
             aria-pressed={mode === value}
             onClick={() => setMode(value)}
-            className={`min-h-11 rounded-xl border px-1 text-[10px] font-black ${mode === value ? "border-[#173f35] bg-[#173f35] text-white" : "border-[#d8d2c6] bg-white"}`}
+            className={`min-h-11 rounded-xl border px-1 text-[0.625rem] font-black ${mode === value ? "border-[#173f35] bg-[#173f35] text-white" : "border-[#d8d2c6] bg-white"}`}
           >
             {label}
           </button>
@@ -5442,7 +6088,7 @@ function PaymentSheet({
       )}
       {!isSupplier && manual && (
         <div className="mt-3 space-y-2">
-          <p className="text-[10px] font-bold text-[#748078]">
+          <p className="text-[0.625rem] font-bold text-[#748078]">
             {copy.allocationHelp(formatMoney(selectedDue))}
           </p>
           {invoices.map((invoice) => (
@@ -5465,7 +6111,7 @@ function PaymentSheet({
                 />
                 <div>
                   <strong className="text-xs">{invoice.invoiceNumber}</strong>
-                  <p className="text-[9px] text-[#7b837f]">
+                  <p className="text-[0.5625rem] text-[#7b837f]">
                     {formatLocalizedDate(invoice.date, language)}
                   </p>
                 </div>
@@ -5514,6 +6160,11 @@ const itemsScreenCopy = {
     addProduct: "Add product",
     helper: "Add, edit and photograph products. Every change is saved offline first.",
     active: (count: number) => `${count} active`,
+    archived: (count: number) => `${count} archived`,
+    catalogueViews: "Product catalogue views",
+    activeProducts: "Active products",
+    archivedProducts: "Archived products",
+    archivedHelper: "Archived products stay safe here. Restore one to make it available for billing again.",
     searchLabel: "Search product catalogue",
     searchPlaceholder: "Name, SKU, Hindi or Bengali",
     variantFamilies: "Variant families",
@@ -5533,8 +6184,13 @@ const itemsScreenCopy = {
     wholesale: "Wholesale",
     bulk: "Bulk",
     addToBill: "Add to current bill",
+    restore: "Restore product",
+    restoreProduct: (name: string) => `Restore ${name}`,
+    archivedStatus: "Archived",
+    archivedOn: (date: string) => `Archived ${date}`,
     loadMore: (remaining: number) => `Load 90 more · ${remaining} remaining`,
     noMatch: "No matching product",
+    noArchived: "No archived products yet.",
     addManually: "Add it manually",
   },
   hi: {
@@ -5543,6 +6199,11 @@ const itemsScreenCopy = {
     addProduct: "प्रोडक्ट जोड़ें",
     helper: "सामान जोड़ें, बदलें और फोटो लगाएँ। हर बदलाव पहले ऑफलाइन सेव होता है।",
     active: (count: number) => `${count} चालू`,
+    archived: (count: number) => `${count} आर्काइव`,
+    catalogueViews: "प्रोडक्ट कैटलॉग के प्रकार",
+    activeProducts: "चालू प्रोडक्ट",
+    archivedProducts: "आर्काइव प्रोडक्ट",
+    archivedHelper: "आर्काइव किए प्रोडक्ट यहाँ सुरक्षित रहते हैं। उन्हें फिर से बिलिंग में लाने के लिए वापस लाएँ।",
     searchLabel: "प्रोडक्ट कैटलॉग में खोजें",
     searchPlaceholder: "नाम, SKU, हिंदी या बंगाली",
     variantFamilies: "वेरिएंट ग्रुप",
@@ -5562,8 +6223,13 @@ const itemsScreenCopy = {
     wholesale: "होलसेल",
     bulk: "बल्क",
     addToBill: "मौजूदा बिल में जोड़ें",
+    restore: "प्रोडक्ट वापस लाएँ",
+    restoreProduct: (name: string) => `${name} को वापस लाएँ`,
+    archivedStatus: "आर्काइव",
+    archivedOn: (date: string) => `${date} को आर्काइव`,
     loadMore: (remaining: number) => `90 और दिखाएँ · ${remaining} बाकी`,
     noMatch: "मिलता-जुलता कोई प्रोडक्ट नहीं मिला",
+    noArchived: "अभी कोई आर्काइव किया हुआ प्रोडक्ट नहीं है।",
     addManually: "खुद जोड़ें",
   },
   bn: {
@@ -5572,6 +6238,11 @@ const itemsScreenCopy = {
     addProduct: "পণ্য যোগ করুন",
     helper: "পণ্য যোগ করুন, বদলান ও ছবি দিন। প্রতিটি বদল আগে অফলাইনে সেভ হয়।",
     active: (count: number) => `${count}টি চালু`,
+    archived: (count: number) => `${count}টি আর্কাইভ`,
+    catalogueViews: "পণ্যের ক্যাটালগের ধরন",
+    activeProducts: "চালু পণ্য",
+    archivedProducts: "আর্কাইভ করা পণ্য",
+    archivedHelper: "আর্কাইভ করা পণ্য এখানে নিরাপদে থাকে। আবার বিলিংয়ে আনতে ফিরিয়ে আনুন।",
     searchLabel: "পণ্যের ক্যাটালগে খুঁজুন",
     searchPlaceholder: "নাম, SKU, হিন্দি বা বাংলা",
     variantFamilies: "ভ্যারিয়েন্ট গ্রুপ",
@@ -5591,8 +6262,13 @@ const itemsScreenCopy = {
     wholesale: "হোলসেল",
     bulk: "বাল্ক",
     addToBill: "চলতি বিলে যোগ করুন",
+    restore: "পণ্য ফিরিয়ে আনুন",
+    restoreProduct: (name: string) => `${name} ফিরিয়ে আনুন`,
+    archivedStatus: "আর্কাইভ",
+    archivedOn: (date: string) => `${date}-এ আর্কাইভ`,
     loadMore: (remaining: number) => `আরও 90টি দেখান · ${remaining}টি বাকি`,
     noMatch: "মিলছে এমন পণ্য পাওয়া যায়নি",
+    noArchived: "এখনও কোনো আর্কাইভ করা পণ্য নেই।",
     addManually: "নিজে যোগ করুন",
   },
 } satisfies Record<Language, Record<string, string | ((...args: never[]) => string)>>;
@@ -5620,34 +6296,49 @@ function localizedVariantFamilyName(item: Item, language: Language) {
 
 function ItemsScreen({
   items,
+  archivedItems,
   language,
   ownerMode,
   onOwnerMode,
+  onInventory,
+  onFestival,
   onAdd,
   onCreate,
   onEdit,
+  onRestore,
   onPhoto,
 }: {
   items: Item[];
+  archivedItems: Item[];
   language: Language;
   ownerMode: boolean;
   onOwnerMode: (enabled: boolean) => void;
+  onInventory: () => void;
+  onFestival: () => void;
   onAdd: (item: Item) => void;
   onCreate: () => void;
   onEdit: (item: Item) => void;
+  onRestore: (item: Item) => Promise<void>;
   onPhoto: (item: Item, file?: File) => Promise<void>;
 }) {
   const copy = itemsScreenCopy[language];
+  const [catalogueView, setCatalogueView] = useState<"active" | "archived">("active");
   const [query, setQuery] = useState("");
   const [photoBusy, setPhotoBusy] = useState("");
+  const [restoreBusy, setRestoreBusy] = useState("");
   const [visibleLimit, setVisibleLimit] = useState(90);
   const [groupVariants, setGroupVariants] = useState(true);
-  const matches = useMemo(() => items
+  const activeMatches = useMemo(() => items
     .map((item) => ({ item, score: fuzzyScore(query, item) }))
     .filter((x) => !query || x.score > 0)
     .sort((a, b) => b.score - a.score || variantFamily(a.item).localeCompare(variantFamily(b.item))), [items, query]);
+  const archivedMatches = useMemo(() => archivedItems
+    .map((item) => ({ item, score: fuzzyScore(query, item) }))
+    .filter((x) => !query || x.score > 0)
+    .sort((a, b) => b.score - a.score || b.item.updatedAt.localeCompare(a.item.updatedAt)), [archivedItems, query]);
+  const matches = catalogueView === "active" ? activeMatches : archivedMatches;
   const visibleMatches = matches.slice(0, visibleLimit);
-  const familyCount = useMemo(() => new Set(matches.map(({ item }) => variantFamily(item))).size, [matches]);
+  const familyCount = useMemo(() => new Set(activeMatches.map(({ item }) => variantFamily(item))).size, [activeMatches]);
   async function choosePhoto(item: Item, file?: File) {
     if (!file) return;
     setPhotoBusy(item.id);
@@ -5669,28 +6360,88 @@ function ItemsScreen({
       setPhotoBusy("");
     }
   }
+  async function restore(item: Item) {
+    if (restoreBusy) return;
+    setRestoreBusy(item.id);
+    try {
+      await onRestore(item);
+    } finally {
+      setRestoreBusy("");
+    }
+  }
   return (
     <section className="mx-auto max-w-5xl px-3 py-5 md:px-7">
-      <div className="flex items-end justify-between gap-3">
+      <div className="flex flex-col items-stretch gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <p className="eyebrow">{copy.eyebrow}</p>
           <h2 className="page-title">{copy.title}</h2>
         </div>
-        <button
-          type="button"
-          onClick={onCreate}
-          className="min-h-11 shrink-0 rounded-lg bg-[#014921] px-4 text-xs font-black text-white"
-        >
-          ＋ {copy.addProduct}
-        </button>
+        <div className="grid shrink-0 grid-cols-2 gap-2 sm:grid-cols-3">
+          <button
+            type="button"
+            onClick={onInventory}
+            className="items-workspace-shortcut"
+          >
+            ▦ {inventoryText(language, "Inventory", "इन्वेंटरी", "ইনভেন্টরি")}
+          </button>
+          <button
+            type="button"
+            onClick={onFestival}
+            className="items-workspace-shortcut"
+          >
+            ◷ {festivalCopy(language).title}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setCatalogueView("active");
+              onCreate();
+            }}
+            className="col-span-2 min-h-11 rounded-lg bg-[#014921] px-4 text-xs font-black text-white sm:col-span-1"
+          >
+            ＋ {copy.addProduct}
+          </button>
+        </div>
       </div>
       <div className="mt-3 flex items-center justify-between gap-3">
-        <p className="text-[11px] font-semibold text-[#6f7773]">
-          {copy.helper}
+        <p className="text-[0.6875rem] font-semibold text-[#6f7773]">
+          {catalogueView === "active" ? copy.helper : copy.archivedHelper}
         </p>
         <span className="shrink-0 rounded-xl bg-[#e9f3ed] px-3 py-2 text-xs font-black text-[#286c52]">
-          {copy.active(items.length)}
+          {catalogueView === "active"
+            ? copy.active(items.length)
+            : copy.archived(archivedItems.length)}
         </span>
+      </div>
+      <div
+        className="item-catalogue-tabs mt-4"
+        role="group"
+        aria-label={copy.catalogueViews}
+      >
+        <button
+          type="button"
+          aria-pressed={catalogueView === "active"}
+          onClick={() => {
+            setCatalogueView("active");
+            setQuery("");
+            setVisibleLimit(90);
+          }}
+        >
+          <span>{copy.activeProducts}</span>
+          <strong>{items.length}</strong>
+        </button>
+        <button
+          type="button"
+          aria-pressed={catalogueView === "archived"}
+          onClick={() => {
+            setCatalogueView("archived");
+            setQuery("");
+            setVisibleLimit(90);
+          }}
+        >
+          <span>{copy.archivedProducts}</span>
+          <strong>{archivedItems.length}</strong>
+        </button>
       </div>
       <div className={`owner-mode-panel mt-4 ${ownerMode ? "active" : ""}`}>
         <div className="reports-dashboard-copy min-w-0">
@@ -5728,10 +6479,17 @@ function ItemsScreen({
           aria-label={copy.searchLabel}
           value={query}
           onChange={(e) => { setQuery(e.target.value); setVisibleLimit(90); }}
-          placeholder={copy.searchPlaceholder}
+          placeholder={
+            catalogueView === "active"
+              ? copy.searchPlaceholder
+              : copy.archivedProducts
+          }
         />
       </label>
-      <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-[#e2e2db] bg-white p-2"><div><strong className="text-[10px]">{copy.variantFamilies}</strong><p className="text-[8px] text-[#747573]">{copy.familySummary(familyCount, matches.length)}</p></div><button type="button" role="switch" aria-checked={groupVariants} onClick={() => { setGroupVariants((value) => !value); setVisibleLimit(90); }} className={`min-h-10 rounded-lg px-3 text-[9px] font-black ${groupVariants ? "bg-[#014921] text-white" : "border"}`}>{groupVariants ? copy.grouped : copy.flatList}</button></div>
+      {catalogueView === "active" && (
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-[#e2e2db] bg-white p-2"><div><strong className="text-[0.625rem]">{copy.variantFamilies}</strong><p className="text-[0.5rem] text-[#747573]">{copy.familySummary(familyCount, activeMatches.length)}</p></div><button type="button" role="switch" aria-checked={groupVariants} onClick={() => { setGroupVariants((value) => !value); setVisibleLimit(90); }} className={`min-h-10 rounded-lg px-3 text-[0.5625rem] font-black ${groupVariants ? "bg-[#014921] text-white" : "border"}`}>{groupVariants ? copy.grouped : copy.flatList}</button></div>
+      )}
+      {catalogueView === "active" ? (
       <div className="grid gap-2 md:grid-cols-2 lg:grid-cols-3">
         {visibleMatches.map(({ item }, index) => {
           const metrics = itemProfitMetrics(item);
@@ -5739,7 +6497,7 @@ function ItemsScreen({
           const showFamily = groupVariants && (index === 0 || variantFamily(visibleMatches[index - 1].item) !== family);
           return (
             <div key={item.id} className="contents">
-            {showFamily && <div className="col-span-full mt-2 flex items-center gap-2 border-b border-[#e2e2db] pb-2"><strong className="text-xs text-[#014921]">{localizedVariantFamilyName(item, language)}</strong><span className="rounded-full bg-[#f4faf0] px-2 py-1 text-[8px] font-black">{copy.variants(matches.filter((row) => variantFamily(row.item) === family).length)}</span></div>}
+            {showFamily && <div className="col-span-full mt-2 flex items-center gap-2 border-b border-[#e2e2db] pb-2"><strong className="text-xs text-[#014921]">{localizedVariantFamilyName(item, language)}</strong><span className="rounded-full bg-[#f4faf0] px-2 py-1 text-[0.5rem] font-black">{copy.variants(matches.filter((row) => variantFamily(row.item) === family).length)}</span></div>}
             <article
               className="rounded-2xl border border-[#ddd7ca] bg-white p-3.5 shadow-sm"
             >
@@ -5761,7 +6519,7 @@ function ItemsScreen({
                   }}
                 />
                 <ProductThumb item={item} language={language} className="h-[72px] w-[72px]" />
-                <span className="absolute inset-x-1 bottom-1 rounded bg-[#014921]/90 py-1 text-center text-[8px] font-black text-white">
+                <span className="absolute inset-x-1 bottom-1 rounded bg-[#014921]/90 py-1 text-center text-[0.5rem] font-black text-white">
                   {photoBusy === item.id
                     ? copy.saving
                     : item.imageUrl
@@ -5773,18 +6531,18 @@ function ItemsScreen({
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <h3 className="truncate text-sm font-black">{localizedItemName(language, item)}</h3>
-                    <p className="mt-1 truncate text-[10px] text-[#737f78]">
+                    <p className="mt-1 truncate text-[0.625rem] text-[#737f78]">
                       {localizedItemSecondaryName(language, item)}
                     </p>
                   </div>
-                  <span className="shrink-0 rounded-lg bg-[#f0ede6] px-2 py-1 text-[9px] font-black">
+                  <span className="shrink-0 rounded-lg bg-[#f0ede6] px-2 py-1 text-[0.5625rem] font-black">
                     {item.skuCode}
                   </span>
                 </div>
                 <button
                   type="button"
                   onClick={() => onEdit(item)}
-                  className="mt-2 text-[9px] font-black text-[#014921] underline underline-offset-2"
+                  className="mt-2 text-[0.5625rem] font-black text-[#014921] underline underline-offset-2"
                 >
                   {copy.edit}
                 </button>
@@ -5792,7 +6550,7 @@ function ItemsScreen({
                   <button
                     type="button"
                     onClick={() => void removePhoto(item)}
-                    className="ml-3 mt-2 text-[9px] font-black text-[#8b4840] underline underline-offset-2"
+                    className="ml-3 mt-2 text-[0.5625rem] font-black text-[#8b4840] underline underline-offset-2"
                   >
                     {copy.removePhoto}
                   </button>
@@ -5801,7 +6559,7 @@ function ItemsScreen({
             </div>
             <div className="mt-4 grid grid-cols-3 gap-2 text-center">
               <div className="rounded-xl bg-[#f6f3ec] p-2">
-                <span className="text-[8px] font-bold text-[#77817c]">
+                <span className="text-[0.5rem] font-bold text-[#77817c]">
                   {copy.wholesale}
                 </span>
                 <strong className="mt-1 block text-xs">
@@ -5809,7 +6567,7 @@ function ItemsScreen({
                 </strong>
               </div>
               <div className="rounded-xl bg-[#f6f3ec] p-2">
-                <span className="text-[8px] font-bold text-[#77817c]">
+                <span className="text-[0.5rem] font-bold text-[#77817c]">
                   {copy.bulk}
                 </span>
                 <strong className="mt-1 block text-xs">
@@ -5817,7 +6575,7 @@ function ItemsScreen({
                 </strong>
               </div>
               <div className="rounded-xl bg-[#f6f3ec] p-2">
-                <span className="text-[8px] font-bold text-[#77817c]">GST</span>
+                <span className="text-[0.5rem] font-bold text-[#77817c]">GST</span>
                 <strong className="mt-1 block text-xs">{item.gstRate}%</strong>
               </div>
             </div>
@@ -5891,31 +6649,97 @@ function ItemsScreen({
           );
         })}
       </div>
+      ) : (
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {visibleMatches.map(({ item }) => (
+            <article key={item.id} className="archived-product-card">
+              <div className="flex min-w-0 items-start gap-3">
+                <ProductThumb
+                  item={item}
+                  language={language}
+                  className="h-14 w-14 opacity-75 grayscale-[25%]"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <h3 className="truncate text-sm font-black">
+                        {localizedItemName(language, item)}
+                      </h3>
+                      <p className="mt-1 truncate text-[0.625rem] text-[#737f78]">
+                        {localizedItemSecondaryName(language, item)}
+                      </p>
+                    </div>
+                    <span className="archived-product-card__status">
+                      {copy.archivedStatus}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-[0.5625rem] font-bold text-[#737f78]">
+                    {item.skuCode} · {copy.archivedOn(
+                      formatLocalizedDateTime(item.updatedAt, language),
+                    )}
+                  </p>
+                </div>
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2 text-center">
+                <div className="rounded-xl bg-[#f6f3ec] p-2">
+                  <span className="text-[0.5rem] font-bold text-[#77817c]">
+                    {copy.wholesale}
+                  </span>
+                  <strong className="mt-1 block text-xs">
+                    {formatMoney(item.priceWholesale)}
+                  </strong>
+                </div>
+                <div className="rounded-xl bg-[#f6f3ec] p-2">
+                  <span className="text-[0.5rem] font-bold text-[#77817c]">
+                    {copy.bulk}
+                  </span>
+                  <strong className="mt-1 block text-xs">
+                    {formatMoney(item.priceBulk)}
+                  </strong>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={Boolean(restoreBusy)}
+                onClick={() => void restore(item)}
+                aria-label={copy.restoreProduct(localizedItemName(language, item))}
+                className="counter-primary mt-3 min-h-11 w-full disabled:opacity-55"
+              >
+                {restoreBusy === item.id ? copy.saving : `↺ ${copy.restore}`}
+              </button>
+            </article>
+          ))}
+        </div>
+      )}
       {visibleLimit < matches.length && <button type="button" onClick={() => setVisibleLimit((value) => value + 90)} className="counter-secondary mt-4">{copy.loadMore(matches.length - visibleLimit)}</button>}
       {!matches.length && (
         <div className="rounded-xl border border-dashed border-[#cfd3cc] p-8 text-center">
-          <p className="text-sm font-black">{copy.noMatch}</p>
-          <button
-            onClick={onCreate}
-            className="mt-3 text-xs font-black text-[#014921] underline"
-          >
-            {copy.addManually}
-          </button>
+          <p className="text-sm font-black">
+            {catalogueView === "archived" && !query
+              ? copy.noArchived
+              : copy.noMatch}
+          </p>
+          {catalogueView === "active" && (
+            <button
+              onClick={onCreate}
+              className="mt-3 text-xs font-black text-[#014921] underline"
+            >
+              {copy.addManually}
+            </button>
+          )}
         </div>
       )}
     </section>
   );
 }
 
-type DashboardPeriod = "7d" | "30d" | "90d" | "all";
-
 const dashboardModeColors: Record<string, string> = {
-  cash: "#014921",
-  upi: "#309d4b",
-  credit: "#abd49e",
-  mixed: "#5b8f66",
-  bank: "#97ae9f",
-  cheque: "#d39b52",
+  cash: "var(--report-mode-cash)",
+  upi: "var(--report-mode-upi)",
+  credit: "var(--report-money-due)",
+  mixed: "var(--report-mode-mixed)",
+  bank: "var(--report-mode-bank)",
+  cheque: "var(--report-mode-cheque)",
 };
 const dashboardCategoryNames: Record<string, string> = {
   "cat-mala": "Moti Mala",
@@ -5933,12 +6757,14 @@ function DashboardMetric({
   value,
   note,
   tone,
+  valueTone,
 }: {
   icon: string;
   label: string;
   value: string;
   note: string;
   tone: "orange" | "green" | "blue" | "gold";
+  valueTone?: "in" | "out" | "due";
 }) {
   const tones = {
     orange: "bg-[#f4faf0] text-[#014921]",
@@ -5949,13 +6775,23 @@ function DashboardMetric({
   return (
     <article className="dashboard-card flex min-h-[112px] items-start justify-between gap-3 p-4">
       <div className="min-w-0">
-        <p className="text-[10px] font-black uppercase tracking-[.12em] text-[#8a918d]">
+        <p className="text-[0.625rem] font-black uppercase tracking-[.12em] text-[#8a918d]">
           {label}
         </p>
-        <strong className="mt-2 block truncate text-[22px] tracking-tight text-[#173f35]">
+        <strong
+          className={`mt-2 block break-words text-[1.375rem] tracking-tight ${
+            valueTone === "in"
+              ? "report-money-in"
+              : valueTone === "out"
+                ? "report-money-out"
+                : valueTone === "due"
+                  ? "report-money-due"
+                  : "text-[#173f35]"
+          }`}
+        >
           {value}
         </strong>
-        <p className="mt-1 text-[10px] font-semibold text-[#7b8580]">{note}</p>
+        <p className="mt-1 text-[0.625rem] font-semibold text-[#7b8580]">{note}</p>
       </div>
       <span
         className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl text-lg ${tones[tone]}`}
@@ -6089,40 +6925,46 @@ const duesScreenCopy = {
     noAddress: "No address saved", noPhone: "No phone saved", reminder: "WhatsApp reminder", khata: "Account ledger", date: "Date",
     billsStillDue: "Bills still due", billsStillDueHelper: "Oldest unpaid bill first, with the original total, received amount and balance left.",
     bills: (count: number) => `${count} bills`, dueAmount: (amount: string) => `Due ${amount}`, billTotal: "Bill total", receivedSoFar: "Received so far",
-    eyebrow: "Customer receivables", listHelper: "Customers who chose to pay later, with their latest payment and current balance.",
-    totalToCollect: "Total to collect", customersWithDue: "Customers with due", searchLabel: "Search customers with outstanding dues", searchPlaceholder: "Search customer name or code",
+    eyebrow: "Customer receivables", listHelper: "Every customer with due history, including outstanding and fully settled accounts.",
+    totalToCollect: "Total to collect", customersWithDue: "Customers with due", searchLabel: "Search customers with due history", searchPlaceholder: "Search customer name or code",
+    dueHistoryCustomers: "Due-history customers", allAccounts: "All", outstandingAccounts: "Outstanding", paidInFullAccounts: "Paid in full", paidInFull: "Paid in full", statusFilter: "Filter due accounts", noAccounts: "No due-history customers yet",
+    actualPayments: "Customer payments", returnCredits: "Return credits", paidCredit: "Paid / credit", refundPaid: "Refund paid",
     lastPayment: "Last payment", noPayment: "No payment recorded yet", due: "Due", forParty: (action: string, party: string) => `${action} for ${party}`,
-    noSearchMatch: "No due customer matches this search", noDues: "No customer dues right now", searchHint: "Try the customer name or code name.", noDuesHint: "Customers with a pay-later balance will appear here automatically.",
+    noSearchMatch: "No due-history customer matches this search or filter", noDues: "No customer dues right now", searchHint: "Try the customer name or code name, or change the status filter.", noDuesHint: "Customers appear here after a pay-later balance is recorded, even after it is fully settled.",
     exportDone: (party: string, format: string, result: string) => `${party} ${format} due statement ${result}`,
     exportError: (format: string, party: string) => `Could not export the ${format} statement for ${party}.`, shared: "shared", downloaded: "downloaded",
     openingBalance: "Opening balance", salesBill: "Sales bill", paidWithBill: "Payment received with bill", manualDue: "Manual due", customerPayment: "Customer payment received",
-    kinds: { opening_balance: "Opening balance", sale_invoice: "Sale bill", manual_due: "Manual due", payment: "Payment", balance_adjustment: "Balance adjustment" },
+    kinds: { opening_balance: "Opening balance", sale_invoice: "Sale bill", return_credit: "Sales return credit", return_refund: "Immediate return refund", manual_due: "Manual due", payment: "Payment", balance_adjustment: "Balance adjustment" },
   },
   hi: {
     noAddress: "पता सेव नहीं है", noPhone: "फोन सेव नहीं है", reminder: "WhatsApp रिमाइंडर", khata: "खाता", date: "तारीख",
     billsStillDue: "जिन बिलों का पेमेंट बाकी है", billsStillDueHelper: "सबसे पुराना बाकी बिल पहले है। हर कार्ड में बिल का कुल, मिली रकम और बचा बैलेंस अलग दिखता है।",
     bills: (count: number) => `${count} बिल`, dueAmount: (amount: string) => `बाकी ${amount}`, billTotal: "बिल का कुल", receivedSoFar: "अब तक मिला",
-    eyebrow: "कस्टमर से लेना है", listHelper: "बाद में पेमेंट करने वाले कस्टमर, उनका पिछला पेमेंट और मौजूदा बाकी।",
-    totalToCollect: "कुल लेना है", customersWithDue: "बाकी वाले कस्टमर", searchLabel: "बाकी वाले कस्टमर खोजें", searchPlaceholder: "कस्टमर का नाम या कोड खोजें",
+    eyebrow: "कस्टमर से लेना है", listHelper: "बाकी हिस्ट्री वाले सभी कस्टमर—बाकी और पूरा सेटल, दोनों खाते।",
+    totalToCollect: "कुल लेना है", customersWithDue: "बाकी वाले कस्टमर", searchLabel: "बाकी हिस्ट्री वाले कस्टमर खोजें", searchPlaceholder: "कस्टमर का नाम या कोड खोजें",
+    dueHistoryCustomers: "बाकी हिस्ट्री वाले कस्टमर", allAccounts: "सभी", outstandingAccounts: "बाकी", paidInFullAccounts: "पूरा भुगतान", paidInFull: "पूरा भुगतान", statusFilter: "बाकी खाते फ़िल्टर करें", noAccounts: "अभी कोई बाकी हिस्ट्री नहीं है",
+    actualPayments: "कस्टमर पेमेंट", returnCredits: "रिटर्न क्रेडिट", paidCredit: "पेमेंट / क्रेडिट", refundPaid: "रिफंड दिया",
     lastPayment: "पिछला पेमेंट", noPayment: "अभी कोई पेमेंट दर्ज नहीं है", due: "बाकी", forParty: (action: string, party: string) => `${party} के लिए ${action}`,
-    noSearchMatch: "इस खोज से कोई बाकी वाला कस्टमर नहीं मिला", noDues: "अभी किसी कस्टमर का बाकी नहीं है", searchHint: "कस्टमर का नाम या कोड नाम डालें।", noDuesHint: "बाद में पेमेंट वाला बैलेंस होते ही कस्टमर यहाँ अपने-आप दिखेगा।",
+    noSearchMatch: "इस खोज या फ़िल्टर से कोई बाकी हिस्ट्री वाला कस्टमर नहीं मिला", noDues: "अभी किसी कस्टमर का बाकी नहीं है", searchHint: "कस्टमर का नाम/कोड डालें या स्टेटस फ़िल्टर बदलें।", noDuesHint: "बाद में पेमेंट वाला बैलेंस दर्ज होने पर, पूरा सेटल होने के बाद भी कस्टमर यहाँ दिखेगा।",
     exportDone: (party: string, format: string, result: string) => `${party} का ${format} बाकी स्टेटमेंट ${result}`,
     exportError: (format: string, party: string) => `${party} का ${format} स्टेटमेंट एक्सपोर्ट नहीं हो सका।`, shared: "शेयर हो गया", downloaded: "डाउनलोड हो गया",
     openingBalance: "शुरुआती बैलेंस", salesBill: "सेल बिल", paidWithBill: "बिल के साथ पेमेंट मिला", manualDue: "हाथ से जोड़ा बाकी", customerPayment: "कस्टमर पेमेंट मिला",
-    kinds: { opening_balance: "शुरुआती बैलेंस", sale_invoice: "सेल बिल", manual_due: "हाथ से जोड़ा बाकी", payment: "पेमेंट", balance_adjustment: "बैलेंस में बदलाव" },
+    kinds: { opening_balance: "शुरुआती बैलेंस", sale_invoice: "सेल बिल", return_credit: "बिक्री वापसी क्रेडिट", return_refund: "तुरंत वापसी रिफंड", manual_due: "हाथ से जोड़ा बाकी", payment: "पेमेंट", balance_adjustment: "बैलेंस में बदलाव" },
   },
   bn: {
     noAddress: "ঠিকানা সেভ করা নেই", noPhone: "ফোন সেভ করা নেই", reminder: "WhatsApp রিমাইন্ডার", khata: "খাতা", date: "তারিখ",
     billsStillDue: "যে বিলগুলোর টাকা বাকি", billsStillDueHelper: "সবচেয়ে পুরনো বাকি বিল আগে আছে। প্রতিটি কার্ডে বিলের মোট, পাওয়া টাকা ও বাকি ব্যালেন্স আলাদা দেখা যাবে।",
     bills: (count: number) => `${count}টি বিল`, dueAmount: (amount: string) => `বাকি ${amount}`, billTotal: "বিলের মোট", receivedSoFar: "এখনও পর্যন্ত পাওয়া",
-    eyebrow: "কাস্টমারের কাছ থেকে পাওনা", listHelper: "পরে পেমেন্ট করা কাস্টমার, তাদের শেষ পেমেন্ট ও এখনকার বাকি।",
-    totalToCollect: "মোট পাওনা", customersWithDue: "বাকি থাকা কাস্টমার", searchLabel: "বাকি থাকা কাস্টমার খুঁজুন", searchPlaceholder: "কাস্টমারের নাম বা কোড খুঁজুন",
+    eyebrow: "কাস্টমারের কাছ থেকে পাওনা", listHelper: "বাকি ইতিহাস থাকা সব ক্রেতা—বাকি ও সম্পূর্ণ মেটানো দুই ধরনের হিসাব।",
+    totalToCollect: "মোট পাওনা", customersWithDue: "বাকি থাকা কাস্টমার", searchLabel: "বাকি ইতিহাস থাকা ক্রেতা খুঁজুন", searchPlaceholder: "কাস্টমারের নাম বা কোড খুঁজুন",
+    dueHistoryCustomers: "বাকি ইতিহাস থাকা ক্রেতা", allAccounts: "সব", outstandingAccounts: "বাকি", paidInFullAccounts: "সম্পূর্ণ পরিশোধ", paidInFull: "সম্পূর্ণ পরিশোধ", statusFilter: "বাকি হিসাব ফিল্টার করুন", noAccounts: "এখনও কোনো বাকি ইতিহাস নেই",
+    actualPayments: "ক্রেতার পেমেন্ট", returnCredits: "ফেরত ক্রেডিট", paidCredit: "পেমেন্ট / ক্রেডিট", refundPaid: "রিফান্ড দেওয়া",
     lastPayment: "শেষ পেমেন্ট", noPayment: "এখনও কোনো পেমেন্ট লেখা নেই", due: "বাকি", forParty: (action: string, party: string) => `${party}-এর জন্য ${action}`,
-    noSearchMatch: "এই খোঁজে বাকি থাকা কোনো কাস্টমার মেলেনি", noDues: "এখন কোনো কাস্টমারের বাকি নেই", searchHint: "কাস্টমারের নাম বা কোড নাম লিখুন।", noDuesHint: "পরে পেমেন্টের ব্যালেন্স হলেই কাস্টমার এখানে নিজে থেকে দেখা যাবে।",
+    noSearchMatch: "এই খোঁজ বা ফিল্টারে বাকি ইতিহাস থাকা কোনো ক্রেতা মেলেনি", noDues: "এখন কোনো কাস্টমারের বাকি নেই", searchHint: "ক্রেতার নাম/কোড লিখুন বা স্ট্যাটাস ফিল্টার বদলান।", noDuesHint: "পরে পেমেন্টের ব্যালেন্স লেখা হলে, সম্পূর্ণ মেটানোর পরেও ক্রেতা এখানে থাকবে।",
     exportDone: (party: string, format: string, result: string) => `${party}-এর ${format} বাকি স্টেটমেন্ট ${result}`,
     exportError: (format: string, party: string) => `${party}-এর ${format} স্টেটমেন্ট এক্সপোর্ট করা যায়নি।`, shared: "শেয়ার হয়েছে", downloaded: "ডাউনলোড হয়েছে",
     openingBalance: "শুরুর ব্যালেন্স", salesBill: "সেল বিল", paidWithBill: "বিলের সঙ্গে পেমেন্ট পাওয়া", manualDue: "নিজে যোগ করা বাকি", customerPayment: "কাস্টমার পেমেন্ট পাওয়া",
-    kinds: { opening_balance: "শুরুর ব্যালেন্স", sale_invoice: "সেল বিল", manual_due: "নিজে যোগ করা বাকি", payment: "পেমেন্ট", balance_adjustment: "ব্যালেন্সে বদল" },
+    kinds: { opening_balance: "শুরুর ব্যালেন্স", sale_invoice: "সেল বিল", return_credit: "বিক্রি ফেরতের ক্রেডিট", return_refund: "তাৎক্ষণিক ফেরত রিফান্ড", manual_due: "নিজে যোগ করা বাকি", payment: "পেমেন্ট", balance_adjustment: "ব্যালেন্সে বদল" },
   },
 } satisfies Record<Language, object>;
 
@@ -6130,6 +6972,8 @@ type DueStatementRow = ReturnType<typeof partyDueStatement>["rows"][number];
 
 function localizedDueActivity(row: DueStatementRow, language: Language) {
   const copy = duesScreenCopy[language];
+  if (row.kind === "manual_due" && row.reference.startsWith("MKDUES1|"))
+    return importedDueActivityLabel(language);
   if (row.activity === "Opening balance") return copy.openingBalance;
   if (row.activity === "Sales bill") return copy.salesBill;
   if (row.activity === "Payment received with bill") return copy.paidWithBill;
@@ -6152,6 +6996,7 @@ function DuesScreen({
   onBack,
   onAddDue,
   onPayment,
+  onBackup,
   onToast,
 }: {
   parties: Party[];
@@ -6166,18 +7011,23 @@ function DuesScreen({
   onBack: () => void;
   onAddDue: (party?: Party) => void;
   onPayment: (party: Party) => void;
+  onBackup: () => void;
   onToast: (message: string) => void;
 }) {
   const copy = duesScreenCopy[language];
+  const backupCopy = dueBackupCopy(language);
   const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "outstanding" | "paid_in_full">("all");
   const allDueRows = useMemo(
-    () => dueCustomerRows(parties, payments, "", invoices),
-    [parties, payments, invoices],
+    () => dueCustomerRows(parties, payments, "", invoices, accountEntries, true),
+    [parties, payments, invoices, accountEntries],
   );
-  const visibleRows = useMemo(
-    () => dueCustomerRows(parties, payments, query, invoices),
-    [parties, payments, invoices, query],
-  );
+  const visibleRows = useMemo(() => {
+    const searched = dueCustomerRows(parties, payments, query, invoices, accountEntries, true);
+    return statusFilter === "all" ? searched : searched.filter((row) => row.status === statusFilter);
+  }, [parties, payments, invoices, accountEntries, query, statusFilter]);
+  const outstandingCount = allDueRows.filter((row) => row.status === "outstanding").length;
+  const settledCount = allDueRows.filter((row) => row.status === "paid_in_full").length;
   const totalDue = allDueRows.reduce(
     (sum, row) => sum + row.party.currentBalance,
     0,
@@ -6234,6 +7084,7 @@ function DuesScreen({
           a.createdAt.localeCompare(b.createdAt),
       );
     const lastPayment = statement.lastPayment;
+    const settled = statement.remainingDue <= 0;
     return (
       <section className="mx-auto max-w-4xl px-3 py-5 md:px-7">
         <button
@@ -6242,36 +7093,36 @@ function DuesScreen({
         >
           ‹ {t(language, "backToDues")}
         </button>
-        <div className="overflow-hidden rounded-3xl bg-[#173f35] text-white shadow-sm">
+        <div className="due-customer-hero overflow-hidden rounded-3xl bg-[#173f35] text-white shadow-sm" data-status={settled ? "settled" : "outstanding"}>
           <div className="p-5">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
                   {current.codeName && (
-                    <span className="rounded-lg bg-[#ffb45f] px-2 py-1 text-[9px] font-black uppercase text-[#173f35]">
+                    <span className="rounded-lg bg-[#ffb45f] px-2 py-1 text-[0.5625rem] font-black uppercase text-[#173f35]">
                       {current.codeName}
                     </span>
                   )}
-                  <span className="text-[10px] font-semibold text-[#c2d3cc]">
+                  <span className="text-[0.625rem] font-semibold text-[#c2d3cc]">
                     {t(language, "customerAccount")}
                   </span>
                 </div>
-                <h2 className="mt-2 truncate text-2xl font-black">
+                <h2 className="mt-2 break-words text-2xl font-black">
                   {partyStatementLabel(current)}
                 </h2>
-                <p className="mt-1 truncate text-[10px] text-[#c5d6d0]">
+                <p className="mt-1 break-words text-[0.625rem] text-[#c5d6d0]">
                   ⌖ {current.address || copy.noAddress}
                 </p>
-                <p className="mt-1 text-[10px] text-[#c5d6d0]">
+                <p className="mt-1 text-[0.625rem] text-[#c5d6d0]">
                   {current.phone || copy.noPhone}
                 </p>
               </div>
               <div className="shrink-0 text-right">
-                <p className="text-[9px] font-black uppercase tracking-wide text-[#bdd0c8]">
-                  {t(language, "amountToPayNext")}
+                <p className="text-[0.5625rem] font-black uppercase tracking-wide text-[#bdd0c8]">
+                  {settled ? copy.paidInFull : t(language, "amountToPayNext")}
                 </p>
                 <strong className="mt-1 block text-2xl text-[#ffb45f]">
-                  {formatMoney(statement.remainingDue)}
+                  {settled ? `✓ ${formatMoney(0)}` : formatMoney(statement.remainingDue)}
                 </strong>
               </div>
             </div>
@@ -6279,48 +7130,48 @@ function DuesScreen({
               <button
                 type="button"
                 onClick={() => onAddDue(current)}
-                className="min-h-12 rounded-xl border border-white/25 bg-white px-2 text-[10px] font-black text-[#014921]"
+                className="min-h-12 rounded-xl border border-white/25 bg-white px-2 text-[0.625rem] font-black text-[#014921]"
               >
                 ＋ {t(language, "addManualDue")}
               </button>
               <button
                 onClick={() => onPayment(current)}
                 disabled={statement.remainingDue <= 0}
-                className="min-h-12 rounded-xl border border-white/20 bg-[#309d4b] px-2 text-[10px] font-black text-white disabled:opacity-45"
+                className="min-h-12 rounded-xl border border-white/20 bg-[#309d4b] px-2 text-[0.625rem] font-black text-white disabled:opacity-45"
               >
                 ₹ {t(language, "paymentReceived")}
               </button>
               <button
                 type="button"
                 onClick={() => void exportPartyStatement(current, "pdf")}
-                className="min-h-12 rounded-xl border border-white/25 bg-white px-2 text-[10px] font-black text-[#014921]"
+                className="min-h-12 rounded-xl border border-white/25 bg-white px-2 text-[0.625rem] font-black text-[#014921]"
               >
                 ↓ {t(language, "exportPdf")}
               </button>
               <button
                 type="button"
                 onClick={() => void exportPartyStatement(current, "text")}
-                className="min-h-12 rounded-xl border border-white/25 bg-white px-2 text-[10px] font-black text-[#014921]"
+                className="min-h-12 rounded-xl border border-white/25 bg-white px-2 text-[0.625rem] font-black text-[#014921]"
               >
                 ↓ {t(language, "exportText")}
               </button>
               <button
                 type="button"
-                disabled={!current.phone}
+                disabled={!current.phone || settled}
                 onClick={() => {
                   const message = renderMessageTemplate(dueTemplate, { party_name: current.name, party_code: current.codeName, due: formatMoney(statement.remainingDue), shop_name: business.name });
                   const url = `https://wa.me/${current.phone.replace(/\D/g, "")}?text=${encodeURIComponent(message)}`;
                   void openExternalUrl(url).then((opened) => { if (!opened) window.open(url, "_blank", "noopener,noreferrer"); });
                 }}
-                className="min-h-12 rounded-xl border border-white/25 bg-[#309d4b] px-2 text-[10px] font-black text-white disabled:opacity-40"
+                className="min-h-12 rounded-xl border border-white/25 bg-[#309d4b] px-2 text-[0.625rem] font-black text-white disabled:opacity-40"
               >
                 {copy.reminder}
               </button>
             </div>
           </div>
-          <div className="grid grid-cols-2 border-t border-white/10 bg-white/5 text-center sm:grid-cols-4">
+          <div className="grid grid-cols-2 border-t border-white/10 bg-white/5 text-center sm:grid-cols-6">
             <div className="p-3">
-              <span className="text-[8px] font-black uppercase text-[#b9cbc4]">
+              <span className="text-[0.5rem] font-black uppercase text-[#b9cbc4]">
                 {t(language, "dueAdded")}
               </span>
               <strong className="mt-1 block text-sm">
@@ -6328,25 +7179,41 @@ function DuesScreen({
               </strong>
             </div>
             <div className="border-l border-white/10 p-3">
-              <span className="text-[8px] font-black uppercase text-[#b9cbc4]">
-                {t(language, "totalPaid")}
+              <span className="text-[0.5rem] font-black uppercase text-[#b9cbc4]">
+                {copy.actualPayments}
               </span>
               <strong className="mt-1 block text-sm">
                 {formatMoney(statement.totalPaid)}
               </strong>
             </div>
             <div className="border-t border-white/10 p-3 sm:border-l sm:border-t-0">
-              <span className="text-[8px] font-black uppercase text-[#b9cbc4]">
+              <span className="text-[0.5rem] font-black uppercase text-[#b9cbc4]">
+                {copy.returnCredits}
+              </span>
+              <strong className="mt-1 block text-sm">
+                {formatMoney(statement.totalReturnCredits)}
+              </strong>
+            </div>
+            <div className="border-l border-t border-white/10 p-3 sm:border-t-0">
+              <span className="text-[0.5rem] font-black uppercase text-[#b9cbc4]">
+                {copy.refundPaid}
+              </span>
+              <strong className="mt-1 block text-sm">
+                {formatMoney(statement.totalRefunded)}
+              </strong>
+            </div>
+            <div className="border-t border-white/10 p-3 sm:border-l sm:border-t-0">
+              <span className="text-[0.5rem] font-black uppercase text-[#b9cbc4]">
                 {t(language, "lastPayment")}
               </span>
-              <strong className="mt-1 block text-[10px]">
+              <strong className="mt-1 block text-[0.625rem]">
                 {lastPayment
                   ? `${formatMoney(lastPayment.amount)} · ${fullInvoiceDate(lastPayment.date, language)}`
                   : t(language, "noPaymentRecorded")}
               </strong>
             </div>
             <div className="border-l border-t border-white/10 p-3 sm:border-t-0">
-              <span className="text-[8px] font-black uppercase text-[#b9cbc4]">
+              <span className="text-[0.5rem] font-black uppercase text-[#b9cbc4]">
                 {t(language, "activity")}
               </span>
               <strong className="mt-1 block text-sm">
@@ -6361,14 +7228,14 @@ function DuesScreen({
             <h3 className="mt-1 text-xl font-black">
               {t(language, "dueStatement")}
             </h3>
-            <p className="mt-1 text-[11px] font-black text-[#335f50]">
+            <p className="mt-1 text-[0.6875rem] font-black text-[#335f50]">
               {partyStatementLabel(current)}
             </p>
-            <p className="mt-1 text-[10px] text-[#748078]">
+            <p className="mt-1 text-[0.625rem] text-[#748078]">
               {t(language, "dueStatementHelp")}
             </p>
           </div>
-          <span className="shrink-0 text-[10px] font-black text-[#748078]">
+          <span className="shrink-0 text-[0.625rem] font-black text-[#748078]">
             {statement.rows.length} {t(language, "accountEntries")}
           </span>
         </div>
@@ -6379,7 +7246,7 @@ function DuesScreen({
               <strong className="mt-1 block text-xs">
                 {fullInvoiceDate(lastPayment.date, language)} · {invoiceRecordedTime(lastPayment.createdAt, language)}
               </strong>
-              <p className="mt-1 text-[9px] text-[#748078]">
+              <p className="mt-1 text-[0.5625rem] text-[#748078]">
                 {paymentModeLabel(lastPayment.mode, language)}
                 {lastPayment.reference ? ` · ${lastPayment.reference}` : ""}
               </p>
@@ -6397,7 +7264,8 @@ function DuesScreen({
                 <th>{t(language, "activity")}</th>
                 <th>{t(language, "referenceMode")}</th>
                 <th className="amount-column">{t(language, "dueAdded")} (+)</th>
-                <th className="amount-column">{t(language, "paymentReceived")} (−)</th>
+                <th className="amount-column">{copy.paidCredit} (−)</th>
+                <th className="amount-column">{copy.refundPaid}</th>
                 <th className="amount-column">{t(language, "runningBalance")}</th>
               </tr>
             </thead>
@@ -6424,6 +7292,9 @@ function DuesScreen({
                   <td className="amount-column payment-received">
                     {row.paymentReceived ? `−${formatMoney(row.paymentReceived)}` : "—"}
                   </td>
+                  <td className="amount-column payment-received">
+                    {row.refundPaid ? formatMoney(row.refundPaid) : "—"}
+                  </td>
                   <td className="amount-column running-balance">
                     {formatMoney(row.runningBalance)}
                   </td>
@@ -6431,7 +7302,7 @@ function DuesScreen({
               ))}
               {!statement.rows.length && (
                 <tr>
-                  <td colSpan={6} className="empty-row">
+                  <td colSpan={7} className="empty-row">
                     {t(language, "noPaymentRecorded")}
                   </td>
                 </tr>
@@ -6441,16 +7312,17 @@ function DuesScreen({
               <tr>
                 <th colSpan={3}>{t(language, "totalRemaining")}</th>
                 <td className="amount-column">{formatMoney(statement.totalDueAdded)}</td>
-                <td className="amount-column">{formatMoney(statement.totalPaid)}</td>
+                <td className="amount-column">{formatMoney(statement.totalBalanceReductions)}</td>
+                <td className="amount-column">{formatMoney(statement.totalRefunded)}</td>
                 <td className="amount-column">{formatMoney(statement.remainingDue)}</td>
               </tr>
             </tfoot>
           </table>
         </div>
-        <div className="due-statement-total mt-3">
+        <div className="due-statement-total mt-3" data-status={settled ? "settled" : "outstanding"}>
           <div>
-            <span>{t(language, "amountToPayNext")}</span>
-            <small>{t(language, "totalRemaining")}</small>
+            <span>{settled ? `✓ ${copy.paidInFull}` : t(language, "amountToPayNext")}</span>
+            <small>{settled ? copy.paidInFull : t(language, "totalRemaining")}</small>
           </div>
           <strong>{formatMoney(statement.remainingDue)}</strong>
         </div>
@@ -6459,11 +7331,11 @@ function DuesScreen({
             <div className="mb-2 flex items-end justify-between">
               <div>
                 <h3 className="text-sm font-black">{copy.billsStillDue}</h3>
-                <p className="mt-1 text-[10px] text-[#748078]">
+                <p className="mt-1 text-[0.625rem] text-[#748078]">
                   {copy.billsStillDueHelper}
                 </p>
               </div>
-              <span className="text-[10px] font-black text-[#748078]">
+              <span className="text-[0.625rem] font-black text-[#748078]">
                 {copy.bills(outstandingBills.length)}
               </span>
             </div>
@@ -6478,7 +7350,7 @@ function DuesScreen({
                       <strong className="text-xs">
                         {partyStatementLabel(current)}
                       </strong>
-                      <p className="mt-1 text-[9px] text-[#7b837f]">
+                      <p className="mt-1 text-[0.5625rem] text-[#7b837f]">
                         {invoice.invoiceNumber} · {fullInvoiceDate(invoice.date, language)} ·{" "}
                         {invoicePaymentLabel(invoice, language)}
                       </p>
@@ -6489,18 +7361,18 @@ function DuesScreen({
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-2 text-center">
                     <div className="rounded-lg bg-[#f4faf0] p-2">
-                      <span className="block text-[8px] font-black uppercase text-[#718077]">
+                      <span className="block text-[0.5rem] font-black uppercase text-[#718077]">
                         {copy.billTotal}
                       </span>
-                      <strong className="mt-1 block text-[10px]">
+                      <strong className="mt-1 block text-[0.625rem]">
                         {formatMoney(invoice.grandTotal)}
                       </strong>
                     </div>
                     <div className="rounded-lg bg-[#eaf4ee] p-2">
-                      <span className="block text-[8px] font-black uppercase text-[#567268]">
+                      <span className="block text-[0.5rem] font-black uppercase text-[#567268]">
                         {copy.receivedSoFar}
                       </span>
-                      <strong className="mt-1 block text-[10px] text-[#267055]">
+                      <strong className="mt-1 block text-[0.625rem] text-[#267055]">
                         {formatMoney(invoice.amountPaid)}
                       </strong>
                     </div>
@@ -6521,21 +7393,21 @@ function DuesScreen({
             {copy.eyebrow}
           </p>
           <h2 className="page-title">{t(language, "dues")}</h2>
-          <p className="mt-1 text-[11px] font-semibold text-[#6f7773]">
+          <p className="mt-1 text-[0.6875rem] font-semibold text-[#6f7773]">
             {copy.listHelper}
           </p>
         </div>
         <button
           type="button"
           onClick={() => onAddDue()}
-          className="min-h-12 shrink-0 rounded-xl bg-[#309d4b] px-3 text-[10px] font-black text-white"
+          className="min-h-12 shrink-0 rounded-xl bg-[#309d4b] px-3 text-[0.625rem] font-black text-white"
         >
           ＋ {t(language, "addManualDue")}
         </button>
       </div>
-      <div className="mt-4 grid grid-cols-2 gap-2">
+      <div className="mt-4 grid grid-cols-1 gap-2 min-[360px]:grid-cols-3">
         <div className="rounded-2xl bg-[#173f35] p-4 text-white">
-          <span className="text-[9px] font-black uppercase tracking-wide text-[#bdd0c8]">
+          <span className="text-[0.5625rem] font-black uppercase tracking-wide text-[#bdd0c8]">
             {copy.totalToCollect}
           </span>
           <strong className="mt-1 block text-xl text-[#ffb45f]">
@@ -6543,13 +7415,50 @@ function DuesScreen({
           </strong>
         </div>
         <div className="rounded-2xl border border-[#ddd7ca] bg-white p-4">
-          <span className="text-[9px] font-black uppercase tracking-wide text-[#748078]">
+          <span className="text-[0.5625rem] font-black uppercase tracking-wide text-[#748078]">
             {copy.customersWithDue}
           </span>
           <strong className="mt-1 block text-xl text-[#173f35]">
-            {allDueRows.length}
+            {outstandingCount}
           </strong>
         </div>
+        <div className="due-paid-metric rounded-2xl border p-4">
+          <span className="text-[0.6875rem] font-black text-[#267055]">
+            ✓ {copy.paidInFullAccounts}
+          </span>
+          <strong className="mt-1 block text-xl text-[#267055]">
+            {settledCount}
+          </strong>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onBackup}
+        className="due-backup-launch mt-3"
+      >
+        <span aria-hidden="true">⇅</span>
+        <span>
+          <strong>{backupCopy.title}</strong>
+          <small>{backupCopy.helper}</small>
+        </span>
+        <b aria-hidden="true">›</b>
+      </button>
+      <div className="due-status-filter mt-4" role="group" aria-label={copy.statusFilter}>
+        {([
+          ["all", copy.allAccounts, allDueRows.length],
+          ["outstanding", copy.outstandingAccounts, outstandingCount],
+          ["paid_in_full", copy.paidInFullAccounts, settledCount],
+        ] as const).map(([value, label, count]) => (
+          <button
+            key={value}
+            type="button"
+            aria-pressed={statusFilter === value}
+            onClick={() => setStatusFilter(value)}
+          >
+            <span>{label}</span>
+            <b>{count}</b>
+          </button>
+        ))}
       </div>
       <label className="search-box my-4">
         <span aria-hidden="true">⌕</span>
@@ -6561,47 +7470,51 @@ function DuesScreen({
         />
       </label>
       <div className="grid gap-2 md:grid-cols-2">
-        {visibleRows.map(({ party, lastPayment }) => (
+        {visibleRows.map(({ party, lastPayment, status }) => (
           <article
             key={party.id}
-            className="rounded-2xl border border-[#ddd7ca] bg-white p-3.5 text-left shadow-sm"
+            className="due-customer-card rounded-2xl border border-[#ddd7ca] bg-white p-3.5 text-left shadow-sm"
+            data-status={status === "paid_in_full" ? "settled" : "outstanding"}
           >
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
-                <strong className="block truncate text-sm">
+                <strong className="block break-words text-sm" title={partyStatementLabel(party)}>
                   {partyStatementLabel(party)}
                 </strong>
-                <p className="mt-2 text-[9px] font-black uppercase text-[#898f8b]">
+                <span className="due-customer-status mt-1" data-status={status === "paid_in_full" ? "settled" : "outstanding"}>
+                  {status === "paid_in_full" ? `✓ ${copy.paidInFull}` : copy.outstandingAccounts}
+                </span>
+                <p className="mt-2 text-[0.5625rem] font-black uppercase text-[#898f8b]">
                   {copy.lastPayment}
                 </p>
                 {lastPayment ? (
-                  <p className="mt-1 text-[10px] font-semibold text-[#53635c]">
+                  <p className="mt-1 text-[0.625rem] font-semibold text-[#53635c]">
                     {formatMoney(lastPayment.amount)} ·{" "}
                     {fullInvoiceDate(lastPayment.date, language)}
                   </p>
                 ) : (
-                  <p className="mt-1 text-[10px] font-semibold text-[#9a6b50]">
+                  <p className="mt-1 text-[0.625rem] font-semibold text-[#9a6b50]">
                     {copy.noPayment}
                   </p>
                 )}
                 {lastPayment && (
                   <span
-                    className={`mt-1 inline-block rounded-full px-2 py-1 text-[8px] font-black ${lastPayment.mode === "cash" ? "bg-[#fff0df] text-[#a95221]" : "bg-[#e6f4ed] text-[#246b50]"}`}
+                    className={`mt-1 inline-block rounded-full px-2 py-1 text-[0.5rem] font-black ${lastPayment.mode === "cash" ? "bg-[#fff0df] text-[#a95221]" : "bg-[#e6f4ed] text-[#246b50]"}`}
                   >
                     {paymentModeLabel(lastPayment.mode, language)}
                   </span>
                 )}
               </div>
               <div className="shrink-0 text-right">
-                <span className="text-[8px] font-black uppercase text-[#898f8b]">
-                  {copy.due}
+                <span className="text-[0.6875rem] font-black text-[#68756e]">
+                  {status === "paid_in_full" ? copy.paidInFull : copy.due}
                 </span>
-                <strong className="mt-1 block text-base text-[#b75b2b]">
+                <strong className="due-customer-card__balance mt-1 block text-base">
                   {formatMoney(party.currentBalance)}
                 </strong>
               </div>
             </div>
-            <div className="mt-3 grid grid-cols-3 gap-2 border-t border-[#e2e2db] pt-3">
+            <div className="due-list-actions mt-3 grid grid-cols-3 gap-2 border-t border-[#e2e2db] pt-3">
               <button
                 type="button"
                 onClick={() => onParty(party)}
@@ -6634,12 +7547,12 @@ function DuesScreen({
         <div className="rounded-2xl border-2 border-dashed border-[#d8d1c3] bg-[#f8f5ee] p-8 text-center">
           <div className="text-3xl">✓</div>
           <p className="mt-2 text-sm font-black">
-            {query
+            {query || statusFilter !== "all"
               ? copy.noSearchMatch
-              : copy.noDues}
+              : copy.noAccounts}
           </p>
-          <p className="mt-1 text-[10px] text-[#748078]">
-            {query
+          <p className="mt-1 text-[0.625rem] text-[#748078]">
+            {query || statusFilter !== "all"
               ? copy.searchHint
               : copy.noDuesHint}
           </p>
@@ -6936,31 +7849,34 @@ function MiscellaneousScreen({
       <div>
         <p className="eyebrow">{copy.eyebrow}</p>
         <h2 className="page-title">{t(language, "miscellaneous")}</h2>
-        <p className="mt-1 max-w-2xl text-[11px] font-semibold leading-5 text-[#6f7773]">
+        <p className="mt-1 max-w-2xl text-[0.6875rem] font-semibold leading-5 text-[#6f7773]">
           {copy.helper}
         </p>
       </div>
-      <div className="mt-4 grid grid-cols-3 gap-2">
+      <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
         <DashboardMetric
           icon="↘"
           label={copy.today}
-          value={formatMoney(todayTotal)}
+          value={`−${formatMoney(todayTotal)}`}
           note={`${active.filter((expense) => expense.date === localDate()).length} ${copy.entries}`}
           tone="orange"
+          valueTone="out"
         />
         <DashboardMetric
           icon="◫"
           label={copy.month}
-          value={formatMoney(monthTotal)}
+          value={`−${formatMoney(monthTotal)}`}
           note={`${active.filter((expense) => expense.date.startsWith(month)).length} ${copy.entries}`}
           tone="green"
+          valueTone="out"
         />
         <DashboardMetric
           icon="Σ"
           label={copy.all}
-          value={formatMoney(allTotal)}
+          value={`−${formatMoney(allTotal)}`}
           note={`${active.length} ${copy.entries}`}
           tone="gold"
+          valueTone="out"
         />
       </div>
       <div className="mt-4 grid gap-4 lg:grid-cols-[.85fr_1.15fr]">
@@ -6987,7 +7903,7 @@ function MiscellaneousScreen({
                   key={option}
                   aria-pressed={category === option}
                   onClick={() => setCategory(option)}
-                  className={`min-h-14 rounded-xl border px-2 text-[10px] font-black ${category === option ? "border-[#014921] bg-[#e8f3e9] text-[#014921]" : "border-[#ddd8ce] bg-white text-[#68746e]"}`}
+                  className={`min-h-14 rounded-xl border px-2 text-[0.625rem] font-black ${category === option ? "border-[#014921] bg-[#e8f3e9] text-[#014921]" : "border-[#ddd8ce] bg-white text-[#68746e]"}`}
                 >
                   <span className="mb-1 block text-lg">
                     {categoryIcons[option]}
@@ -7012,7 +7928,7 @@ function MiscellaneousScreen({
                 }
                 className="flex min-h-14 w-full items-center justify-between rounded-xl border-2 border-[#efb17f] bg-[#fff8ef] px-3 text-left"
               >
-                <span className="text-[10px] font-black text-[#9a6a49]">₹</span>
+                <span className="text-[0.625rem] font-black text-[#9a6a49]">₹</span>
                 <strong className="text-lg">{formatMoney(amount)}</strong>
               </button>
             </div>
@@ -7047,7 +7963,7 @@ function MiscellaneousScreen({
                 key={mode}
                 aria-pressed={paymentMode === mode}
                 onClick={() => setPaymentMode(mode)}
-                className={`min-h-11 rounded-xl border text-[10px] font-black uppercase ${paymentMode === mode ? "border-[#014921] bg-[#014921] text-white" : "border-[#d8d4c9] bg-white"}`}
+                className={`min-h-11 rounded-xl border text-[0.625rem] font-black uppercase ${paymentMode === mode ? "border-[#014921] bg-[#014921] text-white" : "border-[#d8d4c9] bg-white"}`}
               >
                 {copy.paymentModes[mode]}
               </button>
@@ -7065,7 +7981,7 @@ function MiscellaneousScreen({
           {error && (
             <p
               role="alert"
-              className="mt-3 rounded-xl bg-[#fff0e8] p-3 text-[10px] font-bold text-[#a9502b]"
+              className="mt-3 rounded-xl bg-[#fff0e8] p-3 text-[0.625rem] font-bold text-[#a9502b]"
             >
               {error}
             </p>
@@ -7109,34 +8025,34 @@ function MiscellaneousScreen({
               >
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-full bg-[#fff0df] px-2 py-1 text-[8px] font-black text-[#a95221]">
+                    <span className="rounded-full bg-[#fff0df] px-2 py-1 text-[0.5rem] font-black text-[#a95221]">
                       {expenseCategoryCopy[language][expense.category]}
                     </span>
-                    <span className="rounded-full bg-[#e7f3ec] px-2 py-1 text-[8px] font-black uppercase text-[#25684f]">
+                    <span className="rounded-full bg-[#e7f3ec] px-2 py-1 text-[0.5rem] font-black uppercase text-[#25684f]">
                       {copy.paymentModes[expense.paymentMode]}
                     </span>
                   </div>
                   <strong className="mt-2 block text-sm">
                     {localizedExpenseDescription(expense, language)}
                   </strong>
-                  <p className="mt-1 text-[10px] font-semibold text-[#65716b]">
+                  <p className="mt-1 text-[0.625rem] font-semibold text-[#65716b]">
                     {fullInvoiceDate(expense.date, language)} · {copy.recorded}{" "}
                     {invoiceRecordedTime(expense.createdAt, language)}
                   </p>
                   {expense.reference && (
-                    <p className="mt-1 text-[9px] text-[#7c8580]">
+                    <p className="mt-1 text-[0.5625rem] text-[#7c8580]">
                       {copy.ref}: {expense.reference}
                     </p>
                   )}
                 </div>
                 <div className="shrink-0 text-right">
-                  <strong className="text-base text-[#b75b2b]">
+                  <strong className="report-money-out text-base">
                     −{formatMoney(expense.amount)}
                   </strong>
                   <button
                     type="button"
                     onClick={() => void remove(expense)}
-                    className="mt-2 block min-h-9 rounded-lg border border-[#e2c6b9] bg-white px-3 text-[9px] font-black text-[#9e4d2d]"
+                    className="mt-2 block min-h-9 rounded-lg border border-[#e2c6b9] bg-white px-3 text-[0.5625rem] font-black text-[#9e4d2d]"
                   >
                     {copy.remove}
                   </button>
@@ -7152,7 +8068,7 @@ function MiscellaneousScreen({
           </div>
           {removed.length > 0 && (
             <div className="border-t border-[#e7e3da] bg-[#f8f5ee] p-4">
-              <h4 className="text-[10px] font-black uppercase tracking-wide text-[#737d78]">
+              <h4 className="text-[0.625rem] font-black uppercase tracking-wide text-[#737d78]">
                 {copy.removed}
               </h4>
               <div className="mt-2 space-y-2">
@@ -7162,10 +8078,10 @@ function MiscellaneousScreen({
                     className="flex items-center justify-between gap-3 rounded-xl bg-white p-3"
                   >
                     <div className="min-w-0">
-                      <strong className="block truncate text-[10px]">
+                      <strong className="block truncate text-[0.625rem]">
                         {localizedExpenseDescription(expense, language)}
                       </strong>
-                      <p className="mt-1 text-[9px] text-[#7a837e]">
+                      <p className="mt-1 text-[0.5625rem] text-[#7a837e]">
                         {formatMoney(expense.amount)} ·{" "}
                         {fullInvoiceDate(expense.date, language)}
                       </p>
@@ -7173,7 +8089,7 @@ function MiscellaneousScreen({
                     <button
                       type="button"
                       onClick={() => void restore(expense)}
-                      className="min-h-9 rounded-lg bg-[#e7f3ec] px-3 text-[9px] font-black text-[#25684f]"
+                      className="min-h-9 rounded-lg bg-[#e7f3ec] px-3 text-[0.5625rem] font-black text-[#25684f]"
                     >
                       {copy.restore}
                     </button>
@@ -7449,6 +8365,9 @@ function CashFlowPanel({
   parties,
   accountEntries,
   expenses,
+  fromDate,
+  toDate,
+  onRangeChange,
   business,
   language,
   onToast,
@@ -7458,14 +8377,13 @@ function CashFlowPanel({
   parties: Party[];
   accountEntries: AccountEntry[];
   expenses: Expense[];
+  fromDate: string;
+  toDate: string;
+  onRangeChange: (fromDate: string, toDate: string) => void;
   business: BusinessSettings;
   language: Language;
   onToast: (message: string) => void;
 }) {
-  const today = localDate();
-  const startOfMonth = `${today.slice(0, 7)}-01`;
-  const [fromDate, setFromDate] = useState(startOfMonth);
-  const [toDate, setToDate] = useState(today);
   const copy = cashFlowCopy[language];
   const report = useMemo(
     () =>
@@ -7481,36 +8399,11 @@ function CashFlowPanel({
     [invoices, payments, parties, accountEntries, expenses, fromDate, toDate],
   );
   const visibleMovements = report.movements.slice(0, 100);
-  const dayOffset = (days: number) => {
-    const value = new Date();
-    value.setHours(0, 0, 0, 0);
-    value.setDate(value.getDate() - days);
-    return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
-  };
-  const preset = (kind: "today" | "7d" | "30d" | "month" | "all") => {
-    if (kind === "all") {
-      setFromDate("");
-      setToDate("");
-      return;
-    }
-    setToDate(today);
-    setFromDate(
-      kind === "today"
-        ? today
-        : kind === "7d"
-          ? dayOffset(6)
-          : kind === "30d"
-            ? dayOffset(29)
-            : startOfMonth,
-    );
-  };
   const changeFrom = (value: string) => {
-    setFromDate(value);
-    if (value && toDate && value > toDate) setToDate(value);
+    onRangeChange(value, value && toDate && value > toDate ? value : toDate);
   };
   const changeTo = (value: string) => {
-    setToDate(value);
-    if (value && fromDate && value < fromDate) setFromDate(value);
+    onRangeChange(value && fromDate && value < fromDate ? value : fromDate, value);
   };
   async function exportPdf() {
     try {
@@ -7535,8 +8428,8 @@ function CashFlowPanel({
   const partyById = new Map(parties.map((party) => [party.id, party]));
   const expenseById = new Map(expenses.map((expense) => [expense.id, expense]));
   const movementDisplay = (movement: (typeof report.movements)[number]) => {
-    if (movement.id.startsWith("invoice-")) {
-      const invoice = invoiceById.get(movement.id.slice("invoice-".length));
+    if (movement.invoiceId) {
+      const invoice = invoiceById.get(movement.invoiceId);
       return {
         title: invoice
           ? `${movementType(movement.source)} ${invoice.invoiceNumber}`
@@ -7546,8 +8439,8 @@ function CashFlowPanel({
           : movement.details,
       };
     }
-    if (movement.id.startsWith("payment-")) {
-      const payment = paymentById.get(movement.id.slice("payment-".length));
+    if (movement.paymentId) {
+      const payment = paymentById.get(movement.paymentId);
       const party = payment ? partyById.get(payment.partyId) : undefined;
       return {
         title: party
@@ -7562,8 +8455,8 @@ function CashFlowPanel({
             : copy.accountPayment),
       };
     }
-    if (movement.id.startsWith("expense-")) {
-      const expense = expenseById.get(movement.id.slice("expense-".length));
+    if (movement.expenseId) {
+      const expense = expenseById.get(movement.expenseId);
       return {
         title: expense
           ? localizedExpenseDescription(expense, language)
@@ -7589,7 +8482,7 @@ function CashFlowPanel({
                 <h3 className="text-lg font-black text-[#014921]">
                   {copy.title}
                 </h3>
-                <p className="mt-1 text-[10px] font-semibold leading-4 text-[#6f7974]">
+                <p className="mt-1 text-[0.625rem] font-semibold leading-4 text-[#6f7974]">
                   {copy.helper}
                 </p>
               </div>
@@ -7599,14 +8492,14 @@ function CashFlowPanel({
             <button
               type="button"
               onClick={() => void exportPdf()}
-              className="min-h-11 rounded-xl bg-[#014921] px-4 text-[10px] font-black text-white"
+              className="min-h-11 rounded-xl bg-[#014921] px-4 text-[0.625rem] font-black text-white"
             >
               ↓ {t(language, "exportPdf")}
             </button>
             <button
               type="button"
               onClick={exportText}
-              className="min-h-11 rounded-xl border border-[#8fbd9f] bg-white px-4 text-[10px] font-black text-[#014921]"
+              className="min-h-11 rounded-xl border border-[#8fbd9f] bg-white px-4 text-[0.625rem] font-black text-[#014921]"
             >
               ↓ {t(language, "exportText")}
             </button>
@@ -7614,31 +8507,11 @@ function CashFlowPanel({
         </div>
         <div className="mt-4 rounded-2xl bg-[#f7f5ef] p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-[9px] font-black uppercase tracking-[.13em] text-[#7a837e]">
+            <p className="text-[0.5625rem] font-black uppercase tracking-[.13em] text-[#7a837e]">
               {copy.period} · {localizedCashFlowDateRange(fromDate, toDate, language)}
             </p>
-            <div className="flex flex-wrap gap-1.5">
-              {(
-                [
-                  ["today", copy.today],
-                  ["7d", copy.seven],
-                  ["30d", copy.thirty],
-                  ["month", copy.month],
-                  ["all", copy.all],
-                ] as ["today" | "7d" | "30d" | "month" | "all", string][]
-              ).map(([key, label]) => (
-                <button
-                  type="button"
-                  key={key}
-                  onClick={() => preset(key)}
-                  className="min-h-9 rounded-lg border border-[#d9d5ca] bg-white px-2.5 text-[9px] font-black text-[#53615b]"
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
           </div>
-          <div className="mt-3 grid grid-cols-2 gap-2">
+          <div className="report-date-grid mt-3">
             <label>
               <span className="field-caption mb-1 block">{copy.from}</span>
               <input
@@ -7661,54 +8534,45 @@ function CashFlowPanel({
         </div>
       </div>
       <div className="p-4 md:p-5">
-        <div className="grid gap-3 sm:grid-cols-3">
-          <div className="rounded-2xl bg-[#e8f3e9] p-4">
-            <span className="text-[9px] font-black uppercase tracking-wide text-[#4d6a5d]">
-              {t(language, "moneyIn")}
-            </span>
-            <strong className="mt-2 block text-2xl text-[#267055]">
-              +{formatMoney(report.moneyIn)}
-            </strong>
-            <p className="mt-1 text-[9px] font-semibold text-[#66736d]">
-              {copy.actualReceipts}
-            </p>
-          </div>
-          <div className="rounded-2xl bg-[#fff0e4] p-4">
-            <span className="text-[9px] font-black uppercase tracking-wide text-[#8a654e]">
-              {t(language, "moneyOut")}
-            </span>
-            <strong className="mt-2 block text-2xl text-[#b75b2b]">
-              −{formatMoney(report.moneyOut)}
-            </strong>
-            <p className="mt-1 text-[9px] font-semibold text-[#806b5e]">
-              {copy.actualPayments}
-            </p>
-          </div>
-          <div
-            className={`rounded-2xl p-4 ${report.netCashFlow >= 0 ? "bg-[#014921] text-white" : "bg-[#8f3e28] text-white"}`}
-          >
-            <span className="text-[9px] font-black uppercase tracking-wide opacity-75">
-              {t(language, "netCashFlow")}
-            </span>
-            <strong className="mt-2 block text-2xl">
-              {formatMoney(report.netCashFlow)}
-            </strong>
-            <p className="mt-1 text-[9px] font-semibold opacity-75">
-              {copy.netHelper}
-            </p>
-          </div>
+        <div
+          className="report-flow-comparison"
+          role="img"
+          aria-label={`${copy.actualReceipts}: ${formatMoney(report.moneyIn)}. ${copy.actualPayments}: ${formatMoney(report.moneyOut)}.`}
+        >
+          {([
+            ["in", copy.actualReceipts, report.moneyIn],
+            ["out", copy.actualPayments, report.moneyOut],
+          ] as const).map(([direction, label, amount]) => {
+            const largest = Math.max(report.moneyIn, report.moneyOut, 1);
+            return (
+              <div key={direction} className="report-flow-comparison__row">
+                <div>
+                  <span>{direction === "in" ? "+" : "−"} {label}</span>
+                  <strong className={direction === "in" ? "report-money-in" : "report-money-out"}>
+                    {formatMoney(amount)}
+                  </strong>
+                </div>
+                <div className="report-flow-comparison__track" aria-hidden="true">
+                  <span
+                    data-direction={direction}
+                    style={{ width: `${(amount / largest) * 100}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })}
         </div>
         <div className="mt-4 rounded-2xl border border-[#ddd9cf] bg-[#fbfaf6] p-4">
           <div className="flex items-center justify-between">
             <div>
               <h4 className="text-xs font-black">{copy.calculation}</h4>
-              <p className="mt-1 text-[9px] text-[#78817d]">{copy.separated}</p>
+              <p className="mt-1 text-[0.5625rem] text-[#78817d]">{copy.separated}</p>
             </div>
             <span className="dashboard-chip">
               {localizedCashFlowDateRange(fromDate, toDate, language)}
             </span>
           </div>
-          <div className="mt-4 grid gap-x-8 gap-y-2 text-[10px] sm:grid-cols-2">
+          <div className="mt-4 grid gap-x-8 gap-y-2 text-[0.625rem] sm:grid-cols-2">
             <div className="flex justify-between gap-3">
               <span>{copy.salesBilled}</span>
               <strong>{formatMoney(report.salesBilled)}</strong>
@@ -7717,31 +8581,31 @@ function CashFlowPanel({
               <span>{copy.supplierBills}</span>
               <strong>{formatMoney(report.supplierBillsRecorded)}</strong>
             </div>
-            <div className="flex justify-between gap-3 text-[#267055]">
+            <div className="report-calculation-row report-money-in">
               <span>{copy.receivedBills}</span>
               <strong>+{formatMoney(report.receivedWithBills)}</strong>
             </div>
-            <div className="flex justify-between gap-3 text-[#b75b2b]">
+            <div className="report-calculation-row report-money-out">
               <span>{copy.paidPurchases}</span>
               <strong>−{formatMoney(report.paidWithPurchases)}</strong>
             </div>
-            <div className="flex justify-between gap-3 text-[#267055]">
+            <div className="report-calculation-row report-money-in">
               <span>{copy.customerPayments}</span>
               <strong>+{formatMoney(report.customerPayments)}</strong>
             </div>
-            <div className="flex justify-between gap-3 text-[#b75b2b]">
+            <div className="report-calculation-row report-money-out">
               <span>{copy.supplierPaid}</span>
               <strong>−{formatMoney(report.supplierPayments)}</strong>
             </div>
-            <div className="flex justify-between gap-3">
+            <div className="report-calculation-row report-money-due">
               <span>{copy.customerDue}</span>
               <strong>{formatMoney(report.customerOutstanding)}</strong>
             </div>
-            <div className="flex justify-between gap-3">
+            <div className="report-calculation-row report-money-out">
               <span>{copy.supplierDue}</span>
               <strong>{formatMoney(report.supplierOutstanding)}</strong>
             </div>
-            <div className="flex justify-between gap-3 text-[#b75b2b] sm:col-span-2">
+            <div className="report-calculation-row report-money-out sm:col-span-2">
               <span>{copy.misc}</span>
               <strong>−{formatMoney(report.miscellaneousExpenses)}</strong>
             </div>
@@ -7751,7 +8615,7 @@ function CashFlowPanel({
               {report.expenseBreakdown.map((row) => (
                 <span
                   key={row.category}
-                  className="rounded-lg bg-white px-2.5 py-2 text-[9px] font-black text-[#705f54]"
+                  className="report-expense-chip"
                 >
                   {expenseCategoryCopy[language][row.category]} ·{" "}
                   {formatMoney(row.amount)}
@@ -7764,7 +8628,7 @@ function CashFlowPanel({
           <div className="flex items-end justify-between gap-3 border-b border-[#e7e3da] bg-white p-4">
             <div>
               <h4 className="text-xs font-black">{copy.movements}</h4>
-              <p className="mt-1 text-[9px] text-[#78817d]">
+              <p className="mt-1 text-[0.5625rem] text-[#78817d]">
                 {copy.movementHelper}
               </p>
             </div>
@@ -7791,7 +8655,7 @@ function CashFlowPanel({
                     <td>{fullInvoiceDate(movement.date, language)}</td>
                     <td>
                       <span
-                        className={`rounded-full px-2 py-1 text-[8px] font-black uppercase ${movement.direction === "in" ? "bg-[#e7f3ec] text-[#267055]" : "bg-[#fff0e4] text-[#b75b2b]"}`}
+                        className={`report-movement-direction report-movement-direction--${movement.direction}`}
                       >
                         {movement.direction === "in"
                           ? t(language, "moneyIn")
@@ -7800,16 +8664,16 @@ function CashFlowPanel({
                     </td>
                     <td>{movementType(movement.source)}</td>
                     <td>
-                      <strong className="block text-[10px]">
+                      <strong className="block text-[0.625rem]">
                         {display.title}
                       </strong>
-                      <span className="text-[8px] text-[#7d8581]">
+                      <span className="text-[0.5rem] text-[#7d8581]">
                         {display.details}
                       </span>
                     </td>
                     <td>{localizedPaymentModeName(movement.mode, language)}</td>
                     <td
-                      className={`text-right font-black ${movement.direction === "in" ? "text-[#267055]" : "text-[#b75b2b]"}`}
+                      className={`text-right font-black ${movement.direction === "in" ? "report-money-in" : "report-money-out"}`}
                     >
                       {movement.direction === "in" ? "+" : "−"}
                       {formatMoney(movement.amount)}
@@ -7830,7 +8694,7 @@ function CashFlowPanel({
             </table>
           </div>
           {report.movements.length > visibleMovements.length && (
-            <p className="border-t border-[#e7e3da] bg-[#f8f6f1] p-3 text-center text-[9px] font-semibold text-[#707a75]">
+            <p className="border-t border-[#e7e3da] bg-[#f8f6f1] p-3 text-center text-[0.5625rem] font-semibold text-[#707a75]">
               {language === "hi"
                 ? `नई 100 एंट्री दिखाई गई हैं। PDF और टेक्स्ट एक्सपोर्ट में सभी ${report.movements.length} एंट्री हैं।`
                 : language === "bn"
@@ -7847,47 +8711,68 @@ function CashFlowPanel({
 const reportsDashboardCopy = {
   en: {
     periods: { "7d": "7 days", "30d": "30 days", "90d": "90 days", all: "All time" },
-    breadcrumb: "Business dashboard", title: "Business dashboard", helper: "Gross sales before returns, credit and product performance on this device.", newBill: "New bill",
+    periodControl: "Report period",
+    breadcrumb: "Business dashboard", title: "Business dashboard", helper: "See actual money in, money out, sales collection and current dues in one place.", newBill: "New bill",
+    financialSnapshot: "Financial snapshot", financialSnapshotHelper: (period: string) => `Actual recorded receipts and payments · ${period}`,
+    moneyReceived: "Money in", moneyReceivedNote: "Actually received in this period", moneySpent: "Money out", moneySpentNote: "Actually paid or spent in this period",
+    netMovement: "Net cash flow", netPositive: "More came in than went out", netNegative: "More went out than came in", netNotProfit: "Cash movement · not profit",
+    dueToCollect: "Customer due", dueCurrentNote: "Current balance · all dates", supplierPayableNote: (amount: string) => `Supplier payables ${amount}`,
     grossSales: "Gross sales", grossSalesNote: (count: number, period: string) => `${count} bills · before returns · ${period}`,
     grossToday: "Gross today", grossTodayNote: "Bills recorded today · before returns", outstanding: "Outstanding", outstandingNote: "Total customer credit",
     estimatedProfit: "Est. gross profit", bills: "Bills", costMissing: "Cost missing", missingCostNote: "Add purchase costs for every sold item", ownerProfitNote: "Owner-only · before expenses", recordedIn: (period: string) => `Recorded in ${period}`,
     counterControl: "Counter control", closingOwnerOnly: "Daily closing is owner-only", closingHelper: "Unlock Owner Mode to count the drawer or replace a saved closing record.", unlockClosing: "Unlock daily closing",
-    settlement: "Sales settlement", settlementHelper: (period: string) => `Initial receipts, later payments and balance due · ${period}`, billCount: (count: number) => `${count} bills`, totalSales: "Total sales", noSales: "No sales in this period yet.",
+    settlement: "Sales collection status", settlementHelper: (period: string) => `How sales billed in ${period} stand today`, billCount: (count: number) => `${count} bills`, totalSales: "Total sales", noSales: "No sales in this period yet.",
+    collected: "Collected", stillDue: "Still due", collectionRate: "collected", paymentBreakdown: "Collected by payment method", shareOfSales: "of sales", noCollections: "No collections recorded yet.",
+    settlementChartLabel: (total: string, collected: string, due: string, percent: number) => `Sales collection status. ${percent}% collected. Total sales ${total}, collected ${collected}, still due ${due}.`,
     recentInvoices: "Recent invoices", recentHelper: "Open a bill to see that customer's full history", live: "Live", recentTable: "Recent invoices table",
     invoice: "Invoice", party: "Party", date: "Date", mode: "Mode", total: "Total", due: "Due", openInvoice: (number: string, party: string) => `Open invoice ${number} for ${party}`, noSavedBills: "Your saved bills will appear here.",
     noAddress: "No address", noPhone: "No phone", noCustomerAccount: "No customer account", walkInSale: "Walk-in sale", noCustomer: "No matching customer.",
-    trend: "Gross sales trend", trendHelper: (period: string) => `Seven equal intervals · ${period}`, trendLabel: "Gross sales before returns trend chart",
-    outstandingByParty: "Outstanding by party", outstandingHelper: "Open a customer to see every bill", topFive: "Top 5", noOutstanding: "No outstanding balances.",
+    trend: "Gross sales trend", trendHelper: (period: string) => `Up to seven equal intervals · ${period}`, trendLabel: "Gross sales before returns trend chart",
+    outstandingByParty: "Outstanding by party", outstandingHelper: "Current all-date balances · open a customer to see every bill", topFive: "Top 5", noOutstanding: "No outstanding balances.",
     topProducts: "Top products", byRevenue: "By billed revenue", byActivity: "By recorded catalogue activity", sales: (count: number) => `${count} sales`, other: "Other",
   },
   hi: {
     periods: { "7d": "7 दिन", "30d": "30 दिन", "90d": "90 दिन", all: "अब तक" },
-    breadcrumb: "बिज़नेस डैशबोर्ड", title: "बिज़नेस डैशबोर्ड", helper: "इस डिवाइस पर रिटर्न से पहले की कुल बिक्री, उधार और प्रोडक्ट की बिक्री।", newBill: "नया बिल",
+    periodControl: "रिपोर्ट की अवधि",
+    breadcrumb: "बिज़नेस डैशबोर्ड", title: "बिज़नेस डैशबोर्ड", helper: "आया पैसा, गया पैसा, बिक्री की वसूली और अभी का बाकी एक जगह देखें।", newBill: "नया बिल",
+    financialSnapshot: "पैसे का सार", financialSnapshotHelper: (period: string) => `वास्तव में मिला और दिया गया पैसा · ${period}`,
+    moneyReceived: "पैसा आया", moneyReceivedNote: "इस अवधि में वास्तव में मिला", moneySpent: "पैसा गया", moneySpentNote: "इस अवधि में वास्तव में दिया या खर्च किया",
+    netMovement: "शुद्ध कैश फ्लो", netPositive: "गए पैसे से ज्यादा पैसा आया", netNegative: "आए पैसे से ज्यादा पैसा गया", netNotProfit: "कैश की चाल · मुनाफ़ा नहीं",
+    dueToCollect: "कस्टमर से लेना है", dueCurrentNote: "अभी का बैलेंस · सभी तारीखें", supplierPayableNote: (amount: string) => `सप्लायर को देना है ${amount}`,
     grossSales: "कुल बिक्री", grossSalesNote: (count: number, period: string) => `${count} बिल · रिटर्न से पहले · ${period}`,
     grossToday: "आज की कुल बिक्री", grossTodayNote: "आज सेव बिल · रिटर्न से पहले", outstanding: "कुल बाकी", outstandingNote: "कस्टमर का कुल उधार",
     estimatedProfit: "अनुमानित ग्रॉस मुनाफ़ा", bills: "बिल", costMissing: "खरीद रेट नहीं है", missingCostNote: "बेचे गए हर सामान का खरीद रेट जोड़ें", ownerProfitNote: "सिर्फ मालिक · खर्च से पहले", recordedIn: (period: string) => `${period} में दर्ज`,
     counterControl: "काउंटर कंट्रोल", closingOwnerOnly: "डेली क्लोज़िंग सिर्फ मालिक के लिए है", closingHelper: "दराज़ का कैश गिनने या सेव क्लोज़िंग बदलने के लिए Owner Mode खोलें।", unlockClosing: "डेली क्लोज़िंग खोलें",
-    settlement: "बिक्री का पेमेंट", settlementHelper: (period: string) => `शुरू में मिला, बाद का पेमेंट और बाकी · ${period}`, billCount: (count: number) => `${count} बिल`, totalSales: "कुल बिक्री", noSales: "इस समय में कोई बिक्री नहीं है।",
+    settlement: "बिक्री की वसूली", settlementHelper: (period: string) => `${period} में बने बिलों में आज कितना मिला और बाकी है`, billCount: (count: number) => `${count} बिल`, totalSales: "कुल बिक्री", noSales: "इस समय में कोई बिक्री नहीं है।",
+    collected: "मिल चुका", stillDue: "अभी बाकी", collectionRate: "वसूला", paymentBreakdown: "पेमेंट के तरीके से मिली रकम", shareOfSales: "बिक्री का", noCollections: "अभी कोई रकम दर्ज नहीं है।",
+    settlementChartLabel: (total: string, collected: string, due: string, percent: number) => `बिक्री की वसूली। ${percent}% मिला। कुल बिक्री ${total}, मिला ${collected}, बाकी ${due}।`,
     recentInvoices: "हाल के बिल", recentHelper: "पूरा कस्टमर हिस्ट्री देखने के लिए बिल खोलें", live: "लाइव", recentTable: "हाल के बिलों की टेबल",
     invoice: "बिल", party: "पार्टी", date: "तारीख", mode: "तरीका", total: "कुल", due: "बाकी", openInvoice: (number: string, party: string) => `${party} का बिल ${number} खोलें`, noSavedBills: "सेव किए बिल यहाँ दिखेंगे।",
     noAddress: "पता नहीं है", noPhone: "फोन नहीं है", noCustomerAccount: "कस्टमर खाता नहीं", walkInSale: "काउंटर बिक्री", noCustomer: "कोई मिलता कस्टमर नहीं मिला।",
-    trend: "कुल बिक्री का ट्रेंड", trendHelper: (period: string) => `7 बराबर हिस्से · ${period}`, trendLabel: "रिटर्न से पहले की कुल बिक्री का ट्रेंड चार्ट",
-    outstandingByParty: "पार्टी के हिसाब से बाकी", outstandingHelper: "सभी बिल देखने के लिए कस्टमर खोलें", topFive: "टॉप 5", noOutstanding: "कोई बाकी बैलेंस नहीं है।",
+    trend: "कुल बिक्री का ट्रेंड", trendHelper: (period: string) => `अधिकतम 7 बराबर हिस्से · ${period}`, trendLabel: "रिटर्न से पहले की कुल बिक्री का ट्रेंड चार्ट",
+    outstandingByParty: "पार्टी के हिसाब से बाकी", outstandingHelper: "आज का सभी तारीखों का बैलेंस · सभी बिल देखने के लिए कस्टमर खोलें", topFive: "टॉप 5", noOutstanding: "कोई बाकी बैलेंस नहीं है।",
     topProducts: "सबसे ज्यादा बिके सामान", byRevenue: "बिल की बिक्री के हिसाब से", byActivity: "कैटलॉग में दर्ज बिक्री के हिसाब से", sales: (count: number) => `${count} बिक्री`, other: "बाकी",
   },
   bn: {
     periods: { "7d": "7 দিন", "30d": "30 দিন", "90d": "90 দিন", all: "এখনও পর্যন্ত" },
-    breadcrumb: "বিজনেস ড্যাশবোর্ড", title: "বিজনেস ড্যাশবোর্ড", helper: "এই ডিভাইসে রিটার্নের আগের মোট বিক্রি, বাকি ও পণ্যের বিক্রি।", newBill: "নতুন বিল",
+    periodControl: "রিপোর্টের সময়কাল",
+    breadcrumb: "বিজনেস ড্যাশবোর্ড", title: "বিজনেস ড্যাশবোর্ড", helper: "আসা টাকা, যাওয়া টাকা, বিক্রির আদায় ও এখনকার বাকি এক জায়গায় দেখুন।", newBill: "নতুন বিল",
+    financialSnapshot: "টাকার সারাংশ", financialSnapshotHelper: (period: string) => `সত্যি পাওয়া ও দেওয়া টাকা · ${period}`,
+    moneyReceived: "টাকা এসেছে", moneyReceivedNote: "এই সময়ে সত্যি পাওয়া", moneySpent: "টাকা গেছে", moneySpentNote: "এই সময়ে সত্যি দেওয়া বা খরচ করা",
+    netMovement: "নিট ক্যাশ ফ্লো", netPositive: "যাওয়া টাকার চেয়ে বেশি এসেছে", netNegative: "আসা টাকার চেয়ে বেশি গেছে", netNotProfit: "ক্যাশের চলাচল · লাভ নয়",
+    dueToCollect: "কাস্টমারের কাছ থেকে পাওনা", dueCurrentNote: "এখনকার ব্যালেন্স · সব তারিখ", supplierPayableNote: (amount: string) => `সাপ্লায়ারকে দিতে হবে ${amount}`,
     grossSales: "মোট বিক্রি", grossSalesNote: (count: number, period: string) => `${count}টি বিল · রিটার্নের আগে · ${period}`,
     grossToday: "আজকের মোট বিক্রি", grossTodayNote: "আজ সেভ করা বিল · রিটার্নের আগে", outstanding: "মোট বাকি", outstandingNote: "কাস্টমারের মোট বাকি",
     estimatedProfit: "আনুমানিক গ্রস লাভ", bills: "বিল", costMissing: "কেনা দাম নেই", missingCostNote: "বিক্রি হওয়া প্রতিটি পণ্যের কেনা দাম যোগ করুন", ownerProfitNote: "শুধু মালিক · খরচের আগে", recordedIn: (period: string) => `${period}-এ লেখা`,
     counterControl: "কাউন্টার কন্ট্রোল", closingOwnerOnly: "ডেইলি ক্লোজিং শুধু মালিকের জন্য", closingHelper: "ড্রয়ারের ক্যাশ গুনতে বা সেভ করা ক্লোজিং বদলাতে Owner Mode খুলুন।", unlockClosing: "ডেইলি ক্লোজিং খুলুন",
-    settlement: "বিক্রির পেমেন্ট", settlementHelper: (period: string) => `শুরুতে পাওয়া, পরের পেমেন্ট ও বাকি · ${period}`, billCount: (count: number) => `${count}টি বিল`, totalSales: "মোট বিক্রি", noSales: "এই সময়ে কোনো বিক্রি নেই।",
+    settlement: "বিক্রির টাকা আদায়", settlementHelper: (period: string) => `${period}-এ করা বিলের কতটা আজ পাওয়া ও বাকি`, billCount: (count: number) => `${count}টি বিল`, totalSales: "মোট বিক্রি", noSales: "এই সময়ে কোনো বিক্রি নেই।",
+    collected: "পাওয়া হয়েছে", stillDue: "এখনও বাকি", collectionRate: "পাওয়া", paymentBreakdown: "পেমেন্ট মাধ্যম অনুযায়ী পাওয়া", shareOfSales: "বিক্রির", noCollections: "এখনও কোনো টাকা পাওয়া লেখা নেই।",
+    settlementChartLabel: (total: string, collected: string, due: string, percent: number) => `বিক্রির টাকা আদায়। ${percent}% পাওয়া। মোট বিক্রি ${total}, পাওয়া ${collected}, বাকি ${due}।`,
     recentInvoices: "সাম্প্রতিক বিল", recentHelper: "কাস্টমারের পুরো হিস্ট্রি দেখতে বিল খুলুন", live: "লাইভ", recentTable: "সাম্প্রতিক বিলের টেবিল",
     invoice: "বিল", party: "পার্টি", date: "তারিখ", mode: "মাধ্যম", total: "মোট", due: "বাকি", openInvoice: (number: string, party: string) => `${party}-এর বিল ${number} খুলুন`, noSavedBills: "সেভ করা বিল এখানে দেখা যাবে।",
     noAddress: "ঠিকানা নেই", noPhone: "ফোন নেই", noCustomerAccount: "কাস্টমার খাতা নেই", walkInSale: "কাউন্টার বিক্রি", noCustomer: "মিলছে এমন কাস্টমার পাওয়া যায়নি।",
-    trend: "মোট বিক্রির ট্রেন্ড", trendHelper: (period: string) => `7টি সমান ভাগ · ${period}`, trendLabel: "রিটার্নের আগের মোট বিক্রির ট্রেন্ড চার্ট",
-    outstandingByParty: "পার্টি অনুযায়ী বাকি", outstandingHelper: "সব বিল দেখতে কাস্টমার খুলুন", topFive: "টপ 5", noOutstanding: "কোনো বাকি ব্যালেন্স নেই।",
+    trend: "মোট বিক্রির ট্রেন্ড", trendHelper: (period: string) => `সর্বোচ্চ 7টি সমান ভাগ · ${period}`, trendLabel: "রিটার্নের আগের মোট বিক্রির ট্রেন্ড চার্ট",
+    outstandingByParty: "পার্টি অনুযায়ী বাকি", outstandingHelper: "আজকের সব তারিখের ব্যালেন্স · সব বিল দেখতে কাস্টমার খুলুন", topFive: "টপ 5", noOutstanding: "কোনো বাকি ব্যালেন্স নেই।",
     topProducts: "সবচেয়ে বেশি বিক্রি হওয়া পণ্য", byRevenue: "বিলের বিক্রি অনুযায়ী", byActivity: "ক্যাটালগে লেখা বিক্রি অনুযায়ী", sales: (count: number) => `${count}টি বিক্রি`, other: "অন্যান্য",
   },
 } satisfies Record<Language, object>;
@@ -7907,7 +8792,10 @@ function ReportsDashboard({
   onToast,
   onConverted,
   ownerMode,
+  cloudConfigured,
   onOwnerUnlock,
+  onMasterRestoringChange,
+  initialAdvancedReport,
 }: {
   invoices: Invoice[];
   payments: Payment[];
@@ -7923,60 +8811,67 @@ function ReportsDashboard({
   onToast: (message: string) => void;
   onConverted: (invoice: Invoice) => void;
   ownerMode: boolean;
+  cloudConfigured: boolean;
   onOwnerUnlock: () => void;
+  onMasterRestoringChange: (restoring: boolean) => void;
+  initialAdvancedReport?: ReportKey;
 }) {
   const copy = reportsDashboardCopy[language];
-  const [period, setPeriod] = useState<DashboardPeriod>("30d");
+  const initialRange = dashboardPeriodRange("30d", localDate());
+  const [period, setPeriod] = useState<DashboardPeriod | "custom">("30d");
+  const [reportFromDate, setReportFromDate] = useState(initialRange.fromDate);
+  const [reportToDate, setReportToDate] = useState(initialRange.toDate);
   const [customerQuery, setCustomerQuery] = useState("");
   const [selectedCustomerId, setSelectedCustomerId] = useState<string | null>(
     null,
   );
   const [selectedHistoryInvoice, setSelectedHistoryInvoice] =
     useState<Invoice | null>(null);
+  const choosePeriod = (next: DashboardPeriod) => {
+    const range = dashboardPeriodRange(next, localDate());
+    setPeriod(next);
+    setReportFromDate(range.fromDate);
+    setReportToDate(range.toDate);
+  };
+  const changeReportRange = (fromDate: string, toDate: string) => {
+    const matched = (["7d", "30d", "90d", "all"] as DashboardPeriod[]).find(
+      (candidate) => {
+        const range = dashboardPeriodRange(candidate, localDate());
+        return range.fromDate === fromDate && range.toDate === toDate;
+      },
+    );
+    setPeriod(matched || "custom");
+    setReportFromDate(fromDate);
+    setReportToDate(toDate);
+  };
   const data = useMemo(() => {
     const allSales = invoices.filter(
       (invoice) => !invoice.deletedAt && invoice.type === "sale",
     );
-    const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const endExclusive = new Date(
-      today.getFullYear(),
-      today.getMonth(),
-      today.getDate() + 1,
-    ).getTime();
-    const periodDays =
-      period === "7d"
-        ? 7
-        : period === "30d"
-          ? 30
-          : period === "90d"
-            ? 90
-            : null;
-    const startDate = periodDays
-      ? new Date(
-          today.getFullYear(),
-          today.getMonth(),
-          today.getDate() - periodDays + 1,
-        )
-      : undefined;
-    const start = startDate?.getTime() || 0;
+    const todayDate = localDate();
     const sales = allSales.filter(
-      (invoice) => {
-        const time = new Date(`${invoice.date}T00:00:00`).getTime();
-        return (!start || time >= start) && time < endExclusive;
-      },
+      (invoice) =>
+        inDateRange(
+          invoice.date,
+          reportFromDate,
+          reportToDate,
+        ),
     );
+    const settlement = buildSalesSettlementReport(sales, payments, todayDate);
+    const cashFlow = buildCashFlowReport({
+      invoices,
+      payments,
+      parties,
+      accountEntries,
+      expenses,
+      fromDate: reportFromDate,
+      toDate: reportToDate,
+    });
     const itemMap = new Map(items.map((item) => [item.id, item]));
-    const salesTotal = sales.reduce(
-      (sum, invoice) => sum + invoice.grandTotal,
-      0,
-    );
+    const salesTotal = settlement.totalSales;
     const todayTotal = allSales
-      .filter((invoice) => invoice.date === localDate())
+      .filter((invoice) => invoice.date === todayDate)
       .reduce((sum, invoice) => sum + invoice.grandTotal, 0);
-    const outstanding = parties
-      .filter((party) => party.type === "customer")
-      .reduce((sum, party) => sum + Math.max(0, party.currentBalance), 0);
     let profit = 0;
     let profitComplete = true;
     for (const invoice of sales)
@@ -7994,80 +8889,11 @@ function ReportsDashboard({
           profitComplete = false;
       }
 
-    const allocationsByInvoice = new Map<
-      string,
-      Array<{
-        amount: number;
-        mode: PaymentChannel;
-        partyId: string;
-        timestamp: string;
-        paymentId: string;
-      }>
-    >();
-    for (const payment of payments)
-      for (const allocation of payment.allocatedTo || []) {
-        if (!Number.isFinite(allocation.amount) || allocation.amount <= 0)
-          continue;
-        const allocations = allocationsByInvoice.get(allocation.invoiceId) || [];
-        allocations.push({
-          amount: allocation.amount,
-          mode: payment.mode,
-          partyId: payment.partyId,
-          timestamp: payment.createdAt,
-          paymentId: payment.id,
-        });
-        allocationsByInvoice.set(allocation.invoiceId, allocations);
-      }
-    const modeMap = new Map<string, number>();
-    const addSettlement = (mode: string, amount: number) => {
-      if (amount <= 0) return;
-      modeMap.set(mode, roundMoney((modeMap.get(mode) || 0) + amount));
-    };
-    for (const invoice of sales) {
-      const laterPayments = (allocationsByInvoice.get(invoice.id) || [])
-        .filter(
-          (allocation) =>
-            !invoice.partyId || allocation.partyId === invoice.partyId,
-        )
-        .sort(
-          (a, b) =>
-            a.timestamp.localeCompare(b.timestamp) ||
-            a.paymentId.localeCompare(b.paymentId),
-        );
-      const laterAllocated = roundMoney(
-        laterPayments.reduce((sum, payment) => sum + payment.amount, 0),
-      );
-      const initialBreakdown = invoiceInitialPaymentBreakdown(
-        invoice,
-        laterAllocated,
-      );
-      const initialPaid = roundMoney(
-        initialBreakdown.reduce((sum, entry) => sum + entry.amount, 0),
-      );
-      initialBreakdown.forEach((entry) => addSettlement(entry.mode, entry.amount));
-      let unsettled = roundMoney(invoice.grandTotal - initialPaid);
-      for (const payment of laterPayments) {
-        const applied = Math.min(unsettled, roundMoney(payment.amount));
-        addSettlement(payment.mode, applied);
-        unsettled = roundMoney(unsettled - applied);
-        if (unsettled <= 0) break;
-      }
-      addSettlement("credit", unsettled);
-    }
-    const modeRows = ["cash", "upi", "bank", "cheque", "credit"]
-      .map((mode) => ({
-        name: mode,
-        value: modeMap.get(mode) || 0,
-        color: dashboardModeColors[mode],
-      }))
-      .filter((row) => row.value > 0);
-    let cursor = 0;
-    const donutStops = modeRows.map((row) => {
-      const from = salesTotal ? (cursor / salesTotal) * 100 : 0;
-      cursor += row.value;
-      const to = salesTotal ? (cursor / salesTotal) * 100 : 0;
-      return `${row.color} ${from}% ${to}%`;
-    });
+    const modeRows = settlement.modes.map((row) => ({
+      name: row.mode,
+      value: row.amount,
+      color: dashboardModeColors[row.mode],
+    }));
 
     const productMap = new Map<string, { name: string; value: number }>();
     const categoryMap = new Map<string, number>();
@@ -8123,72 +8949,35 @@ function ReportsDashboard({
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, 6);
 
-    const bucketCount = 7;
-    const calendarDayNumber = (date: Date) =>
-      Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86400000;
-    const todayDayNumber = calendarDayNumber(today);
-    const earliestDayNumber = Math.min(
-      ...sales.map((invoice) =>
-        calendarDayNumber(new Date(`${invoice.date}T00:00:00`)),
-      ),
-      todayDayNumber,
+    const trendRows = buildDashboardTrendBuckets(
+      sales,
+      reportFromDate,
+      reportToDate,
+      todayDate,
     );
-    const trendDays =
-      periodDays || Math.max(30, todayDayNumber - earliestDayNumber + 1);
-    const trendStart = new Date(
-      today.getFullYear(),
-      today.getMonth(),
-      today.getDate() - trendDays + 1,
-    );
-    const buckets = Array.from({ length: bucketCount }, (_, index) => {
-      const startOffset = Math.floor((index * trendDays) / bucketCount);
-      const endOffset = Math.floor(((index + 1) * trendDays) / bucketCount);
-      const bucketStart = new Date(
-        trendStart.getFullYear(),
-        trendStart.getMonth(),
-        trendStart.getDate() + startOffset,
-      );
-      const bucketEnd = new Date(
-        trendStart.getFullYear(),
-        trendStart.getMonth(),
-        trendStart.getDate() + endOffset,
-      );
-      const labelDate = new Date(
-        bucketEnd.getFullYear(),
-        bucketEnd.getMonth(),
-        bucketEnd.getDate() - 1,
-      );
-      const value = sales
-        .filter((invoice) => {
-          const time = new Date(`${invoice.date}T00:00:00`).getTime();
-          return time >= bucketStart.getTime() && time < bucketEnd.getTime();
-        })
-        .reduce((sum, invoice) => sum + invoice.grandTotal, 0);
-      return {
-        label: formatLocalizedDate(labelDate, language, {
+    const bucketCount = trendRows.length;
+    const buckets = trendRows.map((bucket) => ({
+      label: formatLocalizedDate(bucket.labelDate, language, {
           day: "numeric",
           month: "short",
         }),
-        value,
-      };
-    });
+      value: bucket.value,
+    }));
     const maxTrend = Math.max(...buckets.map((bucket) => bucket.value), 1);
     const points = buckets
       .map(
         (bucket, index) =>
-          `${(index * 100) / (bucketCount - 1)},${88 - (bucket.value / maxTrend) * 68}`,
+          `${bucketCount === 1 ? 50 : (index * 100) / (bucketCount - 1)},${88 - (bucket.value / maxTrend) * 68}`,
       )
       .join(" ");
     return {
       sales,
       salesTotal,
       todayTotal,
-      outstanding,
       profit: profitComplete ? profit : null,
+      cashFlow,
+      settlement,
       modeRows,
-      donutBackground: donutStops.length
-        ? `conic-gradient(${donutStops.join(",")})`
-        : "conic-gradient(#e8e6df 0 100%)",
       topProducts,
       hasProductSales,
       categories,
@@ -8199,7 +8988,17 @@ function ReportsDashboard({
       maxTrend,
       points,
     };
-  }, [invoices, payments, parties, items, language, period]);
+  }, [
+    invoices,
+    payments,
+    accountEntries,
+    expenses,
+    parties,
+    items,
+    language,
+    reportFromDate,
+    reportToDate,
+  ]);
   const customerRows = useMemo(() => {
     const rows: {
       id: string;
@@ -8299,17 +9098,40 @@ function ReportsDashboard({
     ...data.topProducts.map((row) => row.value),
     1,
   );
-  const periodLabel = copy.periods[period];
+  const periodLabel =
+    period === "custom"
+      ? localizedCashFlowDateRange(
+          reportFromDate,
+          reportToDate,
+          language,
+        )
+      : copy.periods[period];
+  const collectionPercent = Math.round(data.settlement.collectionPercent);
+  const duePercent = data.settlement.totalSales
+    ? Math.max(0, 100 - data.settlement.collectionPercent)
+    : 0;
+  const displayedDuePercent = data.settlement.totalSales
+    ? 100 - collectionPercent
+    : 0;
+  const settlementChartLabel = copy.settlementChartLabel(
+    formatMoney(data.settlement.totalSales),
+    formatMoney(data.settlement.collected),
+    formatMoney(data.settlement.due),
+    collectionPercent,
+  );
+  const trendChartLabel = `${copy.trendLabel}. ${data.buckets
+    .map((bucket) => `${bucket.label}: ${formatMoney(bucket.value)}`)
+    .join("; ")}`;
   return (
     <section className="mx-auto max-w-[1380px] px-3 py-4 md:px-5 md:py-5">
       <div className="reports-dashboard-header mb-4">
         <div className="reports-dashboard-copy min-w-0">
-          <p className="flex items-center gap-2 text-[10px] font-bold text-[#8b918d]">
+          <p className="flex items-center gap-2 text-[0.625rem] font-bold text-[#8b918d]">
             <span>{t(language, "reports")}</span>
             <span>›</span>
             <span className="text-[#3b4944]">{copy.breadcrumb}</span>
           </p>
-          <h2 className="mt-1 text-2xl font-black tracking-tight md:text-[28px]">
+          <h2 className="mt-1 text-2xl font-black tracking-tight md:text-[1.75rem]">
             {copy.title}
           </h2>
           <p className="mt-1 text-xs text-[#7a837f]">
@@ -8330,12 +9152,18 @@ function ReportsDashboard({
           />
         </div>
         <div className="reports-dashboard-actions flex flex-wrap items-center gap-2">
-          <div className="flex rounded-xl border border-[#dcd8cf] bg-white p-1">
+          <div
+            className="flex rounded-xl border border-[#dcd8cf] bg-white p-1"
+            role="group"
+            aria-label={copy.periodControl}
+          >
             {(["7d", "30d", "90d", "all"] as DashboardPeriod[]).map((value) => (
               <button
                 key={value}
-                onClick={() => setPeriod(value)}
-                className={`min-h-9 rounded-lg px-3 text-[10px] font-black uppercase ${period === value ? "bg-[#173f35] text-white" : "text-[#737d78]"}`}
+                type="button"
+                aria-pressed={period === value}
+                onClick={() => choosePeriod(value)}
+                className={`min-h-9 rounded-lg px-3 text-[0.625rem] font-black uppercase ${period === value ? "bg-[#173f35] text-white" : "text-[#737d78]"}`}
               >
                 {copy.periods[value]}
               </button>
@@ -8349,7 +9177,84 @@ function ReportsDashboard({
           </button>
         </div>
       </div>
-      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+      <article
+        className="report-financial-overview dashboard-card"
+        aria-labelledby="report-financial-snapshot-title"
+      >
+        <div className="report-financial-overview__header">
+          <div>
+            <p className="eyebrow">{copy.financialSnapshot}</p>
+            <h3 id="report-financial-snapshot-title" className="dashboard-title mt-1">
+              {copy.financialSnapshot}
+            </h3>
+            <p className="dashboard-subtitle">
+              {copy.financialSnapshotHelper(periodLabel)}
+            </p>
+          </div>
+          <span className="dashboard-chip">{periodLabel}</span>
+        </div>
+        <div className="report-financial-overview__grid">
+          <div className="report-summary-metric" data-tone="in">
+            <span className="report-summary-metric__icon" aria-hidden="true">＋</span>
+            <div>
+              <p>{copy.moneyReceived}</p>
+              <strong className="report-money-in">
+                +{formatMoney(data.cashFlow.moneyIn)}
+              </strong>
+              <small>{copy.moneyReceivedNote}</small>
+            </div>
+          </div>
+          <div className="report-summary-metric" data-tone="out">
+            <span className="report-summary-metric__icon" aria-hidden="true">−</span>
+            <div>
+              <p>{copy.moneySpent}</p>
+              <strong className="report-money-out">
+                −{formatMoney(data.cashFlow.moneyOut)}
+              </strong>
+              <small>{copy.moneySpentNote}</small>
+            </div>
+          </div>
+          <div
+            className="report-summary-metric"
+            data-tone={data.cashFlow.netCashFlow >= 0 ? "in" : "out"}
+          >
+            <span className="report-summary-metric__icon" aria-hidden="true">↕</span>
+            <div>
+              <p>{copy.netMovement}</p>
+              <strong
+                className={
+                  data.cashFlow.netCashFlow >= 0
+                    ? "report-money-in"
+                    : "report-money-out"
+                }
+              >
+                {data.cashFlow.netCashFlow > 0 ? "+" : ""}
+                {formatMoney(data.cashFlow.netCashFlow)}
+              </strong>
+              <small>
+                {data.cashFlow.netCashFlow >= 0
+                  ? copy.netPositive
+                  : copy.netNegative} · {copy.netNotProfit}
+              </small>
+            </div>
+          </div>
+          <div className="report-summary-metric" data-tone="due">
+            <span className="report-summary-metric__icon" aria-hidden="true">◎</span>
+            <div>
+              <p>{copy.dueToCollect}</p>
+              <strong className="report-money-due">
+                {formatMoney(data.cashFlow.customerOutstanding)}
+              </strong>
+              <small>
+                {copy.dueCurrentNote} · {copy.supplierPayableNote(
+                  formatMoney(data.cashFlow.supplierOutstanding),
+                )}
+              </small>
+            </div>
+          </div>
+        </div>
+      </article>
+      <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
         <DashboardMetric
           icon="₹"
           label={copy.grossSales}
@@ -8365,26 +9270,157 @@ function ReportsDashboard({
           tone="green"
         />
         <DashboardMetric
-          icon="◎"
-          label={copy.outstanding}
-          value={formatMoney(data.outstanding)}
-          note={copy.outstandingNote}
-          tone="gold"
-        />
-        <DashboardMetric
           icon={ownerMode ? "◈" : "▤"}
           label={ownerMode ? copy.estimatedProfit : copy.bills}
           value={ownerMode ? data.profit == null ? copy.costMissing : formatMoney(data.profit) : String(data.sales.length)}
           note={ownerMode ? data.profit == null ? copy.missingCostNote : copy.ownerProfitNote : copy.recordedIn(periodLabel)}
           tone="blue"
+          valueTone={
+            ownerMode && data.profit != null
+              ? data.profit >= 0
+                ? "in"
+                : "out"
+              : undefined
+          }
         />
       </div>
       <div className="mt-3 grid gap-3 xl:grid-cols-12">
+        <CashFlowPanel
+          invoices={invoices}
+          payments={payments}
+          parties={parties}
+          accountEntries={accountEntries}
+          expenses={expenses}
+          fromDate={reportFromDate}
+          toDate={reportToDate}
+          onRangeChange={changeReportRange}
+          business={business}
+          language={language}
+          onToast={onToast}
+        />
+        <article className="dashboard-card p-4 xl:col-span-12">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="dashboard-title">{copy.settlement}</h3>
+              <p className="dashboard-subtitle">
+                {copy.settlementHelper(periodLabel)}
+              </p>
+            </div>
+            <span className="dashboard-chip">{copy.billCount(data.sales.length)}</span>
+          </div>
+          <div className="report-settlement-layout mt-5">
+            <figure className="report-settlement-figure">
+              <div className="report-settlement-donut">
+                <svg
+                  viewBox="0 0 120 120"
+                  role="img"
+                  aria-label={settlementChartLabel}
+                >
+                  <title>{settlementChartLabel}</title>
+                  <circle
+                    className="report-settlement-donut__track"
+                    cx="60"
+                    cy="60"
+                    r="48"
+                    pathLength="100"
+                  />
+                  {data.settlement.totalSales > 0 && (
+                    <>
+                      <circle
+                        className="report-settlement-donut__collected"
+                        cx="60"
+                        cy="60"
+                        r="48"
+                        pathLength="100"
+                        strokeDasharray={`${data.settlement.collectionPercent} ${100 - data.settlement.collectionPercent}`}
+                      />
+                      {data.settlement.due > 0 && (
+                        <circle
+                          className="report-settlement-donut__due"
+                          cx="60"
+                          cy="60"
+                          r="48"
+                          pathLength="100"
+                          strokeDasharray={`${duePercent} ${100 - duePercent}`}
+                          strokeDashoffset={-data.settlement.collectionPercent}
+                        />
+                      )}
+                    </>
+                  )}
+                </svg>
+                <div className="report-settlement-donut__center" aria-hidden="true">
+                  <strong>{collectionPercent}%</strong>
+                  <span>{copy.collectionRate}</span>
+                  <small>{formatMoney(data.settlement.totalSales)}</small>
+                </div>
+              </div>
+              <figcaption className="report-settlement-summary">
+                <div>
+                  <span className="report-status-dot report-status-dot--in" aria-hidden="true" />
+                  <p>{copy.collected}</p>
+                  <strong className="report-money-in">
+                    {formatMoney(data.settlement.collected)}
+                  </strong>
+                  <small>{collectionPercent}% {copy.shareOfSales}</small>
+                </div>
+                <div>
+                  <span className="report-status-dot report-status-dot--due" aria-hidden="true" />
+                  <p>{copy.stillDue}</p>
+                  <strong className="report-money-due">
+                    {formatMoney(data.settlement.due)}
+                  </strong>
+                  <small>{displayedDuePercent}% {copy.shareOfSales}</small>
+                </div>
+              </figcaption>
+            </figure>
+            <div className="report-payment-breakdown">
+              <p className="field-caption">{copy.paymentBreakdown}</p>
+              {data.modeRows.length ? (
+                <div className="mt-3 space-y-3">
+                  {data.modeRows.map((row) => {
+                    const share = data.settlement.totalSales
+                      ? (row.value / data.settlement.totalSales) * 100
+                      : 0;
+                    return (
+                      <div key={row.name} className="report-payment-row">
+                        <div>
+                          <span>
+                            <i style={{ background: row.color }} aria-hidden="true" />
+                            {localizedPaymentModeName(row.name, language)}
+                          </span>
+                          <strong className="report-money-in">
+                            {formatMoney(row.value)}
+                          </strong>
+                        </div>
+                        <div className="report-payment-row__track" aria-hidden="true">
+                          <span
+                            style={{
+                              width: `${Math.min(100, share)}%`,
+                              background: row.color,
+                            }}
+                          />
+                        </div>
+                        <small>{share.toFixed(1)}% {copy.shareOfSales}</small>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="report-payment-breakdown__empty">
+                  {data.salesTotal ? copy.noCollections : copy.noSales}
+                </p>
+              )}
+            </div>
+          </div>
+        </article>
         <AdvancedReports
           invoices={invoices}
           parties={parties}
           items={items}
           accountEntries={accountEntries}
+          fromDate={reportFromDate}
+          toDate={reportToDate}
+          onRangeChange={changeReportRange}
           language={language}
           business={business}
           format={format}
@@ -8392,6 +9428,15 @@ function ReportsDashboard({
           onToast={onToast}
           onConverted={onConverted}
           ownerMode={ownerMode}
+          initialReport={initialAdvancedReport}
+        />
+        <MasterBackupPanel
+          language={language}
+          ownerMode={ownerMode}
+          cloudConfigured={cloudConfigured}
+          onOwnerUnlock={onOwnerUnlock}
+          onToast={onToast}
+          onRestoringChange={onMasterRestoringChange}
         />
         {ownerMode ? (
           <DailyClosePanel language={language} invoices={invoices} payments={payments} expenses={expenses} parties={parties} onToast={onToast} />
@@ -8407,70 +9452,7 @@ function ReportsDashboard({
             </button>
           </article>
         )}
-        <CashFlowPanel
-          invoices={invoices}
-          payments={payments}
-          parties={parties}
-          accountEntries={accountEntries}
-          expenses={expenses}
-          business={business}
-          language={language}
-          onToast={onToast}
-        />
-        <article className="dashboard-card p-4 xl:col-span-5">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="dashboard-title">{copy.settlement}</h3>
-              <p className="dashboard-subtitle">
-                {copy.settlementHelper(periodLabel)}
-              </p>
-            </div>
-            <span className="dashboard-chip">{copy.billCount(data.sales.length)}</span>
-          </div>
-          <div className="mt-5 grid items-center gap-5 sm:grid-cols-[1.1fr_.9fr]">
-            <div
-              className="relative mx-auto grid aspect-square w-full max-w-[230px] place-items-center rounded-full"
-              style={{ background: data.donutBackground }}
-            >
-              <div className="grid h-[68%] w-[68%] place-items-center rounded-full bg-white text-center shadow-[inset_0_0_0_1px_#eeeae1]">
-                <div>
-                  <strong className="block text-2xl tracking-tight">
-                    {formatMoney(data.salesTotal)}
-                  </strong>
-                  <span className="text-[10px] font-bold text-[#8a918d]">
-                    {copy.totalSales}
-                  </span>
-                </div>
-              </div>
-            </div>
-            <div className="space-y-2">
-              {data.modeRows.length ? (
-                data.modeRows.map((row) => (
-                  <div
-                    key={row.name}
-                    className="flex items-center justify-between rounded-xl bg-[#f8f6f1] px-3 py-2.5"
-                  >
-                    <span className="flex items-center gap-2 text-xs font-bold capitalize">
-                      <i
-                        className="h-2.5 w-2.5 rounded-sm"
-                        style={{ background: row.color }}
-                      />
-                      {localizedPaymentModeName(row.name, language)}
-                    </span>
-                    <strong className="text-xs">
-                      {formatMoney(row.value)}
-                    </strong>
-                  </div>
-                ))
-              ) : (
-                <p className="rounded-xl bg-[#f8f6f1] p-4 text-center text-xs text-[#7b837f]">
-                  {copy.noSales}
-                </p>
-              )}
-            </div>
-          </div>
-        </article>
-        <article className="dashboard-card overflow-hidden xl:col-span-7">
+        <article className="dashboard-card overflow-hidden xl:col-span-12">
           <div className="flex items-center justify-between border-b border-[#e7e3da] px-4 py-4">
             <div>
               <h3 className="dashboard-title">{copy.recentInvoices}</h3>
@@ -8480,8 +9462,84 @@ function ReportsDashboard({
             </div>
             <span className="dashboard-chip">{copy.live}</span>
           </div>
-          <div className="report-table-scroller" role="region" aria-label={copy.recentTable} tabIndex={0}>
-            <table className="dashboard-table min-w-[650px]">
+          <div
+            className="report-recent-invoice-list"
+            role="list"
+            aria-label={copy.recentTable}
+          >
+            {data.recent.length ? (
+              data.recent.map((invoice) => (
+                <div key={invoice.id} role="listitem" className="min-w-0">
+                  <button
+                    type="button"
+                    onClick={() => openInvoiceHistory(invoice)}
+                    className="report-recent-invoice-card"
+                  >
+                    <span className="report-recent-invoice-card__identity">
+                      <strong>{invoice.invoiceNumber}</strong>
+                      <small>{fullInvoiceDate(invoice.date, language)}</small>
+                    </span>
+                    <span className="report-recent-invoice-card__party">
+                      {localizedInvoicePartyName(language, invoice)}
+                    </span>
+                    <span className="report-recent-invoice-card__mode">
+                      <i
+                        style={{
+                          background:
+                            dashboardModeColors[invoice.paymentMode] ||
+                            "#8b918d",
+                        }}
+                        aria-hidden="true"
+                      />
+                      {localizedPaymentModeName(invoice.paymentMode, language)}
+                    </span>
+                    <span className="report-recent-invoice-card__amounts">
+                      <span>
+                        <small>{copy.total}</small>
+                        <strong>{formatMoney(invoice.grandTotal)}</strong>
+                      </span>
+                      <span>
+                        <small>{copy.due}</small>
+                        <strong
+                          className={
+                            invoice.amountDue > 0
+                              ? "report-money-due"
+                              : "report-money-in"
+                          }
+                        >
+                          {formatMoney(invoice.amountDue)}
+                        </strong>
+                      </span>
+                    </span>
+                    <span className="sr-only">
+                      {copy.openInvoice(
+                        invoice.invoiceNumber,
+                        localizedInvoicePartyName(language, invoice),
+                      )}
+                    </span>
+                  </button>
+                </div>
+              ))
+            ) : (
+              <p className="col-span-full py-12 text-center text-xs text-[#858c88]">
+                {copy.noSavedBills}
+              </p>
+            )}
+          </div>
+          <div
+            className="report-recent-invoice-table-region"
+            role="region"
+            aria-label={copy.recentTable}
+          >
+            <table className="dashboard-table report-recent-invoice-table">
+              <colgroup>
+                <col className="w-[15%]" />
+                <col className="w-[25%]" />
+                <col className="w-[18%]" />
+                <col className="w-[16%]" />
+                <col className="w-[13%]" />
+                <col className="w-[13%]" />
+              </colgroup>
               <thead>
                 <tr>
                   <th>{copy.invoice}</th>
@@ -8527,11 +9585,11 @@ function ReportsDashboard({
                           {localizedPaymentModeName(invoice.paymentMode, language)}
                         </span>
                       </td>
-                      <td className="text-right font-bold">
+                      <td className="report-recent-invoice-table__money text-right font-bold">
                         {formatMoney(invoice.grandTotal)}
                       </td>
                       <td
-                        className={`text-right font-bold ${invoice.amountDue > 0 ? "text-[#bd5d2a]" : "text-[#267055]"}`}
+                        className={`report-recent-invoice-table__money text-right font-bold ${invoice.amountDue > 0 ? "report-money-due" : "report-money-in"}`}
                       >
                         {formatMoney(invoice.amountDue)}
                       </td>
@@ -8586,18 +9644,18 @@ function ReportsDashboard({
                       {row.name}
                     </strong>
                     {row.codeName && (
-                      <span className="shrink-0 rounded-md bg-[#e7f3ec] px-1.5 py-1 text-[8px] font-black text-[#25684f]">
+                      <span className="shrink-0 rounded-md bg-[#e7f3ec] px-1.5 py-1 text-[0.5rem] font-black text-[#25684f]">
                         {row.codeName}
                       </span>
                     )}
                   </div>
-                  <p className="mt-1 truncate text-[10px] font-semibold text-[#5f6e67]">
+                  <p className="mt-1 truncate text-[0.625rem] font-semibold text-[#5f6e67]">
                     {row.address || copy.noAddress}
                   </p>
-                  <p className="mt-1 truncate text-[9px] text-[#77817c]">
+                  <p className="mt-1 truncate text-[0.5625rem] text-[#77817c]">
                     {row.phone || copy.noPhone}
                   </p>
-                  <p className="mt-2 text-[9px] font-black uppercase tracking-wide text-[#6f7974]">
+                  <p className="mt-2 text-[0.5625rem] font-black uppercase tracking-wide text-[#6f7974]">
                     {row.billCount} {reportHistoryCopy[language].bills}
                     {row.last
                       ? ` · ${reportHistoryCopy[language].lastPurchase} ${fullInvoiceDate(row.last.date, language)}`
@@ -8608,7 +9666,7 @@ function ReportsDashboard({
                   <strong className="text-sm text-[#173f35]">
                     {formatMoney(row.total)}
                   </strong>
-                  <p className="mt-1 text-[9px] font-bold text-[#7b847f]">
+                  <p className="mt-1 text-[0.5625rem] font-bold text-[#7b847f]">
                     {reportHistoryCopy[language].spent} ›
                   </p>
                 </div>
@@ -8631,9 +9689,10 @@ function ReportsDashboard({
               viewBox="0 0 100 100"
               preserveAspectRatio="none"
               className="h-[132px] w-full overflow-visible"
-              aria-label={copy.trendLabel}
+              aria-label={trendChartLabel}
               role="img"
             >
+              <title>{trendChartLabel}</title>
               <defs>
                 <linearGradient id="salesArea" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor="#309d4b" stopOpacity=".24" />
@@ -8665,7 +9724,7 @@ function ReportsDashboard({
               {data.buckets.map((bucket, index) => (
                 <circle
                   key={bucket.label}
-                  cx={(index * 100) / 6}
+                  cx={data.buckets.length === 1 ? 50 : (index * 100) / (data.buckets.length - 1)}
                   cy={88 - (bucket.value / data.maxTrend) * 68}
                   r="1.6"
                   fill="#f9f9f9"
@@ -8675,7 +9734,10 @@ function ReportsDashboard({
                 />
               ))}
             </svg>
-            <div className="grid grid-cols-7 gap-1 text-center text-[8px] font-bold text-[#8b918d]">
+            <div
+              className="grid gap-1 text-center text-[0.5rem] font-bold text-[#8b918d]"
+              style={{ gridTemplateColumns: `repeat(${data.buckets.length}, minmax(0, 1fr))` }}
+            >
               {data.buckets.map((bucket) => (
                 <span key={bucket.label}>{bucket.label}</span>
               ))}
@@ -8702,16 +9764,16 @@ function ReportsDashboard({
                   className="block w-full rounded-xl p-2 text-left transition hover:bg-[#f4faf0] focus:outline-none focus:ring-2 focus:ring-[#309d4b]"
                 >
                   <div className="mb-1.5 flex items-center justify-between gap-3">
-                    <span className="truncate text-[11px] font-bold text-[#014921]">
+                    <span className="truncate text-[0.6875rem] font-bold text-[#014921]">
                       {party.name} ›
                     </span>
-                    <strong className="shrink-0 text-[11px] text-[#b85a28]">
+                    <strong className="report-money-due shrink-0 text-[0.6875rem]">
                       {formatMoney(party.currentBalance)}
                     </strong>
                   </div>
                   <div className="h-2 overflow-hidden rounded-full bg-[#eeeae2]">
                     <div
-                      className="h-full rounded-full bg-[#abd49e]"
+                      className="report-due-bar h-full rounded-full"
                       style={{
                         width: `${(party.currentBalance / data.maxReceivable) * 100}%`,
                       }}
@@ -8744,11 +9806,11 @@ function ReportsDashboard({
                 key={row.name}
                 className="grid grid-cols-[22px_1fr_auto] items-center gap-2"
               >
-                <span className="grid h-5 w-5 place-items-center rounded-md bg-[#f1eee7] text-[9px] font-black text-[#737b77]">
+                <span className="grid h-5 w-5 place-items-center rounded-md bg-[#f1eee7] text-[0.5625rem] font-black text-[#737b77]">
                   {index + 1}
                 </span>
                 <div className="min-w-0">
-                  <p className="truncate text-[11px] font-bold">{row.name}</p>
+                  <p className="truncate text-[0.6875rem] font-bold">{row.name}</p>
                   <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-[#eeeae2]">
                     <div
                       className="h-full rounded-full bg-[#309d4b]"
@@ -8756,7 +9818,7 @@ function ReportsDashboard({
                     />
                   </div>
                 </div>
-                <strong className="text-[10px]">
+                <strong className="text-[0.625rem]">
                   {data.hasProductSales
                     ? formatMoney(row.value)
                     : copy.sales(row.value)}
@@ -8857,13 +9919,13 @@ function CustomerPurchaseHistory({
       </button>
       <div className="overflow-hidden rounded-3xl bg-[#014921] text-white shadow-sm">
         <div className="p-5 md:p-6">
-          <p className="text-[10px] font-black uppercase tracking-[.14em] text-[#abd49e]">
+          <p className="text-[0.625rem] font-black uppercase tracking-[.14em] text-[#abd49e]">
             {copy.section}
           </p>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <h2 className="text-2xl font-black md:text-3xl">{customerName}</h2>
             {(!party || party.codeName) && (
-              <span className="rounded-lg bg-[#ffbf6f] px-2 py-1 text-[9px] font-black text-[#014921]">
+              <span className="rounded-lg bg-[#ffbf6f] px-2 py-1 text-[0.5625rem] font-black text-[#014921]">
                 {party?.codeName || "CASH"}
               </span>
             )}
@@ -8872,16 +9934,16 @@ function CustomerPurchaseHistory({
             {party?.phone || detailCopy.noPhone}
             {party?.gstin ? ` · GSTIN ${party.gstin}` : ""}
           </p>
-          <p className="mt-1 text-[10px] text-[#c7dbc9]">
+          <p className="mt-1 text-[0.625rem] text-[#c7dbc9]">
             ⌖ {party?.address || detailCopy.noAddress}
           </p>
-          <p className="mt-3 rounded-lg bg-white/10 px-3 py-2 text-[10px] leading-4 text-[#e4efe6]">
+          <p className="mt-3 rounded-lg bg-white/10 px-3 py-2 text-[0.625rem] leading-4 text-[#e4efe6]">
             {detailCopy.grossNote}
           </p>
         </div>
         <div className="grid grid-cols-2 border-t border-white/15 sm:grid-cols-4">
           <div className="border-r border-white/15 p-4">
-            <span className="text-[9px] font-bold uppercase text-[#c3d9c7]">
+            <span className="text-[0.5625rem] font-bold uppercase text-[#c3d9c7]">
               {copy.savedBills}
             </span>
             <strong className="mt-1 block text-xl">
@@ -8889,7 +9951,7 @@ function CustomerPurchaseHistory({
             </strong>
           </div>
           <div className="border-r border-white/15 p-4">
-            <span className="text-[9px] font-bold uppercase text-[#c3d9c7]">
+            <span className="text-[0.5625rem] font-bold uppercase text-[#c3d9c7]">
               {copy.purchaseTotal}
             </span>
             <strong className="mt-1 block text-xl text-[#ffbf6f]">
@@ -8897,13 +9959,13 @@ function CustomerPurchaseHistory({
             </strong>
           </div>
           <div className="border-r border-t border-white/15 p-4 sm:border-t-0">
-            <span className="text-[9px] font-bold uppercase text-[#c3d9c7]">
+            <span className="text-[0.5625rem] font-bold uppercase text-[#c3d9c7]">
               {copy.paid}
             </span>
             <strong className="mt-1 block text-xl">{formatMoney(paid)}</strong>
           </div>
           <div className="border-t border-white/15 p-4 sm:border-t-0">
-            <span className="text-[9px] font-bold uppercase text-[#c3d9c7]">
+            <span className="text-[0.5625rem] font-bold uppercase text-[#c3d9c7]">
               {copy.due}
             </span>
             <strong className="mt-1 block text-xl text-[#ffbf6f]">
@@ -8915,11 +9977,11 @@ function CustomerPurchaseHistory({
       <div className="mb-3 mt-5 flex items-end justify-between gap-3">
         <div>
           <h3 className="text-base font-black">{detailCopy.allBills}</h3>
-          <p className="mt-1 text-[10px] font-semibold text-[#748078]">
+          <p className="mt-1 text-[0.625rem] font-semibold text-[#748078]">
             {detailCopy.newestFirst}
           </p>
         </div>
-        <span className="shrink-0 rounded-xl bg-[#e8f3e9] px-3 py-2 text-[10px] font-black text-[#276b50]">
+        <span className="shrink-0 rounded-xl bg-[#e8f3e9] px-3 py-2 text-[0.625rem] font-black text-[#276b50]">
           {detailCopy.totalCount(invoices.length, deletedCount)}
         </span>
       </div>
@@ -8938,15 +10000,15 @@ function CustomerPurchaseHistory({
                     {invoice.invoiceNumber}
                   </strong>
                   {invoice.deletedAt && (
-                    <span className="rounded-full bg-[#f7e8df] px-2 py-1 text-[8px] font-black uppercase text-[#9a4e2d]">
+                    <span className="rounded-full bg-[#f7e8df] px-2 py-1 text-[0.5rem] font-black uppercase text-[#9a4e2d]">
                       {copy.deleted}
                     </span>
                   )}
                 </div>
-                <p className="mt-2 text-[11px] font-bold text-[#374a43]">
+                <p className="mt-2 text-[0.6875rem] font-bold text-[#374a43]">
                   {fullInvoiceDate(invoice.date, language)}
                 </p>
-                <p className="mt-1 text-[9px] text-[#7b8580]">
+                <p className="mt-1 text-[0.5625rem] text-[#7b8580]">
                   {tr(language, "Recorded", "सेव हुआ", "সেভ হয়েছে")} {invoiceRecordedTime(invoice.createdAt, language)} ·{" "}
                   {invoicePaymentLabel(invoice, language)}
                 </p>
@@ -8956,7 +10018,7 @@ function CustomerPurchaseHistory({
                   {formatMoney(invoice.grandTotal)}
                 </strong>
                 <p
-                  className={`mt-1 text-[9px] font-black ${invoice.amountDue > 0 ? "text-[#b85a28]" : "text-[#267055]"}`}
+                  className={`mt-1 text-[0.5625rem] font-black ${invoice.amountDue > 0 ? "report-money-due" : "report-money-in"}`}
                 >
                   {invoice.amountDue > 0
                     ? `${copy.due} ${formatMoney(invoice.amountDue)}`
@@ -8968,17 +10030,17 @@ function CustomerPurchaseHistory({
               {invoice.lineItems.map((line, index) => (
                 <span
                   key={`${invoice.id}-${line.itemId}-${index}`}
-                  className="rounded-lg bg-[#f1eee7] px-2 py-1.5 text-[9px] font-bold text-[#4f5f58]"
+                  className="rounded-lg bg-[#f1eee7] px-2 py-1.5 text-[0.5625rem] font-bold text-[#4f5f58]"
                 >
                   {line.qty} {localizedInvoiceUnitName(line.unit, language)} × {localizedInvoiceLineName(line, language)}
                 </span>
               ))}
             </div>
             <div className="mt-3 flex items-center justify-between border-t border-[#ece8de] pt-3">
-              <span className="text-[9px] font-bold text-[#748078]">
+              <span className="text-[0.5625rem] font-bold text-[#748078]">
                 {invoice.lineItems.length} {copy.items.toLowerCase()}
               </span>
-              <span className="text-[10px] font-black text-[#014921]">
+              <span className="text-[0.625rem] font-black text-[#014921]">
                 {copy.viewBill} ›
               </span>
             </div>
@@ -8988,7 +10050,7 @@ function CustomerPurchaseHistory({
           <div className="rounded-2xl border-2 border-dashed border-[#d8d2c6] bg-[#f8f5ee] p-12 text-center">
             <span className="text-3xl">▤</span>
             <p className="mt-3 text-sm font-black">{copy.noBills}</p>
-            <p className="mt-1 text-[10px] text-[#7a837f]">
+            <p className="mt-1 text-[0.625rem] text-[#7a837f]">
               {detailCopy.futureBills}
             </p>
           </div>
@@ -9022,13 +10084,13 @@ function ReportInvoiceDetail({
       <div className="rounded-3xl bg-[#014921] p-5 text-white">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <p className="text-[10px] font-black uppercase tracking-[.13em] text-[#abd49e]">
+            <p className="text-[0.625rem] font-black uppercase tracking-[.13em] text-[#abd49e]">
               {detailCopy.salesInvoice}
             </p>
             <h3 className="mt-2 text-xl font-black">
               {localizedInvoicePartyName(language, invoice)}
             </h3>
-            <p className="mt-1 text-[10px] text-[#d0e1d3]">
+            <p className="mt-1 text-[0.625rem] text-[#d0e1d3]">
               {fullInvoiceDate(invoice.date, language)} · {tr(language, "recorded", "सेव हुआ", "সেভ হয়েছে")}{" "}
               {invoiceRecordedTime(invoice.createdAt, language)} ·{" "}
               {invoicePaymentLabel(invoice, language)}
@@ -9039,7 +10101,7 @@ function ReportInvoiceDetail({
           </strong>
         </div>
         {invoice.deletedAt && (
-          <p className="mt-4 rounded-xl bg-[#fff3e8] p-3 text-[10px] font-black text-[#91471f]">
+          <p className="mt-4 rounded-xl bg-[#fff3e8] p-3 text-[0.625rem] font-black text-[#91471f]">
             {detailCopy.recoverable}
           </p>
         )}
@@ -9047,7 +10109,7 @@ function ReportInvoiceDetail({
       <div className="mt-4 overflow-hidden rounded-2xl border border-[#ddd9cf] bg-white">
         <div className="border-b border-[#e8e4da] px-4 py-3">
           <h4 className="text-sm font-black">{copy.items}</h4>
-          <p className="mt-1 text-[9px] text-[#748078]">
+          <p className="mt-1 text-[0.5625rem] text-[#748078]">
             {detailCopy.itemHelper}
           </p>
         </div>
@@ -9057,7 +10119,7 @@ function ReportInvoiceDetail({
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <strong className="block text-xs">{localizedInvoiceLineName(line, language)}</strong>
-                  <p className="mt-1 text-[9px] text-[#7a837e]">
+                  <p className="mt-1 text-[0.5625rem] text-[#7a837e]">
                     {line.skuCode || detailCopy.noSku}
                     {line.hsnCode ? ` · HSN ${line.hsnCode}` : ""}
                   </p>
@@ -9068,26 +10130,26 @@ function ReportInvoiceDetail({
               </div>
               <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                 <div className="rounded-lg bg-[#f6f3ec] p-2">
-                  <span className="block text-[8px] font-bold text-[#7b837f]">
+                  <span className="block text-[0.5rem] font-bold text-[#7b837f]">
                     {detailCopy.quantity}
                   </span>
-                  <strong className="mt-1 block text-[10px]">
+                  <strong className="mt-1 block text-[0.625rem]">
                     {line.qty} {localizedInvoiceUnitName(line.unit, language)}
                   </strong>
                 </div>
                 <div className="rounded-lg bg-[#f6f3ec] p-2">
-                  <span className="block text-[8px] font-bold text-[#7b837f]">
+                  <span className="block text-[0.5rem] font-bold text-[#7b837f]">
                     {detailCopy.rate}
                   </span>
-                  <strong className="mt-1 block text-[10px]">
+                  <strong className="mt-1 block text-[0.625rem]">
                     {formatMoney(line.rate)}
                   </strong>
                 </div>
                 <div className="rounded-lg bg-[#f6f3ec] p-2">
-                  <span className="block text-[8px] font-bold text-[#7b837f]">
+                  <span className="block text-[0.5rem] font-bold text-[#7b837f]">
                     GST
                   </span>
-                  <strong className="mt-1 block text-[10px]">
+                  <strong className="mt-1 block text-[0.625rem]">
                     {line.gstRate}% · {formatMoney(line.gstAmount)}
                   </strong>
                 </div>
@@ -9123,13 +10185,13 @@ function ReportInvoiceDetail({
             <span className="font-black">{detailCopy.grandTotal}</span>
             <strong>{formatMoney(invoice.grandTotal)}</strong>
           </div>
-          <div className="flex justify-between text-[#267055]">
+          <div className="report-money-in flex justify-between">
             <span>
               {copy.paid} · {invoicePaymentLabel(invoice, language)}
             </span>
             <strong>{formatMoney(invoice.amountPaid)}</strong>
           </div>
-          <div className="flex justify-between text-[#b85a28]">
+          <div className="report-money-due flex justify-between">
             <span>{copy.due}</span>
             <strong>{formatMoney(invoice.amountDue)}</strong>
           </div>
@@ -9139,7 +10201,7 @@ function ReportInvoiceDetail({
         <button
           type="button"
           onClick={() => {
-            const preparedWindow = window.open("", "_blank");
+            const preparedWindow = preparePrintWindow();
             void printInvoice(
               invoice,
               business,
@@ -9167,6 +10229,7 @@ function ReportInvoiceDetail({
 function MoreScreen({
   language,
   theme,
+  interfaceScale,
   format,
   business,
   invoices,
@@ -9177,10 +10240,13 @@ function MoreScreen({
   onCloudDisconnect,
   onLanguage,
   onTheme,
+  onInterfaceScale,
   onFormat,
   onBusiness,
   onInstall,
   onToast,
+  onInventory,
+  onFestival,
   onNavigate,
   workspace,
   printerProfiles,
@@ -9199,6 +10265,7 @@ function MoreScreen({
 }: {
   language: Language;
   theme: Theme;
+  interfaceScale: InterfaceScale;
   format: InvoiceFormat;
   business: BusinessSettings;
   invoices: Invoice[];
@@ -9209,10 +10276,13 @@ function MoreScreen({
   onCloudDisconnect: () => Promise<boolean>;
   onLanguage: (x: Language) => void;
   onTheme: (x: Theme) => void;
+  onInterfaceScale: (x: InterfaceScale) => void;
   onFormat: (x: InvoiceFormat) => void;
   onBusiness: (x: BusinessSettings) => Promise<void>;
   onInstall: () => void;
   onToast: (m: string) => void;
+  onInventory: () => void;
+  onFestival: () => void;
   onNavigate: (tab: Tab) => void;
   workspace: WorkspacePreferences;
   printerProfiles: PrinterProfile[];
@@ -9294,6 +10364,24 @@ function MoreScreen({
       "দোকানের তথ্য সেভ হয়নি। আবার চেষ্টা করুন।",
     ),
     language: tr(language, "Language", "भाषा", "ভাষা"),
+    interfaceSize: tr(
+      language,
+      "Interface size",
+      "इंटरफ़ेस साइज़",
+      "ইন্টারফেসের আকার",
+    ),
+    interfaceSizeHelp: tr(
+      language,
+      "Enlarge app text, icons, buttons and spacing together. Printed bills and PDFs stay unchanged.",
+      "ऐप के टेक्स्ट, आइकन, बटन और स्पेसिंग को एक साथ बड़ा करें। प्रिंटेड बिल और PDF नहीं बदलेंगे।",
+      "অ্যাপের লেখা, আইকন, বোতাম ও ফাঁক একসঙ্গে বড় করুন। প্রিন্ট করা বিল ও PDF বদলাবে না।",
+    ),
+    interfaceScaleLabels: {
+      100: tr(language, "Default", "सामान्य", "সাধারণ"),
+      110: tr(language, "Comfortable", "आरामदायक", "আরামদায়ক"),
+      120: tr(language, "Large", "बड़ा", "বড়"),
+      130: tr(language, "Extra large", "बहुत बड़ा", "খুব বড়"),
+    } satisfies Record<InterfaceScale, string>,
     invoiceSize: tr(language, "Invoice size", "बिल का साइज़", "বিলের সাইজ"),
     invoiceFormats: {
       a4: "A4",
@@ -9491,6 +10579,30 @@ function MoreScreen({
       <p className="eyebrow">{copy.settingsData}</p>
       <h2 className="page-title">{t(language, "more")}</h2>
       <div className="mobile-more-tools mt-4 grid grid-cols-2 gap-2 md:hidden">
+        <button
+          type="button"
+          onClick={onInventory}
+          className="more-tool-shortcut"
+        >
+          <span className="more-tool-icon" aria-hidden="true">▦</span>
+          <span className="min-w-0 text-left">
+            <strong>{inventoryText(language, "Inventory", "इन्वेंटरी", "ইনভেন্টরি")}</strong>
+            <small>{inventoryText(language, "Stock, counts and returns", "स्टॉक, गिनती और रिटर्न", "স্টক, গোনা ও ফেরত")}</small>
+          </span>
+          <span aria-hidden="true">›</span>
+        </button>
+        <button
+          type="button"
+          onClick={onFestival}
+          className="more-tool-shortcut"
+        >
+          <span className="more-tool-icon" aria-hidden="true">◷</span>
+          <span className="min-w-0 text-left">
+            <strong>{festivalCopy(language).title}</strong>
+            <small>{festivalText(language, "Calendar, tags and reorder suggestions", "कैलेंडर, टैग और दोबारा ऑर्डर सुझाव", "ক্যালেন্ডার, ট্যাগ ও পুনরায় অর্ডারের পরামর্শ")}</small>
+          </span>
+          <span aria-hidden="true">›</span>
+        </button>
         {!workspace.hidden.includes("dues") && (
           <button
             type="button"
@@ -9527,7 +10639,7 @@ function MoreScreen({
         >
           <div>
             <strong>{copy.installPhone}</strong>
-            <p className="mt-1 text-[10px] text-[#c6d6d0]">
+            <p className="mt-1 text-[0.625rem] text-[#c6d6d0]">
               {copy.installHelp}
             </p>
           </div>
@@ -9537,7 +10649,7 @@ function MoreScreen({
       <div className="mt-4 grid gap-4 md:grid-cols-2">
         <section className="settings-card">
           <h3>{copy.shopDetails}</h3>
-          <p className="mt-1 text-[10px] leading-5 text-[#6f7a74]">
+          <p className="mt-1 text-[0.625rem] leading-5 text-[#6f7a74]">
             {copy.shopDetailsHelp}
           </p>
           <input
@@ -9659,6 +10771,58 @@ function MoreScreen({
               </button>
             ))}
           </div>
+          <h3 className="mt-5">{copy.interfaceSize}</h3>
+          <p className="mt-1 text-[0.625rem] leading-5 text-[#6f7a74]">
+            {copy.interfaceSizeHelp}
+          </p>
+          <div
+            className="interface-scale-picker mt-3"
+            role="group"
+            aria-label={copy.interfaceSize}
+            style={
+              {
+                "--interface-scale-index":
+                  interfaceScaleOptions.indexOf(interfaceScale),
+              } as React.CSSProperties
+            }
+          >
+            <span className="interface-scale-indicator" aria-hidden="true" />
+            {interfaceScaleOptions.map((scale) => {
+              const optionLabel = copy.interfaceScaleLabels[scale];
+              return (
+                <button
+                  key={scale}
+                  type="button"
+                  aria-pressed={interfaceScale === scale}
+                  aria-label={`${optionLabel} (${scale}%)`}
+                  title={`${optionLabel} · ${scale}%`}
+                  onClick={() => onInterfaceScale(scale)}
+                  className={interfaceScale === scale ? "active" : ""}
+                >
+                  {scale}%
+                </button>
+              );
+            })}
+          </div>
+          <div className="interface-scale-preview" aria-live="polite">
+            <span className="interface-scale-preview-type" aria-hidden="true">
+              Aa
+            </span>
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              className="h-5 w-5 fill-none stroke-current"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <rect x="4" y="4" width="16" height="16" rx="3" />
+              <path d="M8 12h8M12 8v8" />
+            </svg>
+            <strong>
+              {copy.interfaceScaleLabels[interfaceScale]} · {interfaceScale}%
+            </strong>
+          </div>
           <h3 className="mt-5">{copy.invoiceSize}</h3>
           <div
             className="grid grid-cols-3 gap-2"
@@ -9683,7 +10847,7 @@ function MoreScreen({
           <div className="mt-3 flex items-center justify-between rounded-xl bg-[#f2efe8] p-3">
             <div>
               <strong className="text-xs">{copy.supabaseSync}</strong>
-              <p className="mt-1 text-[9px] text-[#748078]">
+              <p className="mt-1 text-[0.5625rem] text-[#748078]">
                 {cloudConfigured
                   ? copy.cloudReady
                   : copy.cloudOffline}
@@ -9693,7 +10857,7 @@ function MoreScreen({
               className={`h-3 w-3 rounded-full ${cloudConfigured ? "bg-emerald-500" : "bg-stone-400"}`}
             />
           </div>
-          <p className="mt-3 text-[10px] leading-5 text-[#6f7a74]">
+          <p className="mt-3 text-[0.625rem] leading-5 text-[#6f7a74]">
             {copy.cloudHelp}
           </p>
           {ownerMode ? <>
@@ -9748,7 +10912,7 @@ function MoreScreen({
                   onToast(copy.generateCodeFailed);
                 }
               }}
-              className="mt-2 text-left text-[10px] font-black text-[#267055]"
+              className="mt-2 text-left text-[0.625rem] font-black text-[#267055]"
             >
               {copy.generateCode}
             </button>
@@ -9776,7 +10940,7 @@ function MoreScreen({
             <strong className="text-xs text-[#173f35]">
               {copy.ownerUnlockRequired}
             </strong>
-            <p className="mt-1 text-[10px] leading-5 text-[#6f7a74]">
+            <p className="mt-1 text-[0.625rem] leading-5 text-[#6f7a74]">
               {copy.ownerCloudHelp}
             </p>
             <button type="button" onClick={onOwnerSetup} className="counter-secondary mt-3">
@@ -9786,7 +10950,7 @@ function MoreScreen({
         </section>
         <section className="settings-card">
           <h3>{copy.gstExport}</h3>
-          <p className="mt-2 text-[10px] leading-5 text-[#6f7a74]">
+          <p className="mt-2 text-[0.625rem] leading-5 text-[#6f7a74]">
             {copy.gstHelp}
           </p>
           <button onClick={exportGstr} className="counter-secondary mt-3">
@@ -9804,14 +10968,14 @@ function MoreScreen({
                 >
                   <div>
                     <strong className="text-xs">{invoice.invoiceNumber}</strong>
-                    <p className="mt-1 text-[9px] text-[#7d817e]">
+                    <p className="mt-1 text-[0.5625rem] text-[#7d817e]">
                       {invoice.partyId ? invoice.partyName : copy.cashCustomer} ·{" "}
                       {formatMoney(invoice.grandTotal)}
                     </p>
                   </div>
                   <button
                     onClick={() => restore(invoice)}
-                    className="rounded-lg bg-white px-3 py-2 text-[10px] font-black text-[#267055]"
+                    className="rounded-lg bg-white px-3 py-2 text-[0.625rem] font-black text-[#267055]"
                   >
                     {copy.restore}
                   </button>
@@ -9977,54 +11141,54 @@ function InvoiceSaved({
           className={`mx-auto mt-3 grid max-w-sm gap-2 text-center ${quotation ? "grid-cols-3" : "grid-cols-4"}`}
         >
           <div>
-            <span className="block text-[8px] font-black uppercase text-[#748078]">
+            <span className="block text-[0.5rem] font-black uppercase text-[#748078]">
               {copy.taxable}
             </span>
-            <strong className="text-[11px]">
+            <strong className="text-[0.6875rem]">
               {formatMoney(invoice.subtotal - invoice.discountTotal)}
             </strong>
           </div>
           <div>
-            <span className="block text-[8px] font-black uppercase text-[#748078]">
+            <span className="block text-[0.5rem] font-black uppercase text-[#748078]">
               GST
             </span>
-            <strong className="text-[11px]">
+            <strong className="text-[0.6875rem]">
               {formatMoney(invoice.gstTotal)}
             </strong>
           </div>
           <div>
-            <span className="block text-[8px] font-black uppercase text-[#748078]">
+            <span className="block text-[0.5rem] font-black uppercase text-[#748078]">
               {copy.charges}
             </span>
-            <strong className="text-[11px]">
+            <strong className="text-[0.6875rem]">
               {formatMoney(invoice.otherChargesTotal || 0)}
             </strong>
           </div>
           {!quotation && (
             <div>
-              <span className="block text-[8px] font-black uppercase text-[#748078]">
+              <span className="block text-[0.5rem] font-black uppercase text-[#748078]">
                 {copy.due}
               </span>
-              <strong className="text-[11px] text-[#b65b2b]">
+              <strong className="text-[0.6875rem] text-[#b65b2b]">
                 {formatMoney(invoice.amountDue)}
               </strong>
             </div>
           )}
         </div>
         {quotation && (
-          <p className="mx-auto mt-3 max-w-sm rounded-xl bg-white/70 p-2 text-[9px] font-bold text-[#014921]">
+          <p className="bill-preview-estimate mx-auto mt-3 max-w-sm">
             {copy.estimateHelp}
           </p>
         )}
         {!quotation && invoice.amountDue > 0 && (
           <div className="mx-auto mt-3 max-w-sm rounded-xl border border-[#e8c69f] bg-[#fff7ed] p-3 text-left">
-            <p className="text-[10px] font-black text-[#267055]">
+            <p className="text-[0.625rem] font-black text-[#267055]">
               {copy.receivedNow}: {formatMoney(invoice.amountPaid)}
               {invoice.amountPaid > 0
                 ? ` · ${invoicePaymentLabel(invoice, language)}`
                 : ""}
             </p>
-            <p className="mt-1 text-[10px] font-black text-[#b65b2b]">
+            <p className="mt-1 text-[0.625rem] font-black text-[#b65b2b]">
               {copy.addedToDues(formatMoney(invoice.amountDue), partyName)}
             </p>
           </div>
@@ -10043,7 +11207,7 @@ function InvoiceSaved({
               type="button"
               onClick={() => setSelectedFormat(option)}
               aria-pressed={selectedFormat === option}
-              className={`min-h-12 rounded-lg border px-2 text-[10px] font-black ${selectedFormat === option ? "border-[#014921] bg-[#014921] text-white" : "border-[#d8d2c6] bg-white"}`}
+              className={`min-h-12 rounded-lg border px-2 text-[0.625rem] font-black ${selectedFormat === option ? "border-[#014921] bg-[#014921] text-white" : "border-[#d8d2c6] bg-white"}`}
             >
               {formatLabels[option]}
             </button>

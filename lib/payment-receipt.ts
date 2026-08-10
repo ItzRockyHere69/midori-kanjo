@@ -1,6 +1,12 @@
 import type { Language, Party, Payment } from "./db";
 import type { BusinessSettings, InvoiceFormat } from "./pdf";
-import { isNativeApp, shareNativeBlob } from "./native-files";
+import {
+  isNativeApp,
+  isTauriApp,
+  openExternalUrl,
+  saveDesktopBlob,
+  shareNativeBlob,
+} from "./native-files";
 import {
   normalizePdfLanguage,
   pdfDate,
@@ -133,7 +139,15 @@ export async function paymentReceiptPdf(payment: Payment, party: Party, remainin
 export async function downloadPaymentReceipt(payment: Payment, party: Party, remaining: number, business: BusinessSettings, format: InvoiceFormat = "a5", language: Language = "en") {
   const doc = await paymentReceiptPdf(payment, party, remaining, business, format, language);
   const partyPart = (party.codeName || party.name).replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "customer";
-  doc.save(`${paymentReceiptNumber(payment)}-${partyPart}.pdf`);
+  const fileName = `${paymentReceiptNumber(payment)}-${partyPart}.pdf`;
+  if (isTauriApp()) {
+    await saveDesktopBlob(doc.output("blob"), {
+      fileName,
+      title: receiptCopy[normalizePdfLanguage(language)].shareTitle,
+    });
+    return;
+  }
+  doc.save(fileName);
 }
 
 export async function sharePaymentReceipt(payment: Payment, party: Party, remaining: number, business: BusinessSettings, format: InvoiceFormat = "a5", message?: string, language: Language = "en", preparedWindow?: Window | null) {
@@ -152,6 +166,18 @@ export async function sharePaymentReceipt(payment: Payment, party: Party, remain
     const blob = doc.output("blob");
     const partyPart = (party.codeName || party.name).replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "") || "customer";
     const fileName = `${paymentReceiptNumber(payment)}-${partyPart}.pdf`;
+    if (isTauriApp()) {
+      preparedWindow?.close();
+      const savedPath = await saveDesktopBlob(blob, {
+        fileName,
+        title: copy.shareTitle,
+      });
+      if (savedPath && party.phone)
+        await openExternalUrl(
+          `https://wa.me/${party.phone.replace(/\D/g, "")}?text=${encodeURIComponent(shareMessage)}`,
+        );
+      return;
+    }
     if (native) {
       preparedWindow?.close();
       await shareNativeBlob(blob, { fileName, title: copy.shareTitle, text: shareMessage });

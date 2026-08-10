@@ -1,4 +1,4 @@
-const CACHE = "midori-kanjo-v5";
+const CACHE = "midori-kanjo-v6";
 const SHELL = [
   "/manifest.webmanifest",
   "/app-icon.svg",

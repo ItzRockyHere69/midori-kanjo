@@ -1,6 +1,7 @@
 import {
   db,
   isValidLocalDate,
+  localDate,
   makeId,
   nowIso,
   priceKey,
@@ -24,8 +25,10 @@ import {
   invoiceInitialPaymentBreakdown,
   normalizePartyIdentity,
   normalizePhoneDigits,
+  paymentChannels,
   roundMoney,
 } from "./billing";
+import { transferMergedFestivalTags } from "./festivals";
 
 export const OWNER_PIN_META = "owner-pin-sha256-v1";
 const OWNER_PIN_LOCKOUT_META = "owner-pin-lockout-v1";
@@ -353,9 +356,69 @@ export async function saveBillDraft(draft: Omit<BillDraft, "version" | "savedAt"
   return value;
 }
 
-export async function loadBillDraft() {
+export async function loadBillDraft(): Promise<BillDraft | null> {
   const draft = await readJsonMeta<BillDraft | null>(BILL_DRAFT_META, null);
-  return draft?.version === 1 && Array.isArray(draft.lines) ? draft : null;
+  if (draft?.version !== 1 || !Array.isArray(draft.lines)) return null;
+
+  const paymentPlan = (["full", "partial", "credit"] as const).includes(
+    draft.paymentPlan,
+  )
+    ? draft.paymentPlan
+    : "full";
+  const paymentMode = paymentChannels.includes(
+    draft.paymentMode as PaymentChannel,
+  )
+    ? draft.paymentMode as PaymentChannel
+    : "cash";
+  const seenModes = new Set<PaymentChannel>();
+  const paymentBreakdown: InvoicePaymentAllocation[] = [];
+  if (Array.isArray(draft.paymentBreakdown)) {
+    for (const rawEntry of draft.paymentBreakdown) {
+      if (!rawEntry || typeof rawEntry !== "object") continue;
+      const entry = rawEntry as Partial<InvoicePaymentAllocation>;
+      if (
+        !paymentChannels.includes(entry.mode as PaymentChannel) ||
+        seenModes.has(entry.mode as PaymentChannel) ||
+        !Number.isFinite(entry.amount) ||
+        Number(entry.amount) <= 0
+      ) continue;
+      const mode = entry.mode as PaymentChannel;
+      seenModes.add(mode);
+      paymentBreakdown.push({
+        mode,
+        amount: roundMoney(Number(entry.amount)),
+        ...(typeof entry.reference === "string" && entry.reference.trim()
+          ? { reference: entry.reference.trim().slice(0, 80) }
+          : {}),
+      });
+    }
+  }
+  const splitPayment =
+    paymentPlan !== "credit" && Boolean(draft.splitPayment);
+  const paid = paymentPlan === "credit"
+    ? 0
+    : splitPayment
+      ? roundMoney(
+          paymentBreakdown.reduce((sum, entry) => sum + entry.amount, 0),
+        )
+      : roundMoney(
+          Number.isFinite(draft.paid) ? Math.max(0, Number(draft.paid)) : 0,
+        );
+
+  return {
+    ...draft,
+    paid,
+    paymentMode,
+    paymentPlan,
+    splitPayment,
+    paymentBreakdown: splitPayment ? paymentBreakdown : [],
+    documentType: draft.documentType === "quotation" ? "quotation" : "sale",
+    gstEnabled: draft.gstEnabled !== false,
+    gstRate: Number.isFinite(draft.gstRate)
+      ? Math.min(25, Math.max(0, Number(draft.gstRate)))
+      : 18,
+    otherCharges: Array.isArray(draft.otherCharges) ? draft.otherCharges : [],
+  };
 }
 
 export async function clearBillDraft() { await db.meta.delete(BILL_DRAFT_META); }
@@ -494,7 +557,7 @@ function mergedPriceHistory(
 
 export async function mergeItems(sourceId: string, targetId: string, actor: ActivityLog["actor"] = "owner") {
   if (sourceId === targetId) throw new Error("Choose two different products.");
-  return db.transaction("rw", [db.items, db.partyItemPrices, db.activityLogs], async () => {
+  return db.transaction("rw", [db.items, db.partyItemPrices, db.stockMovements, db.activityLogs], async () => {
     const [source, target] = await Promise.all([db.items.get(sourceId), db.items.get(targetId)]);
     if (!source || !target) throw new Error("Product could not be found.");
     if (!source.isActive) throw new Error("This source product has already been merged or archived.");
@@ -513,15 +576,75 @@ export async function mergeItems(sourceId: string, targetId: string, actor: Acti
     }
     const stock = source.currentStock == null || target.currentStock == null
       ? null
-      : roundMoney(source.currentStock + target.currentStock);
+      : Math.round((source.currentStock + target.currentStock + Number.EPSILON) * 1_000_000) / 1_000_000;
     const lastSoldDate = [source.lastSoldDate, target.lastSoldDate]
       .filter((value): value is string => Boolean(value))
       .sort()
       .at(-1);
-    await db.items.update(targetId, { currentStock: stock, saleCount: target.saleCount + source.saleCount, lastSoldDate, updatedAt: stamp, isSynced: false });
-    await db.items.update(sourceId, { isActive: false, festivalTags: [...source.festivalTags.filter((tag) => !tag.startsWith("aliasOf:")), `aliasOf:${targetId}`], updatedAt: stamp, isSynced: false });
+    const mergedFestivalTags = transferMergedFestivalTags(source.festivalTags, target.festivalTags);
+    await db.stockMovements.add({
+      id: `item_merge:${sourceId}:${targetId}:${stamp}`,
+      itemId: targetId,
+      kind: "manual_adjustment",
+      reason: "item_merge",
+      note: `Merged stock from ${source.name}`,
+      qtyChange: target.currentStock === null || stock === null
+        ? null
+        : Math.round((stock - target.currentStock + Number.EPSILON) * 1_000_000) / 1_000_000,
+      stockBefore: target.currentStock,
+      stockAfter: stock,
+      applied: true,
+      date: localDate(),
+      actor,
+      createdAt: stamp,
+      updatedAt: stamp,
+      isSynced: false,
+    });
+    await db.items.update(targetId, { currentStock: stock, saleCount: target.saleCount + source.saleCount, lastSoldDate, festivalTags: mergedFestivalTags.targetTags, updatedAt: stamp, isSynced: false });
+    await db.items.update(sourceId, { isActive: false, festivalTags: [...mergedFestivalTags.sourceTags.filter((tag) => !tag.startsWith("aliasOf:")), `aliasOf:${targetId}`], updatedAt: stamp, isSynced: false });
     await logActivity({ action: "item.merge", entityType: "item", entityId: targetId, description: `Merged ${source.name} into ${target.name}`, actor, metadata: { sourceId } });
     return targetId;
+  });
+}
+
+export function isRestorableArchivedItem(
+  item: Pick<Item, "isActive" | "festivalTags">,
+) {
+  return (
+    !item.isActive &&
+    !item.festivalTags.some((tag) => tag.startsWith("aliasOf:"))
+  );
+}
+
+export async function restoreArchivedItem(
+  itemId: string,
+  actor: ActivityLog["actor"] = "owner",
+) {
+  return db.transaction("rw", [db.items, db.activityLogs], async () => {
+    const item = await db.items.get(itemId);
+    if (!item) throw new Error("This product no longer exists.");
+    if (item.isActive) return item;
+    if (!isRestorableArchivedItem(item)) {
+      throw new Error(
+        "This product was merged into another product and cannot be restored separately.",
+      );
+    }
+    const stamp = nowIso();
+    const restored: Item = {
+      ...item,
+      isActive: true,
+      updatedAt: stamp,
+      isSynced: false,
+    };
+    await db.items.put(restored);
+    await logActivity({
+      action: "item.restored",
+      entityType: "item",
+      entityId: item.id,
+      description: `${item.name} restored`,
+      actor,
+    });
+    return restored;
   });
 }
 

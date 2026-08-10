@@ -103,6 +103,7 @@ const enQolCopy = {
     lastSuccess: "Last successful backup",
     never: "Never",
     pendingLabels: {
+      categories: "Categories",
       parties: "Parties",
       items: "Items",
       prices: "Rates",
@@ -110,9 +111,12 @@ const enQolCopy = {
       payments: "Payments",
       dues: "Dues",
       expenses: "Expenses",
+      countSessions: "Stock counts",
+      countLines: "Count lines",
+      stockMovements: "Stock movements",
     },
     conflicts: (count: number) =>
-      `${count} newer cloud edit${count === 1 ? "" : "s"} replaced older offline data. Ledger balances were rebuilt from bills, dues and payments.`,
+      `${count} newer cloud edit${count === 1 ? "" : "s"} replaced older offline data. Account balances and stock were rebuilt from their audit records.`,
     backingUp: "Backing up…",
     backUpNow: (count: number) => `Back up now · ${count} pending`,
     helper:
@@ -268,6 +272,7 @@ const enQolCopy = {
       "item.created": "Item created",
       "item.updated": "Item updated",
       "item.archived": "Item archived",
+      "item.restored": "Item restored",
       "item.photo.update": "Photo updated",
       "item.photo.remove": "Photo removed",
       "item.merge": "Items merged",
@@ -344,6 +349,7 @@ const qolCopy: Record<Language, QolCopy> = {
       lastSuccess: "आखिरी सफल बैकअप",
       never: "कभी नहीं",
       pendingLabels: {
+        categories: "श्रेणियाँ",
         parties: "पार्टी",
         items: "सामान",
         prices: "रेट",
@@ -351,9 +357,12 @@ const qolCopy: Record<Language, QolCopy> = {
         payments: "पेमेंट",
         dues: "बाकी",
         expenses: "खर्च",
+        countSessions: "स्टॉक गिनती",
+        countLines: "गिनती की पंक्तियाँ",
+        stockMovements: "स्टॉक बदलाव",
       },
       conflicts: (count: number) =>
-        `${count} नए क्लाउड बदलावों ने पुराने ऑफलाइन डेटा को बदला। बिल, बाकी और पेमेंट से खाता बैलेंस फिर बनाया गया।`,
+        `${count} नए क्लाउड बदलावों ने पुराने ऑफलाइन डेटा को बदला। खाते और स्टॉक अपने ऑडिट रिकॉर्ड से फिर बनाए गए।`,
       backingUp: "बैकअप हो रहा है…",
       backUpNow: (count: number) => `अभी बैकअप करें · ${count} बाकी`,
       helper:
@@ -504,6 +513,7 @@ const qolCopy: Record<Language, QolCopy> = {
         "item.created": "सामान बनाया",
         "item.updated": "सामान बदला",
         "item.archived": "सामान आर्काइव किया",
+        "item.restored": "सामान वापस लाया",
         "item.photo.update": "फोटो बदली",
         "item.photo.remove": "फोटो हटाई",
         "item.merge": "सामान मिलाया",
@@ -567,6 +577,7 @@ const qolCopy: Record<Language, QolCopy> = {
       lastSuccess: "শেষ সফল ব্যাকআপ",
       never: "কখনও হয়নি",
       pendingLabels: {
+        categories: "বিভাগ",
         parties: "পার্টি",
         items: "পণ্য",
         prices: "রেট",
@@ -574,8 +585,11 @@ const qolCopy: Record<Language, QolCopy> = {
         payments: "পেমেন্ট",
         dues: "বাকি",
         expenses: "খরচ",
+        countSessions: "স্টক গোনা",
+        countLines: "গোনার সারি",
+        stockMovements: "স্টক পরিবর্তন",
       },
-      conflicts: (count: number) => `${count}টি নতুন ক্লাউড পরিবর্তন পুরনো অফলাইন ডেটার জায়গায় এসেছে। বিল, বাকি ও পেমেন্ট থেকে খাতার ব্যালেন্স আবার তৈরি হয়েছে।`,
+      conflicts: (count: number) => `${count}টি নতুন ক্লাউড পরিবর্তন পুরনো অফলাইন ডেটার জায়গায় এসেছে। খাতা ও স্টক তাদের অডিট রেকর্ড থেকে আবার তৈরি হয়েছে।`,
       backingUp: "ব্যাকআপ হচ্ছে…",
       backUpNow: (count: number) => `এখন ব্যাকআপ করুন · ${count}টি বাকি`,
       helper: "ইন্টারনেট ছাড়াও বিল করা যাবে। আপলোড নিরাপদ ব্যাচে হয় এবং বড় পণ্যের তালিকা পেজ ধরে ডাউনলোড হয়।",
@@ -719,6 +733,7 @@ const qolCopy: Record<Language, QolCopy> = {
         "item.created": "পণ্য তৈরি",
         "item.updated": "পণ্য বদলানো",
         "item.archived": "পণ্য আর্কাইভ",
+        "item.restored": "পণ্য ফিরিয়ে আনা",
         "item.photo.update": "ছবি বদলানো",
         "item.photo.remove": "ছবি বাদ দেওয়া",
         "item.merge": "পণ্য মেলানো",
@@ -848,7 +863,7 @@ export function OwnerPinSheet({
     >
       <div className="rounded-2xl bg-[#f4faf0] p-4">
         <strong className="text-sm text-[#014921]">{copy.owner.privateView}</strong>
-        <p className="mt-2 text-[11px] leading-5 text-[#66736d]">
+        <p className="mt-2 text-[0.6875rem] leading-5 text-[#66736d]">
           {copy.owner.helper}
         </p>
       </div>
@@ -997,10 +1012,10 @@ export function GlobalSearchSheet({
                 </span>
                 <span className="min-w-0">
                   <strong className="block truncate text-xs">{result.party.name}</strong>
-                  <span className="mt-1 block truncate text-[9px] text-[#747573]">
+                  <span className="mt-1 block truncate text-[0.5625rem] text-[#747573]">
                     {[result.party.codeName, result.party.phone || result.party.address].filter(Boolean).join(" · ")}
                   </span>
-                  <span className="mt-1 block text-[9px] font-black text-[#b85a28]">
+                  <span className="mt-1 block text-[0.5625rem] font-black text-[#b85a28]">
                     {copy.search.due} {formatMoney(result.party.currentBalance)}
                   </span>
                 </span>
@@ -1027,11 +1042,11 @@ export function GlobalSearchSheet({
                 </span>
                 <span className="min-w-0">
                   <strong className="block truncate text-xs">{itemName}</strong>
-                  <span className="mt-1 block truncate text-[9px] text-[#747573]">
+                  <span className="mt-1 block truncate text-[0.5625rem] text-[#747573]">
                     {itemMeta}
                   </span>
                   {ownerMode && (
-                    <span className="mt-1 block text-[8px] font-bold text-[#014921]">
+                    <span className="mt-1 block text-[0.5rem] font-bold text-[#014921]">
                       {copy.search.cost} {formatMoney(result.item.purchasePrice)}
                     </span>
                   )}
@@ -1053,10 +1068,10 @@ export function GlobalSearchSheet({
                 <strong className="block truncate text-xs">
                   {result.invoice.invoiceNumber}
                 </strong>
-                <span className="mt-1 block truncate text-[9px] text-[#747573]">
+                <span className="mt-1 block truncate text-[0.5625rem] text-[#747573]">
                   {localizedInvoicePartyName(language, result.invoice)} · {formatShortDate(result.invoice.date, language)}
                 </span>
-                <span className="mt-1 block text-[9px] font-black">
+                <span className="mt-1 block text-[0.5625rem] font-black">
                   {formatMoney(result.invoice.grandTotal)}
                 </span>
               </span>
@@ -1124,7 +1139,7 @@ export function SyncCenterSheet({
         <div className="flex items-center justify-between">
           <div>
             <strong className="text-sm">{status}</strong>
-            <p className="mt-1 text-[10px] text-[#68736e]">
+            <p className="mt-1 text-[0.625rem] text-[#68736e]">
               {copy.sync.lastSuccess}: {diagnostics.lastSuccess
                 ? formatDateTime(diagnostics.lastSuccess, language)
                 : copy.sync.never}
@@ -1139,7 +1154,7 @@ export function SyncCenterSheet({
         {(diagnostics.lastError || actionError) && (
           <p
             role="alert"
-            className="mt-3 text-[10px] font-bold text-[#9b4c28]"
+            className="mt-3 text-[0.625rem] font-bold text-[#9b4c28]"
           >
             {actionError || copy.sync.backupError}
           </p>
@@ -1159,7 +1174,7 @@ export function SyncCenterSheet({
         ))}
       </div>
       {diagnostics.conflictCount > 0 && (
-        <p className="mt-3 rounded-xl bg-[#fff3e8] p-3 text-[10px] font-bold text-[#9b4c28]">
+        <p className="mt-3 rounded-xl bg-[#fff3e8] p-3 text-[0.625rem] font-bold text-[#9b4c28]">
           {copy.sync.conflicts(diagnostics.conflictCount)}
         </p>
       )}
@@ -1172,7 +1187,7 @@ export function SyncCenterSheet({
           ? copy.sync.backingUp
           : copy.sync.backUpNow(diagnostics.totalPending)}
       </button>
-      <p className="mt-3 text-[10px] leading-5 text-[#747573]">
+      <p className="mt-3 text-[0.625rem] leading-5 text-[#747573]">
         {copy.sync.helper}
       </p>
     </Modal>
@@ -1265,7 +1280,7 @@ export function PaymentReceiptSheet({
         <span className="mx-auto grid h-12 w-12 place-items-center rounded-full bg-[#014921] text-xl text-white">
           ✓
         </span>
-        <p className="mt-3 text-[9px] font-black tracking-wide text-[#747573]">
+        <p className="mt-3 text-[0.5625rem] font-black tracking-wide text-[#747573]">
           {paymentReceiptNumber(payment)}
         </p>
         <h3 className="mt-1 text-lg font-black">{party.name}</h3>
@@ -1277,7 +1292,7 @@ export function PaymentReceiptSheet({
             ? copy.receipt.paid
             : copy.receipt.received}
         </p>
-        <p className="mt-3 rounded-xl bg-white/70 p-3 text-xs font-black text-[#b85a28]">
+        <p className="payment-receipt-balance mt-3">
           {supplier ? copy.receipt.remainingPayable : copy.receipt.remainingDue}{" "}
           {formatMoney(remaining)}
         </p>
@@ -1507,15 +1522,15 @@ export function DailyClosePanel({
   }
 
   const summaryRows = [
-    [copy.close.summaryLabels.sales, summary.sales],
-    [copy.close.summaryLabels.invoiceCash, summary.invoiceCash],
-    [copy.close.summaryLabels.invoiceCashOut, -summary.invoiceCashOut],
-    [copy.close.summaryLabels.customerCash, summary.customerCash],
-    [copy.close.summaryLabels.supplierCash, -summary.supplierCash],
-    [copy.close.summaryLabels.expensesCash, -summary.expensesCash],
-    [copy.close.summaryLabels.upiIn, summary.upiIn],
-    [copy.close.summaryLabels.bankIn, summary.bankIn],
-    [copy.close.summaryLabels.chequeIn, summary.chequeIn],
+    [copy.close.summaryLabels.sales, summary.sales, "neutral"],
+    [copy.close.summaryLabels.invoiceCash, summary.invoiceCash, "in"],
+    [copy.close.summaryLabels.invoiceCashOut, -summary.invoiceCashOut, "out"],
+    [copy.close.summaryLabels.customerCash, summary.customerCash, "in"],
+    [copy.close.summaryLabels.supplierCash, -summary.supplierCash, "out"],
+    [copy.close.summaryLabels.expensesCash, -summary.expensesCash, "out"],
+    [copy.close.summaryLabels.upiIn, summary.upiIn, "in"],
+    [copy.close.summaryLabels.bankIn, summary.bankIn, "in"],
+    [copy.close.summaryLabels.chequeIn, summary.chequeIn, "in"],
   ] as const;
 
   return (
@@ -1523,12 +1538,12 @@ export function DailyClosePanel({
       <div className="border-b border-[#e2e2db] p-4">
         <p className="eyebrow">{copy.close.eyebrow}</p>
         <h3 className="mt-1 text-xl text-[#014921]">{copy.close.title}</h3>
-        <p className="mt-1 text-[10px] text-[#747573]">{copy.close.helper}</p>
+        <p className="mt-1 text-[0.625rem] text-[#747573]">{copy.close.helper}</p>
       </div>
       {closeLoadError && (
         <div
           role="alert"
-          className="mx-4 mt-4 rounded-xl border border-[#d8a27e] bg-[#fff3e8] p-3 text-[10px] text-[#7b3519]"
+          className="mx-4 mt-4 rounded-xl border border-[#d8a27e] bg-[#fff3e8] p-3 text-[0.625rem] text-[#7b3519]"
         >
           {closeLoadError}
         </div>
@@ -1536,7 +1551,7 @@ export function DailyClosePanel({
       {currentSaved && (
         <div
           role="status"
-          className="mx-4 mt-4 rounded-xl border border-[#b9cdbf] bg-[#f2f8f3] p-3 text-[10px] leading-5 text-[#285a3d]"
+          className="daily-close-saved mx-4 mt-4"
         >
           <strong className="block text-xs">
             {copy.close.savedClose} · {formatDateTime(currentSaved.updatedAt, language)}
@@ -1590,10 +1605,18 @@ export function DailyClosePanel({
         </div>
         <div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {summaryRows.map(([label, value]) => (
+            {summaryRows.map(([label, value, direction]) => (
               <div key={label} className="rounded-xl bg-[#f7f5ef] p-3">
                 <span className="field-caption">{label}</span>
-                <strong className="mt-1 block text-sm">
+                <strong
+                  className={`mt-1 block text-sm ${
+                    direction === "in"
+                      ? "report-money-in"
+                      : direction === "out"
+                        ? "report-money-out"
+                        : ""
+                  }`}
+                >
                   {formatMoney(Number(value))}
                 </strong>
               </div>
@@ -1601,7 +1624,7 @@ export function DailyClosePanel({
           </div>
           <div className="mt-2 grid grid-cols-2 gap-2">
             <div className="rounded-xl bg-[#014921] p-3 text-white">
-              <span className="text-[8px] font-black uppercase opacity-75">
+              <span className="text-[0.5rem] font-black uppercase opacity-75">
                 {copy.close.expectedCash}
               </span>
               <strong className="mt-1 block text-xl">
@@ -1611,7 +1634,7 @@ export function DailyClosePanel({
             <div
               className={`rounded-xl p-3 ${Math.abs(difference) < 0.01 ? "bg-[#f4faf0] text-[#014921]" : "bg-[#fff3e8] text-[#9b4c28]"}`}
             >
-              <span className="text-[8px] font-black uppercase">
+              <span className="text-[0.5rem] font-black uppercase">
                 {copy.close.overShort}
               </span>
               <strong className="mt-1 block text-xl">{formatMoney(difference)}</strong>
@@ -1811,13 +1834,13 @@ export function QualityOfLifeSettings({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h3>{copy.settings.title}</h3>
-          <p className="mt-1 text-[10px] text-[#747573]">
+          <p className="mt-1 text-[0.625rem] text-[#747573]">
             {copy.settings.helper}
           </p>
         </div>
         <button
           onClick={onOwnerSetup}
-          className="min-h-10 rounded-lg border border-[#e2e2db] bg-white px-3 text-[9px] font-black text-[#014921]"
+          className="min-h-10 rounded-lg border border-[#e2e2db] bg-white px-3 text-[0.5625rem] font-black text-[#014921]"
         >
           {ownerConfigured
             ? copy.settings.ownerConfigured
@@ -1835,7 +1858,7 @@ export function QualityOfLifeSettings({
             type="button"
             aria-pressed={section === key}
             onClick={() => setSection(key)}
-            className={`min-h-10 shrink-0 rounded-lg px-3 text-[9px] font-black ${section === key ? "bg-[#014921] text-white" : "border border-[#e2e2db] bg-white"}`}
+            className={`min-h-10 shrink-0 rounded-lg px-3 text-[0.5625rem] font-black ${section === key ? "bg-[#014921] text-white" : "border border-[#e2e2db] bg-white"}`}
           >
             {copy.settings.sections[key]}
           </button>
@@ -1844,7 +1867,7 @@ export function QualityOfLifeSettings({
 
       {section === "workspace" && (
         <div className="mt-4">
-          <p className="text-[10px] text-[#747573]">
+          <p className="text-[0.625rem] text-[#747573]">
             {copy.settings.workspaceHelper}
           </p>
           <div className="mt-3 space-y-2">
@@ -1855,7 +1878,7 @@ export function QualityOfLifeSettings({
                   key={tab}
                   className="flex items-center gap-2 rounded-xl border border-[#e2e2db] bg-white p-2"
                 >
-                  <span className="grid h-9 w-9 place-items-center rounded-lg bg-[#f4faf0] text-[10px] font-black">
+                  <span className="grid h-9 w-9 place-items-center rounded-lg bg-[#f4faf0] text-[0.625rem] font-black">
                     {index + 1}
                   </span>
                   <strong className="min-w-0 flex-1">{label}</strong>
@@ -1873,7 +1896,7 @@ export function QualityOfLifeSettings({
                   >
                     ↓
                   </button>
-                  <label className="flex min-h-9 items-center gap-2 px-1 text-[9px] font-black">
+                  <label className="flex min-h-9 items-center gap-2 px-1 text-[0.5625rem] font-black">
                     <input
                       type="checkbox"
                       disabled={tab === "bill" || tab === "more"}
@@ -1968,7 +1991,7 @@ export function QualityOfLifeSettings({
                   <option value="a5">A5</option>
                   <option value="thermal">{copy.settings.thermal}</option>
                 </select>
-                <label className="flex items-center gap-2 text-[9px] font-black">
+                <label className="flex items-center gap-2 text-[0.5625rem] font-black">
                   <input
                     aria-label={copy.settings.copiesFor(profileLabel)}
                     type="number"
@@ -2005,7 +2028,7 @@ export function QualityOfLifeSettings({
                       })),
                     )
                   }
-                  className={`min-h-11 rounded-lg px-3 text-[9px] font-black ${profile.isDefault ? "bg-[#014921] text-white" : "border"}`}
+                  className={`min-h-11 rounded-lg px-3 text-[0.5625rem] font-black ${profile.isDefault ? "bg-[#014921] text-white" : "border"}`}
                 >
                   {profile.isDefault
                     ? copy.settings.defaultPrinter
@@ -2014,7 +2037,7 @@ export function QualityOfLifeSettings({
               </div>
             );
           })}
-          <p className="text-[10px] text-[#747573]">
+          <p className="text-[0.625rem] text-[#747573]">
             {copy.settings.printerHelper}
           </p>
           <button
@@ -2044,7 +2067,7 @@ export function QualityOfLifeSettings({
               />
             </label>
           ))}
-          <p className="text-[10px] leading-5 text-[#747573] md:col-span-2">
+          <p className="text-[0.625rem] leading-5 text-[#747573] md:col-span-2">
             {copy.settings.placeholders}: {"{{party_name}} {{party_code}} {{invoice_number}} {{total}} {{paid}} {{due}} {{payment_date}} {{shop_name}} {{item_count}} {{price_tier}}"}
           </p>
           <button
@@ -2074,15 +2097,15 @@ export function QualityOfLifeSettings({
                     key={`${first.id}-${second.id}`}
                     className="rounded-xl border bg-white p-3"
                   >
-                    <strong className="text-[11px]">
+                    <strong className="text-[0.6875rem]">
                       {first.name} ↔ {second.name}
                     </strong>
-                    <p className="mt-1 text-[9px] text-[#747573]">
+                    <p className="mt-1 text-[0.5625rem] text-[#747573]">
                       {[first.codeName, second.codeName].filter(Boolean).join(" / ")}
                     </p>
                     <button
                       onClick={() => void mergeParty(first, second)}
-                      className="mt-2 text-[9px] font-black text-[#014921] underline"
+                      className="mt-2 text-[0.5625rem] font-black text-[#014921] underline"
                     >
                       {copy.settings.mergeFirst}
                     </button>
@@ -2105,15 +2128,15 @@ export function QualityOfLifeSettings({
                     key={`${first.id}-${second.id}`}
                     className="rounded-xl border bg-white p-3"
                   >
-                    <strong className="text-[11px]">
+                    <strong className="text-[0.6875rem]">
                       {displayItemName(first, language)} ↔ {displayItemName(second, language)}
                     </strong>
-                    <p className="mt-1 text-[9px] text-[#747573]">
+                    <p className="mt-1 text-[0.5625rem] text-[#747573]">
                       {first.skuCode} / {second.skuCode}
                     </p>
                     <button
                       onClick={() => void mergeItem(first, second)}
-                      className="mt-2 text-[9px] font-black text-[#014921] underline"
+                      className="mt-2 text-[0.5625rem] font-black text-[#014921] underline"
                     >
                       {copy.settings.mergeFirst}
                     </button>

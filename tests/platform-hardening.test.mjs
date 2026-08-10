@@ -173,7 +173,7 @@ test("service worker precaches rendered assets and awaits runtime cache writes",
       return stored.get(keyOf(key))?.clone();
     },
     async keys() {
-      return ["midori-kanjo-v4", "midori-kanjo-v5"];
+      return ["midori-kanjo-v4", "midori-kanjo-v5", "midori-kanjo-v6"];
     },
     async delete(key) {
       deletedCaches.push(key);
@@ -235,7 +235,7 @@ test("service worker precaches rendered assets and awaits runtime cache writes",
     },
   });
   await activateWork;
-  assert.deepEqual(deletedCaches, ["midori-kanjo-v4"]);
+  assert.deepEqual(deletedCaches, ["midori-kanjo-v4", "midori-kanjo-v5"]);
   assert.equal(clientsClaimed, true);
   for (const expected of [
     "/",

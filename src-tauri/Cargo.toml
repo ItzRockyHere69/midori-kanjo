@@ -1,6 +1,6 @@
 [package]
 name = "midori-kanjo"
-version = "0.1.1"
+version = "0.1.2"
 description = "Offline-first wholesale billing and inventory software"
 authors = ["Sayan Finance"]
 license = "UNLICENSED"
@@ -16,6 +16,10 @@ tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 tauri = { version = "2.11.3", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
 # The dependency and its embedded HTTP server exist only in the dedicated
 # runner-test build selected by `--features desktop-e2e`.

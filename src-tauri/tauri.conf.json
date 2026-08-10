@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Midori Kanjo",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.sayanfinance.midorikanjo",
   "build": {
     "beforeDevCommand": "npm run tauri:frontend:dev",
@@ -46,7 +46,7 @@
     "windows": {
       "allowDowngrades": false,
       "webviewInstallMode": {
-        "type": "downloadBootstrapper",
+        "type": "offlineInstaller",
         "silent": true
       }
     },

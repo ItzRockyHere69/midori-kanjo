@@ -1,7 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useLiveQuery } from "dexie-react-hooks";
 import {
+  db,
   localDate,
   type AccountEntry,
   type Invoice,
@@ -41,7 +43,7 @@ import {
   localizedItemName,
 } from "../lib/i18n";
 
-type ReportKey =
+export type ReportKey =
   | "daily"
   | "party"
   | "profit"
@@ -197,16 +199,16 @@ const uiCopy = {
     rows: (count) => `${count} rows`,
     reportTable: (report) => `${report} table`,
     dailyHelper:
-      "One row per selling day with taxable value, GST, collections and credit.",
+      "Bills raised each day. Collected to date and due today show their current settlement, not cash received that day.",
     date: "Date",
     bills: "Bills",
     taxable: "Taxable",
     gst: "GST",
     sales: "Sales",
-    paid: "Paid",
-    due: "Due",
+    paid: "Collected to date",
+    due: "Due today",
     partyHelper:
-      "Customer totals for the selected dates, ranked by sales value.",
+      "Bills raised in the selected dates, ranked by sales. Collections and dues are current as of today.",
     party: "Party",
     cashCustomer: "Cash customer",
     code: "Code",
@@ -235,7 +237,7 @@ const uiCopy = {
     oldest: "Oldest",
     days: (count) => `${count} days`,
     deadStockHelper:
-      "Active items with no recorded sale for at least six months. Unknown stock stays visible as – and never blocks billing.",
+      "Dormant known stock with no sale for at least six months, plus unknown and negative stock that needs counting or reconciliation.",
     inactive: "Inactive",
     stock: "Stock",
     stockValue: "Stock value",
@@ -329,15 +331,15 @@ const uiCopy = {
     rows: (count) => `${count} एंट्री`,
     reportTable: (report) => `${report} की टेबल`,
     dailyHelper:
-      "हर सेल तारीख का टैक्सेबल अमाउंट, GST, जमा और बाकी एक लाइन में।",
+      "हर बिल तारीख की सेल। आज तक जमा और आज बाकी उन बिलों की मौजूदा स्थिति है, उस दिन का कैश फ्लो नहीं।",
     date: "तारीख",
     bills: "बिल",
     taxable: "टैक्सेबल",
     gst: "GST",
     sales: "सेल",
-    paid: "जमा",
-    due: "बाकी",
-    partyHelper: "चुनी तारीखों की पार्टी-वाइज़ सेल, सबसे बड़ी सेल पहले।",
+    paid: "आज तक जमा",
+    due: "आज बाकी",
+    partyHelper: "चुनी तारीखों में बने बिलों का पार्टी-वाइज़ कुल। जमा और बाकी आज की स्थिति है।",
     party: "पार्टी",
     cashCustomer: "कैश कस्टमर",
     code: "कोड",
@@ -366,7 +368,7 @@ const uiCopy = {
     oldest: "सबसे पुरानी",
     days: (count) => `${count} दिन`,
     deadStockHelper:
-      "ऐसा चालू सामान जो कम-से-कम छह महीने से नहीं बिका। अनजान स्टॉक – दिखेगा और बिलिंग नहीं रोकेगा।",
+      "छह महीने से न बिका ज्ञात स्टॉक, साथ में गिनती या मिलान माँगने वाला अनजान और निगेटिव स्टॉक।",
     inactive: "नहीं बिका",
     stock: "स्टॉक",
     stockValue: "स्टॉक की कीमत",
@@ -460,15 +462,15 @@ const uiCopy = {
     rows: (count) => `${count}টি এন্ট্রি`,
     reportTable: (report) => `${report} টেবিল`,
     dailyHelper:
-      "প্রতি সেলের তারিখে ট্যাক্সযোগ্য টাকা, GST, জমা ও বাকি এক লাইনে।",
+      "প্রতি বিলের তারিখের সেল। আজ পর্যন্ত জমা ও আজ বাকি ওই বিলগুলোর বর্তমান অবস্থা, সেদিনের ক্যাশ ফ্লো নয়।",
     date: "তারিখ",
     bills: "বিল",
     taxable: "ট্যাক্সযোগ্য",
     gst: "GST",
     sales: "সেল",
-    paid: "জমা",
-    due: "বাকি",
-    partyHelper: "বাছাই করা তারিখে পার্টি অনুযায়ী সেল, বেশি সেল আগে।",
+    paid: "আজ পর্যন্ত জমা",
+    due: "আজ বাকি",
+    partyHelper: "বাছাই করা তারিখে তৈরি বিলের পার্টি অনুযায়ী মোট। জমা ও বাকি আজকের অবস্থা।",
     party: "পার্টি",
     cashCustomer: "ক্যাশ কাস্টমার",
     code: "কোড",
@@ -497,7 +499,7 @@ const uiCopy = {
     oldest: "সবচেয়ে পুরনো",
     days: (count) => `${count} দিন`,
     deadStockHelper:
-      "যে চালু আইটেম অন্তত ছয় মাস বিক্রি হয়নি। অজানা স্টক – দেখাবে, বিলিং আটকাবে না।",
+      "ছয় মাস বিক্রি না-হওয়া জানা স্টক, সঙ্গে গোনা বা মেলানো দরকার এমন অজানা ও ঋণাত্মক স্টক।",
     inactive: "বিক্রি নেই",
     stock: "স্টক",
     stockValue: "স্টকের দাম",
@@ -610,6 +612,9 @@ export default function AdvancedReports({
   parties,
   items,
   accountEntries,
+  fromDate,
+  toDate,
+  onRangeChange,
   language,
   business,
   format,
@@ -617,11 +622,15 @@ export default function AdvancedReports({
   onToast,
   onConverted,
   ownerMode,
+  initialReport = "daily",
 }: {
   invoices: Invoice[];
   parties: Party[];
   items: Item[];
   accountEntries: AccountEntry[];
+  fromDate: string;
+  toDate: string;
+  onRangeChange: (fromDate: string, toDate: string) => void;
   language: Language;
   business: BusinessSettings;
   format: InvoiceFormat;
@@ -629,21 +638,30 @@ export default function AdvancedReports({
   onToast: (message: string) => void;
   onConverted: (invoice: Invoice) => void;
   ownerMode: boolean;
+  initialReport?: ReportKey;
 }) {
   const today = localDate();
-  const [selectedReport, setReport] = useState<ReportKey>("daily");
+  const stockMovements = useLiveQuery(() => db.stockMovements.toArray(), [], []);
+  const [selectedReport, setReport] = useState<ReportKey>(initialReport);
   const report: ReportKey =
     ownerMode || !["profit", "margin"].includes(selectedReport)
       ? selectedReport
       : "daily";
-  const [fromDate, setFromDate] = useState(`${today.slice(0, 7)}-01`);
-  const [toDate, setToDate] = useState(today);
   const [query, setQuery] = useState("");
   const [marginParty, setMarginParty] = useState<string | null>(null);
   const [tier, setTier] = useState<CatalogueTier>("wholesale");
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
   const [converting, setConverting] = useState<string | null>(null);
   const copy = uiCopy[language];
+  useEffect(() => {
+    if (initialReport !== "dead") return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById("dead-stock-report");
+      target?.scrollIntoView({ block: "start" });
+      target?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [initialReport]);
   const formatDate = (value?: string) => dateLabel(value, language);
   const range = useMemo(() => ({ fromDate, toDate }), [fromDate, toDate]);
   const allSales = invoices.filter(
@@ -661,6 +679,10 @@ export default function AdvancedReports({
     () => buildItemProfitReport(invoices, items, range),
     [invoices, items, range],
   );
+  const knownProfitTotal = useMemo(
+    () => itemProfit.reduce((sum, row) => sum + (row.profit || 0), 0),
+    [itemProfit],
+  );
   const aging = useMemo(
     () =>
       buildReceivablesAging({
@@ -672,8 +694,8 @@ export default function AdvancedReports({
     [invoices, parties, accountEntries, today],
   );
   const deadStock = useMemo(
-    () => buildDeadStockReport(invoices, items, today),
-    [invoices, items, today],
+    () => buildDeadStockReport(invoices, items, today, 183, stockMovements),
+    [invoices, items, stockMovements, today],
   );
   const topItems = useMemo(
     () => buildTopRevenueItems(invoices, items, range, 20),
@@ -732,8 +754,7 @@ export default function AdvancedReports({
   const reportName = copy.reports[report];
 
   const resetDates = () => {
-    setFromDate("");
-    setToDate("");
+    onRangeChange("", "");
   };
   const chooseReport = (next: ReportKey) => {
     setReport(next);
@@ -818,10 +839,10 @@ export default function AdvancedReports({
           <div>
             <p className="eyebrow">{copy.eyebrow}</p>
             <h3 className="mt-1 text-xl text-[#014921]">{copy.title}</h3>
-            <p className="mt-1 max-w-2xl text-[10px] font-semibold leading-4 text-[#747573]">
+            <p className="mt-1 max-w-2xl text-[0.625rem] font-semibold leading-4 text-[#747573]">
               {copy.helper}
             </p>
-            <p className="mt-1 max-w-2xl text-[9px] leading-4 text-[#8a5a36]">
+            <p className="mt-1 max-w-2xl text-[0.5625rem] leading-4 text-[#8a5a36]">
               {copy.returnsNotice}
             </p>
           </div>
@@ -833,8 +854,10 @@ export default function AdvancedReports({
                   type="date"
                   value={fromDate}
                   max={toDate || undefined}
-                  onChange={(event) => setFromDate(event.target.value)}
-                  className="min-h-11 rounded-lg border border-[#e2e2db] bg-white px-3 text-[10px] font-black"
+                  onChange={(event) =>
+                    onRangeChange(event.target.value, toDate)
+                  }
+                  className="min-h-11 rounded-lg border border-[#e2e2db] bg-white px-3 text-[0.625rem] font-black"
                 />
               </label>
               <label>
@@ -843,13 +866,15 @@ export default function AdvancedReports({
                   type="date"
                   value={toDate}
                   min={fromDate || undefined}
-                  onChange={(event) => setToDate(event.target.value)}
-                  className="min-h-11 rounded-lg border border-[#e2e2db] bg-white px-3 text-[10px] font-black"
+                  onChange={(event) =>
+                    onRangeChange(fromDate, event.target.value)
+                  }
+                  className="min-h-11 rounded-lg border border-[#e2e2db] bg-white px-3 text-[0.625rem] font-black"
                 />
               </label>
               <button
                 onClick={resetDates}
-                className="min-h-11 rounded-lg border border-[#e2e2db] bg-white px-3 text-[9px] font-black text-[#014921]"
+                className="min-h-11 rounded-lg border border-[#e2e2db] bg-white px-3 text-[0.5625rem] font-black text-[#014921]"
               >
                 {copy.allDates}
               </button>
@@ -874,7 +899,7 @@ export default function AdvancedReports({
                 <span aria-hidden="true" className="text-base">
                   {reportIcons[key]}
                 </span>
-                <span className="text-[10px] font-black">
+                <span className="text-[0.625rem] font-black">
                   {copy.reports[key]}
                 </span>
               </button>
@@ -937,10 +962,10 @@ export default function AdvancedReports({
                       <td className="text-right font-black">
                         {formatMoney(row.revenue)}
                       </td>
-                      <td className="text-right text-[#267055]">
+                      <td className="report-money-in text-right">
                         {formatMoney(row.paid)}
                       </td>
-                      <td className="text-right text-[#b85a28]">
+                      <td className="report-money-due text-right">
                         {formatMoney(row.due)}
                       </td>
                     </tr>
@@ -1005,8 +1030,8 @@ export default function AdvancedReports({
                       <td className="text-right">
                         {formatMoney(row.averageBill)}
                       </td>
-                      <td className="text-right">{formatMoney(row.paid)}</td>
-                      <td className="text-right text-[#b85a28]">
+                      <td className="report-money-in text-right">{formatMoney(row.paid)}</td>
+                      <td className="report-money-due text-right">
                         {formatMoney(row.due)}
                       </td>
                       <td>{formatDate(row.lastSaleDate)}</td>
@@ -1036,12 +1061,12 @@ export default function AdvancedReports({
             countLabel={copy.rows(itemProfit.length)}
           />
           <div className="grid grid-cols-2 gap-3 border-b border-[#e2e2db] p-4 sm:grid-cols-3">
-            <div className="rounded-xl bg-[#f4faf0] p-3">
+            <div className="rounded-xl bg-[#f7f5ef] p-3">
               <span className="field-caption">{copy.knownProfit}</span>
-              <strong className="mt-2 block text-xl text-[#014921]">
-                {formatMoney(
-                  itemProfit.reduce((sum, row) => sum + (row.profit || 0), 0),
-                )}
+              <strong
+                className={`mt-2 block text-xl ${knownProfitTotal >= 0 ? "report-money-in" : "report-money-out"}`}
+              >
+                {formatMoney(knownProfitTotal)}
               </strong>
             </div>
             <div className="rounded-xl bg-[#f7f5ef] p-3">
@@ -1104,14 +1129,22 @@ export default function AdvancedReports({
                       </td>
                       <td className="text-right">
                         {row.cost === null ? (
-                          <span className="rounded-md bg-[#fff3e8] px-2 py-1 text-[8px] font-black text-[#9b4c28]">
+                          <span className="rounded-md bg-[#fff3e8] px-2 py-1 text-[0.5rem] font-black text-[#9b4c28]">
                             {copy.addCost}
                           </span>
                         ) : (
                           formatMoney(row.cost)
                         )}
                       </td>
-                      <td className="text-right font-black text-[#014921]">
+                      <td
+                        className={`text-right font-black ${
+                          row.profit == null
+                            ? ""
+                            : row.profit >= 0
+                              ? "report-money-in"
+                              : "report-money-out"
+                        }`}
+                      >
                         {row.profit === null ? "-" : formatMoney(row.profit)}
                       </td>
                       <td className="text-right">
@@ -1154,18 +1187,18 @@ export default function AdvancedReports({
             ).map(([key, label]) => (
               <div
                 key={key}
-                className={`rounded-xl p-3 ${key === "60+" ? "bg-[#fff0e4]" : "bg-[#f4faf0]"}`}
+                className={`report-aging-card ${key === "60+" ? "report-aging-card--overdue" : ""}`}
               >
                 <span className="field-caption">{label}</span>
                 <strong
-                  className={`mt-2 block text-xl ${key === "60+" ? "text-[#b85a28]" : "text-[#014921]"}`}
+                  className="report-money-due mt-2 block text-xl"
                 >
                   {formatMoney(aging.totals[key])}
                 </strong>
               </div>
             ))}
-            <div className="rounded-xl bg-[#014921] p-3 text-white">
-              <span className="text-[8px] font-black uppercase tracking-wide opacity-75">
+            <div className="report-due-total-card">
+              <span className="text-[0.5rem] font-black uppercase tracking-wide opacity-75">
                 {copy.totalDue}
               </span>
               <strong className="mt-2 block text-xl">
@@ -1208,10 +1241,10 @@ export default function AdvancedReports({
                       <td className="text-right">
                         {formatMoney(row.thirtyToSixty)}
                       </td>
-                      <td className="text-right text-[#b85a28]">
+                      <td className="report-money-due text-right">
                         {formatMoney(row.sixtyPlus)}
                       </td>
-                      <td className="text-right font-black">
+                      <td className="report-money-due text-right font-black">
                         {formatMoney(row.total)}
                       </td>
                       <td className="text-right">{copy.days(row.oldestDays)}</td>
@@ -1227,7 +1260,7 @@ export default function AdvancedReports({
       )}
 
       {report === "dead" && (
-        <div>
+        <div id="dead-stock-report" role="region" aria-label={reportName} tabIndex={-1}>
           <ReportHeader
             title={reportName}
             helper={copy.deadStockHelper}
@@ -1247,6 +1280,7 @@ export default function AdvancedReports({
                   <th>{copy.lastSale}</th>
                   <th className="text-right">{copy.inactive}</th>
                   <th className="text-right">{copy.stock}</th>
+                  <th>{language === "hi" ? "आखिरी स्टॉक बदलाव" : language === "bn" ? "শেষ স্টক পরিবর্তন" : "Last stock movement"}</th>
                   {ownerMode && (
                     <th className="text-right">{copy.stockValue}</th>
                   )}
@@ -1274,7 +1308,7 @@ export default function AdvancedReports({
                         {row.lastSaleDate ? (
                           formatDate(row.lastSaleDate)
                         ) : (
-                          <span className="rounded-md bg-[#fff3e8] px-2 py-1 text-[8px] font-black text-[#9b4c28]">
+                          <span className="rounded-md bg-[#fff3e8] px-2 py-1 text-[0.5rem] font-black text-[#9b4c28]">
                             {copy.neverSold}
                           </span>
                         )}
@@ -1285,8 +1319,13 @@ export default function AdvancedReports({
                           : copy.days(row.daysWithoutSale)}
                       </td>
                       <td className="text-right">
-                        {row.currentStock == null ? "-" : row.currentStock}
+                        {row.stockState === "unknown"
+                          ? language === "hi" ? "अनजान" : language === "bn" ? "অজানা" : "Unknown"
+                          : row.stockState === "negative"
+                            ? `${row.currentStock} · ${language === "hi" ? "मिलान करें" : language === "bn" ? "মেলান" : "Reconcile"}`
+                            : row.currentStock}
                       </td>
+                      <td>{row.lastMovementDate ? <>{formatDate(row.lastMovementDate)}<small className="block">{row.lastMovementReason}{row.recentInward ? ` · ${language === "hi" ? "हाल की आवक" : language === "bn" ? "সাম্প্রতিক ইন" : "recent inward"}` : ""}</small></> : "-"}</td>
                       {ownerMode && (
                         <td className="text-right">
                           {row.stockValue == null
@@ -1306,7 +1345,7 @@ export default function AdvancedReports({
                     query,
                   ),
                 ).length && (
-                  <EmptyRow columns={ownerMode ? 6 : 5} label={copy.noData} />
+                  <EmptyRow columns={ownerMode ? 7 : 6} label={copy.noData} />
                 )}
               </tbody>
             </table>
@@ -1346,13 +1385,13 @@ export default function AdvancedReports({
                       <strong className="block truncate text-xs">
                         {displayItemName(row.itemId, row.itemName)}
                       </strong>
-                      <p className="mt-1 text-[8px] text-[#747573]">
+                      <p className="mt-1 text-[0.5rem] text-[#747573]">
                         {row.skuCode} · {copy.billCount(row.bills)}
                       </p>
                       <strong className="mt-3 block text-lg text-[#014921]">
                         {formatMoney(row.revenue)}
                       </strong>
-                      <p className="mt-1 text-[8px] text-[#747573]">
+                      <p className="mt-1 text-[0.5rem] text-[#747573]">
                         {copy.beforeGst} {formatMoney(row.taxable)}
                       </p>
                     </div>
@@ -1419,12 +1458,12 @@ export default function AdvancedReports({
                           {row.partyName}
                         </strong>
                         {row.codeName && (
-                          <span className="rounded-md bg-[#f4faf0] px-2 py-1 text-[8px] font-black">
+                          <span className="rounded-md bg-[#f4faf0] px-2 py-1 text-[0.5rem] font-black">
                             {row.codeName}
                           </span>
                         )}
                       </div>
-                      <p className="mt-1 text-[9px] text-[#747573]">
+                      <p className="mt-1 text-[0.5625rem] text-[#747573]">
                         {copy.lowRateSummary(
                           row.flaggedItems,
                           row.averageGapPercent.toFixed(1),
@@ -1432,7 +1471,7 @@ export default function AdvancedReports({
                       </p>
                     </div>
                     <div className="shrink-0 text-right">
-                      <span className="text-[8px] font-black uppercase text-[#747573]">
+                      <span className="text-[0.5rem] font-black uppercase text-[#747573]">
                         {copy.possibleGap}
                       </span>
                       <strong className="mt-1 block text-sm text-[#b85a28]">
@@ -1506,7 +1545,7 @@ export default function AdvancedReports({
                 <strong className="text-sm text-[#014921]">
                   {copy.noLowRateFlags}
                 </strong>
-                <p className="mt-2 text-[10px] text-[#747573]">
+                <p className="mt-2 text-[0.625rem] text-[#747573]">
                   {copy.noLowRateHelp}
                 </p>
               </div>
@@ -1536,7 +1575,7 @@ export default function AdvancedReports({
                         type="button"
                         aria-pressed={tier === value}
                         onClick={() => setTier(value)}
-                        className={`min-h-11 rounded-lg border text-[9px] font-black ${tier === value ? "border-[#014921] bg-[#014921] text-white" : "border-[#e2e2db] bg-white"}`}
+                        className={`min-h-11 rounded-lg border text-[0.5625rem] font-black ${tier === value ? "border-[#014921] bg-[#014921] text-white" : "border-[#e2e2db] bg-white"}`}
                       >
                         {copy.tiers[value]}
                       </button>
@@ -1549,7 +1588,7 @@ export default function AdvancedReports({
                 <strong className="mt-2 block text-2xl text-[#014921]">
                   {chosenItems.length}
                 </strong>
-                <p className="mt-1 text-[9px] text-[#747573]">
+                <p className="mt-1 text-[0.5625rem] text-[#747573]">
                   {copy.selectedPrice(copy.tiers[tier])}
                 </p>
               </div>
@@ -1582,7 +1621,7 @@ export default function AdvancedReports({
                 />
               </label>
               <div className="mt-2 flex items-center justify-between">
-                <p className="text-[9px] font-bold text-[#747573]">
+                <p className="text-[0.5625rem] font-bold text-[#747573]">
                   {copy.visibleSelected(
                     catalogueItems.length,
                     chosenItems.length,
@@ -1591,13 +1630,13 @@ export default function AdvancedReports({
                 <div className="flex gap-2">
                   <button
                     onClick={selectVisible}
-                    className="min-h-9 rounded-lg border border-[#e2e2db] bg-white px-3 text-[8px] font-black text-[#014921]"
+                    className="min-h-9 rounded-lg border border-[#e2e2db] bg-white px-3 text-[0.5rem] font-black text-[#014921]"
                   >
                     {copy.selectVisible}
                   </button>
                   <button
                     onClick={() => setSelectedItems(new Set())}
-                    className="min-h-9 rounded-lg border border-[#e2e2db] bg-white px-3 text-[8px] font-black"
+                    className="min-h-9 rounded-lg border border-[#e2e2db] bg-white px-3 text-[0.5rem] font-black"
                   >
                     {copy.clearSelection}
                   </button>
@@ -1625,18 +1664,18 @@ export default function AdvancedReports({
                         style={{ backgroundImage: `url(${item.imageUrl})` }}
                       />
                     ) : (
-                      <span className="grid h-12 w-12 shrink-0 place-items-center rounded-lg bg-[#f4faf0] text-[10px] font-black text-[#014921]">
+                      <span className="grid h-12 w-12 shrink-0 place-items-center rounded-lg bg-[#f4faf0] text-[0.625rem] font-black text-[#014921]">
                         {itemName.slice(0, 2).toLocaleUpperCase()}
                       </span>
                     )}
                     <span className="min-w-0">
-                      <strong className="block truncate text-[11px]">
+                      <strong className="block truncate text-[0.6875rem]">
                         {itemName}
                       </strong>
-                      <span className="mt-1 block truncate text-[8px] text-[#747573]">
+                      <span className="mt-1 block truncate text-[0.5rem] text-[#747573]">
                         {item.skuCode} · {copy.units[item.baseUnit]}
                       </span>
-                      <strong className="mt-1 block text-[10px] text-[#014921]">
+                      <strong className="mt-1 block text-[0.625rem] text-[#014921]">
                         {formatMoney(
                           tier === "retail"
                             ? item.priceRetail
@@ -1692,20 +1731,20 @@ export default function AdvancedReports({
                     <div className="flex items-start justify-between gap-3">
                       <div>
                         <span
-                          className={`rounded-md px-2 py-1 text-[8px] font-black ${converted ? "bg-[#f4faf0] text-[#014921]" : "bg-[#fff3e8] text-[#9b4c28]"}`}
+                          className={`rounded-md px-2 py-1 text-[0.5rem] font-black ${converted ? "bg-[#f4faf0] text-[#014921]" : "bg-[#fff3e8] text-[#9b4c28]"}`}
                         >
                           {converted ? copy.converted : copy.openQuote}
                         </span>
                         <strong className="mt-2 block text-sm text-[#014921]">
                           {quotation.invoiceNumber}
                         </strong>
-                        <p className="mt-1 text-[10px] font-bold">
+                        <p className="mt-1 text-[0.625rem] font-bold">
                           {displayPartyName(
                             quotation.partyName,
                             quotation.partyId,
                           )}
                         </p>
-                        <p className="mt-1 text-[8px] text-[#747573]">
+                        <p className="mt-1 text-[0.5rem] text-[#747573]">
                           {formatDate(quotation.date)} ·{" "}
                           {copy.quoteItems(quotation.lineItems.length)}
                         </p>
@@ -1784,7 +1823,7 @@ export default function AdvancedReports({
             ).length && (
               <div className="col-span-full rounded-xl bg-[#f7f5ef] p-12 text-center">
                 <strong className="text-sm">{copy.noQuotations}</strong>
-                <p className="mt-2 text-[10px] text-[#747573]">
+                <p className="mt-2 text-[0.625rem] text-[#747573]">
                   {copy.noQuotationsHelp}
                 </p>
               </div>

@@ -241,8 +241,9 @@ export async function createCashFlowPdf(
   const contentWidth = width - margin * 2;
   const green: [number, number, number] = [1, 73, 33];
   const primary: [number, number, number] = [0, 78, 35];
-  const deep: [number, number, number] = [0, 64, 20];
   const accent: [number, number, number] = [48, 157, 75];
+  const outRed: [number, number, number] = [180, 35, 24];
+  const dueGold: [number, number, number] = [145, 94, 0];
   const pale: [number, number, number] = [249, 249, 249];
   const ink: [number, number, number] = [33, 31, 29];
   const muted: [number, number, number] = [97, 95, 92];
@@ -299,8 +300,8 @@ export async function createCashFlowPdf(
   const boxWidth = (contentWidth - 6) / 3;
   const cards = [
     { label: copy.moneyIn, value: report.moneyIn, color: accent },
-    { label: copy.moneyOut, value: report.moneyOut, color: deep },
-    { label: copy.netCashFlow, value: report.netCashFlow, color: report.netCashFlow >= 0 ? primary : deep },
+    { label: copy.moneyOut, value: report.moneyOut, color: outRed },
+    { label: copy.netCashFlow, value: report.netCashFlow, color: report.netCashFlow >= 0 ? primary : outRed },
   ];
   cards.forEach((card, index) => {
     const x = margin + index * (boxWidth + 3);
@@ -328,15 +329,15 @@ export async function createCashFlowPdf(
   summaryRow(copy.receivedWithBills, report.receivedWithBills, accent);
   summaryRow(copy.customerPayments, report.customerPayments, accent);
   summaryRow(copy.supplierBills, report.supplierBillsRecorded);
-  summaryRow(copy.paidWithPurchases, report.paidWithPurchases, deep);
-  summaryRow(copy.supplierPayments, report.supplierPayments, deep);
-  summaryRow(copy.miscExpenses, report.miscellaneousExpenses, deep);
+  summaryRow(copy.paidWithPurchases, report.paidWithPurchases, outRed);
+  summaryRow(copy.supplierPayments, report.supplierPayments, outRed);
+  summaryRow(copy.miscExpenses, report.miscellaneousExpenses, outRed);
   y += 2;
   doc.setDrawColor(...border);
   doc.line(margin + 4, y, right - 4, y);
   y += 6;
-  summaryRow(copy.customerOutstanding, report.customerOutstanding);
-  summaryRow(copy.supplierOutstanding, report.supplierOutstanding);
+  summaryRow(copy.customerOutstanding, report.customerOutstanding, dueGold);
+  summaryRow(copy.supplierOutstanding, report.supplierOutstanding, outRed);
   y += 5;
 
   if (report.expenseBreakdown.length) {
@@ -345,7 +346,7 @@ export async function createCashFlowPdf(
     doc.setTextColor(...ink);
     doc.text(copy.miscBreakdown, margin, y);
     y += 6;
-    report.expenseBreakdown.forEach((row) => summaryRow(copy.categories[row.category], row.amount, deep));
+    report.expenseBreakdown.forEach((row) => summaryRow(copy.categories[row.category], row.amount, outRed));
     y += 3;
   }
 
@@ -404,7 +405,7 @@ export async function createCashFlowPdf(
     doc.text(detailLines, margin + 57, y + 5);
     doc.text(pdfPaymentMode(movement.mode, active), right - 40, y + 5, { maxWidth: 30 });
     setPdfFont(doc, "bold");
-    doc.setTextColor(...(movement.direction === "in" ? accent : deep));
+    doc.setTextColor(...(movement.direction === "in" ? accent : outRed));
     doc.text(`${movement.direction === "in" ? "+" : "-"}${money(movement.amount)}`, right - 2, y + 5, { align: "right" });
     y += rowHeight;
   }

@@ -1,7 +1,7 @@
 # Sensitive business-data export status
 
 Generated: **2026-08-10 (Asia/Kolkata)**  
-Source snapshot: base commit `f77e9e8bfd86d5d155cdf9b59bd759d6778c4b42` plus the verified 2026-08-10 feature working tree
+Source snapshot: verified Phase 3 baseline `4133653` plus the completed 2026-08-10 dues-backup and expanded-calendar working tree
 
 ## Important: actual business rows are not in the source archive
 
@@ -26,6 +26,7 @@ owner settings. Keep them encrypted and separate from a public source archive.
 
 Supabase currently mirrors only these IndexedDB stores:
 
+- `categories`
 - `parties`
 - `items`
 - `partyItemPrices`
@@ -33,13 +34,15 @@ Supabase currently mirrors only these IndexedDB stores:
 - `payments`
 - `accountEntries`
 - `expenses`
+- `countSessions`
+- `countLines`
+- `stockMovements`
 
 These stores remain device-local in this source snapshot and are not included
 in the Supabase sync layer:
 
-- `categories`
-- `stockMovements`
-- `countSessions`
+- `festivalEntries`
+- `festivalTasks`
 - `activityLogs`
 - `dailyCloses`
 - `meta` (drafts, preferences, shop settings, PIN verifier and other device state)

@@ -1,5 +1,9 @@
 import "fake-indexeddb/auto";
 import "./pdf-i18n.test";
+import "./festival-planning.test";
+import "./due-backup.test";
+import "./dues-ledger-archive.test";
+import "./master-backup.test";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -48,6 +52,11 @@ import {
 } from "../lib/cashflow";
 import { cashFlowText, createCashFlowPdf } from "../lib/report-export";
 import {
+  buildDashboardTrendBuckets,
+  buildSalesSettlementReport,
+  dashboardPeriodRange,
+} from "../lib/report-dashboard";
+import {
   createDueStatementPdf,
   dueStatementText,
   partyStatementLabel,
@@ -89,6 +98,19 @@ import {
   buildReceivablesAging,
   buildTopRevenueItems,
 } from "../lib/reports";
+import {
+  buildInventoryValuation,
+  commitCountSession,
+  lowStockItems,
+  reconcileInventoryStock,
+  recordInventoryReturn,
+  recordStockInward,
+  recordStockOutward,
+  reviewCountSession,
+  saveCountedStock,
+  setStockAbsolute,
+  startCountSession,
+} from "../lib/inventory";
 import { cataloguePdf, cataloguePrice } from "../lib/catalogue-pdf";
 import {
   canonicalizeMessageTemplates,
@@ -96,6 +118,7 @@ import {
   dailyCashSummary,
   defaultMessageTemplates,
   loadBillDraft,
+  isRestorableArchivedItem,
   localizedDefaultMessageTemplates,
   messageTemplatesForLanguage,
   mergeItems,
@@ -104,6 +127,7 @@ import {
   ownerPinConfigured,
   pbkdf2Sha256Fallback,
   quantityPresets,
+  restoreArchivedItem,
   saveBillDraft,
   saveDailyClose,
   setOwnerPin,
@@ -206,6 +230,8 @@ function memorySupabase() {
     } as unknown as Parameters<typeof syncWithClient>[0],
     rows: (name: string) =>
       [...table(name).values()].map((row) => structuredClone(row)),
+    setRow: (name: string, row: Record<string, unknown>) =>
+      table(name).set(String(row.id), structuredClone(row)),
   };
 }
 
@@ -1356,7 +1382,7 @@ test("customer due statement lists every in/out event, reconciles totals and exp
   assert.match(text, /INV-STMT-1/);
   assert.match(text, /CASH-2000/);
   assert.match(text, /AMOUNT TO PAY NEXT \/ TOTAL REMAINING\tRs\. 4,000\.00/);
-  assert.match(text, /TOTAL\t\t\tRs\. 11,000\.00\tRs\. 7,000\.00\tRs\. 4,000\.00/);
+  assert.match(text, /TOTAL\t\t\t\tRs\. 11,000\.00\tRs\. 7,000\.00\tRs\. 4,000\.00/);
   const pdf = await createDueStatementPdf(statement, business);
   assert.ok(pdf.getNumberOfPages() >= 1);
   assert.ok(pdf.output("arraybuffer").byteLength > 4000);
@@ -1461,6 +1487,20 @@ test("miscellaneous expenses and cash-flow reports count real money once and exp
     },
   );
   assert.equal(report.movements.length, 4);
+  assert.equal(
+    report.movements.find((movement) => movement.source === "sale")?.invoiceId,
+    invoice.id,
+  );
+  assert.equal(
+    report.movements.find((movement) => movement.source === "customer_payment")
+      ?.paymentId,
+    laterCustomerPayment.id,
+  );
+  assert.equal(
+    report.movements.find((movement) => movement.source === "misc_expense")
+      ?.expenseId,
+    expense.id,
+  );
   assert.equal(report.customerOutstanding, 48);
   assert.equal(report.supplierOutstanding, 80);
   assert.match(
@@ -1479,6 +1519,14 @@ test("miscellaneous expenses and cash-flow reports count real money once and exp
     gstin: "",
   });
   assert.ok(pdf.output("arraybuffer").byteLength > 3000);
+  const pdfOperators = (
+    pdf.internal.pages as unknown as Array<Array<string | number>>
+  )
+    .flat()
+    .join("\n");
+  assert.match(pdfOperators, /0\.188 0\.616 0\.294 rg/);
+  assert.match(pdfOperators, /0\.706 0\.137 0\.094 rg/);
+  assert.match(pdfOperators, /0\.569 0\.369 0\. rg/);
 
   await removeExpense(expense.id);
   const withoutExpense = buildCashFlowReport({
@@ -1507,6 +1555,185 @@ test("miscellaneous expenses and cash-flow reports count real money once and exp
     { in: 0, out: 0, movements: 0 },
   );
   await db.delete();
+});
+
+test("report settlement reconciles split tenders, later payments and due", () => {
+  const timestamp = "2026-08-10T10:00:00.000Z";
+  const sale: Invoice = {
+    id: "report-sale",
+    invoiceNumber: "MK-R-1",
+    partyId: "report-customer",
+    partyName: "Report Customer",
+    date: "2026-08-10",
+    type: "sale",
+    lineItems: [],
+    subtotal: 1000,
+    discountTotal: 0,
+    gstTotal: 0,
+    roundOff: 0,
+    grandTotal: 1000,
+    initialAmountPaid: 600,
+    amountPaid: 800,
+    amountDue: 200,
+    paymentMode: "mixed",
+    paymentBreakdown: [
+      { mode: "cash", amount: 250 },
+      { mode: "upi", amount: 200, reference: "UPI-R-1" },
+      { mode: "cheque", amount: 150, reference: "CHQ-R-1" },
+    ],
+    notes: "",
+    isSynced: false,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const later: Payment = {
+    id: "report-payment",
+    partyId: "report-customer",
+    amount: 200,
+    date: "2026-08-10",
+    mode: "bank",
+    reference: "BANK-R-1",
+    allocatedTo: [{ invoiceId: sale.id, amount: 200 }],
+    isSynced: false,
+    createdAt: "2026-08-10T11:00:00.000Z",
+    updatedAt: "2026-08-10T11:00:00.000Z",
+  };
+  const wrongParty: Payment = {
+    ...later,
+    id: "wrong-party-payment",
+    partyId: "another-customer",
+    amount: 500,
+    allocatedTo: [{ invoiceId: sale.id, amount: 500 }],
+  };
+  const report = buildSalesSettlementReport([sale], [later, wrongParty]);
+  assert.deepEqual(report, {
+    totalSales: 1000,
+    collected: 800,
+    due: 200,
+    collectionPercent: 80,
+    modes: [
+      { mode: "cash", amount: 250 },
+      { mode: "upi", amount: 200 },
+      { mode: "bank", amount: 200 },
+      { mode: "cheque", amount: 150 },
+    ],
+  });
+  assert.equal(
+    roundMoney(report.collected + report.due),
+    report.totalSales,
+  );
+  const overAllocated = buildSalesSettlementReport(
+    [sale],
+    [
+      later,
+      {
+        ...later,
+        id: "extra-payment",
+        amount: 500,
+        allocatedTo: [{ invoiceId: sale.id, amount: 500 }],
+      },
+    ],
+  );
+  assert.equal(overAllocated.collected, 1000);
+  assert.equal(overAllocated.due, 0);
+  assert.equal(overAllocated.collectionPercent, 100);
+  const beforeFuturePayment = buildSalesSettlementReport(
+    [sale],
+    [{ ...later, id: "future-payment", date: "2026-08-11" }],
+    "2026-08-10",
+  );
+  assert.equal(beforeFuturePayment.collected, 600);
+  assert.equal(beforeFuturePayment.due, 400);
+  const legacySale = {
+    ...sale,
+    id: "legacy-report-sale",
+    initialAmountPaid: undefined,
+  };
+  const legacyBeforeFuturePayment = buildSalesSettlementReport(
+    [legacySale],
+    [
+      {
+        ...later,
+        id: "legacy-future-payment",
+        date: "2026-08-11",
+        allocatedTo: [{ invoiceId: legacySale.id, amount: 200 }],
+      },
+    ],
+    "2026-08-10",
+  );
+  assert.equal(legacyBeforeFuturePayment.collected, 600);
+  assert.equal(legacyBeforeFuturePayment.due, 400);
+  const corruptInitial = buildSalesSettlementReport(
+    [
+      {
+        ...sale,
+        id: "corrupt-initial-sale",
+        initialAmountPaid: 1200,
+        amountPaid: 1200,
+        amountDue: 0,
+        paymentBreakdown: [
+          { mode: "cash", amount: 700 },
+          { mode: "upi", amount: 500 },
+        ],
+      },
+    ],
+    [],
+  );
+  assert.deepEqual(corruptInitial, {
+    totalSales: 1000,
+    collected: 1000,
+    due: 0,
+    collectionPercent: 100,
+    modes: [
+      { mode: "cash", amount: 700 },
+      { mode: "upi", amount: 300 },
+    ],
+  });
+  const historicalBuckets = buildDashboardTrendBuckets(
+    [
+      { ...sale, id: "july-first", date: "2026-07-01", grandTotal: 100 },
+      { ...sale, id: "july-last", date: "2026-07-07", grandTotal: 700 },
+    ],
+    "2026-07-01",
+    "2026-07-07",
+    "2026-08-10",
+  );
+  assert.equal(historicalBuckets.length, 7);
+  assert.deepEqual(
+    historicalBuckets.map((bucket) => [bucket.labelDate, bucket.value]),
+    [
+      ["2026-07-01", 100],
+      ["2026-07-02", 0],
+      ["2026-07-03", 0],
+      ["2026-07-04", 0],
+      ["2026-07-05", 0],
+      ["2026-07-06", 0],
+      ["2026-07-07", 700],
+    ],
+  );
+  assert.equal(
+    buildDashboardTrendBuckets(
+      [{ ...sale, date: "2026-08-10" }],
+      "2026-08-10",
+      "2026-08-10",
+      "2026-08-10",
+    ).length,
+    1,
+  );
+  assert.deepEqual(
+    buildSalesSettlementReport(
+      [
+        { ...sale, id: "deleted-sale", deletedAt: timestamp },
+        { ...sale, id: "quote", type: "quotation" },
+      ],
+      [],
+    ),
+    { totalSales: 0, collected: 0, due: 0, collectionPercent: 0, modes: [] },
+  );
+  assert.deepEqual(dashboardPeriodRange("30d", "2026-08-10"), {
+    fromDate: "2026-07-12",
+    toDate: "2026-08-10",
+  });
 });
 
 test("Phase 1 billing core works offline without duplicate bills", async () => {
@@ -2147,8 +2374,9 @@ test("advanced reports calculate daily, party, profit, aging, dead stock, top re
     buildDeadStockReport(invoices, items, "2026-08-08").map(
       (row) => row.itemId,
     ),
-    ["item-never"],
+    ["item-never", "item-2", "item-1"],
   );
+  assert.ok(buildDeadStockReport(invoices, items, "2026-08-08").every((row) => row.stockState === "unknown"));
   const unknownCostStock = {
     ...item("item-unknown-cost", "Unknown Cost Stock", 0),
     currentStock: 12,
@@ -2369,6 +2597,38 @@ test("automatic bill drafts restore every counter field and tolerate cleanup", a
   assert.equal(restored?.splitPayment, true);
   assert.equal(restored?.paymentBreakdown?.[1].reference, "UPI-DRAFT");
   assert.equal(restored?.otherCharges[0].amount, 25);
+
+  await db.meta.put({
+    key: "bill-draft-v1",
+    value: JSON.stringify({
+      version: 1,
+      draftId: "stale-split-draft",
+      savedAt: "2026-08-10T12:00:00.000Z",
+      lines: [line],
+      paid: 999,
+      paymentMode: "wire",
+      splitPayment: true,
+      paymentBreakdown: [
+        { mode: "cash", amount: 33.333 },
+        { mode: "upi", amount: 66.667, reference: "  UPI-RESTORED  " },
+        { mode: "upi", amount: 1 },
+        { mode: "crypto", amount: 25 },
+        null,
+      ],
+      paymentPlan: "full",
+      documentType: "sale",
+      gstEnabled: true,
+      gstRate: 18,
+      otherCharges: [],
+    }),
+  });
+  const repaired = await loadBillDraft();
+  assert.equal(repaired?.paymentMode, "cash");
+  assert.equal(repaired?.paid, 100);
+  assert.deepEqual(repaired?.paymentBreakdown, [
+    { mode: "cash", amount: 33.33 },
+    { mode: "upi", amount: 66.67, reference: "UPI-RESTORED" },
+  ]);
   await clearBillDraft();
   assert.equal(await loadBillDraft(), null);
   await db.delete();
@@ -2393,6 +2653,302 @@ function sampleInvoiceLine(): InvoiceLine {
   };
 }
 
+test("ordinary sales deduct known stock, allow negatives, and never block unknown stock", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const item = (await db.items.get(sampleItems[0].id))!;
+  await db.items.update(item.id, { currentStock: 0, updatedAt: new Date().toISOString(), isSynced: false });
+  const knownLines = [{ ...sampleInvoiceLine(), qty: 2 }];
+  const knownSale = await saveSale({
+    lines: knownLines,
+    paid: calculateBill(knownLines, 0).grandTotal,
+    paymentMode: "cash",
+  });
+  assert.equal((await db.items.get(item.id))?.currentStock, -2);
+  const knownMovement = await db.stockMovements.get(`sale:${knownSale.id}:0`);
+  assert.equal(knownMovement?.applied, true);
+  assert.equal(knownMovement?.qtyChange, -2);
+
+  await db.items.update(item.id, { currentStock: null, updatedAt: new Date().toISOString(), isSynced: false });
+  const unknownLines = [sampleInvoiceLine()];
+  const unknownSale = await saveSale({
+    lines: unknownLines,
+    paid: calculateBill(unknownLines, 0).grandTotal,
+    paymentMode: "cash",
+  });
+  assert.equal((await db.items.get(item.id))?.currentStock, null);
+  const unknownMovement = await db.stockMovements.get(`sale:${unknownSale.id}:0`);
+  assert.equal(unknownMovement?.applied, false);
+  assert.equal(unknownMovement?.stockAfter, null);
+  await db.delete();
+});
+
+test("unknown inward stays unknown until an Owner starts from zero", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const item = (await db.items.get(sampleItems[0].id))!;
+  await db.items.update(item.id, { currentStock: null, updatedAt: new Date().toISOString(), isSynced: false });
+  const logged = await recordStockInward({ itemId: item.id, quantity: 3, unit: item.baseUnit });
+  assert.equal(logged.applied, false);
+  assert.equal((await db.items.get(item.id))?.currentStock, null);
+  await assert.rejects(
+    recordStockInward({ itemId: item.id, quantity: 3, unit: item.baseUnit, startFromZero: true, actor: "staff" }),
+    /Owner unlock/,
+  );
+  const initialized = await recordStockInward({ itemId: item.id, quantity: 3, unit: item.baseUnit, startFromZero: true, actor: "owner" });
+  assert.equal(initialized.stockBefore, 0);
+  assert.equal(initialized.stockAfter, 3);
+  assert.equal((await db.items.get(item.id))?.currentStock, 3);
+  await db.delete();
+});
+
+test("manual inventory commands follow merged aliases and are idempotent", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const source = (await db.items.get("i-mm12-red"))!;
+  const target = (await db.items.get("i-mm12-gold"))!;
+  await db.items.update(source.id, { currentStock: 4, updatedAt: new Date().toISOString(), isSynced: false });
+  await db.items.update(target.id, { currentStock: 6, updatedAt: new Date().toISOString(), isSynced: false });
+  await mergeItems(source.id, target.id);
+
+  await recordStockInward({ operationId: "alias-inward", itemId: source.id, quantity: 1, unit: source.baseUnit });
+  await recordStockInward({ operationId: "alias-inward", itemId: source.id, quantity: 1, unit: source.baseUnit });
+  assert.equal((await db.items.get(target.id))?.currentStock, 11);
+
+  await recordStockOutward({ operationId: "alias-outward", itemId: source.id, quantity: 1, unit: source.baseUnit, reason: "damage" });
+  await recordStockOutward({ operationId: "alias-outward", itemId: source.id, quantity: 1, unit: source.baseUnit, reason: "damage" });
+  assert.equal((await db.items.get(target.id))?.currentStock, 10);
+
+  await setStockAbsolute({ operationId: "alias-adjust", itemId: source.id, actualStock: 7, reason: "Verified count", actor: "owner" });
+  await setStockAbsolute({ operationId: "alias-adjust", itemId: source.id, actualStock: 7, reason: "Verified count", actor: "owner" });
+  assert.equal((await db.items.get(source.id))?.currentStock, 4);
+  assert.equal((await db.items.get(target.id))?.currentStock, 7);
+  assert.equal(await db.stockMovements.where("id").anyOf("alias-inward", "alias-outward", "alias-adjust").count(), 3);
+  await reconcileInventoryStock();
+  assert.equal((await db.items.get(target.id))?.currentStock, 7);
+  await db.delete();
+});
+
+test("returns apply outstanding balance first and settle excess immediately without negative balances", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const customer = await createParty({ name: "Return Buyer", type: "customer", openingBalance: 100 });
+  const item = (await db.items.get(sampleItems[0].id))!;
+  await db.items.update(item.id, { currentStock: 5, updatedAt: new Date().toISOString(), isSynced: false });
+  const returned = await recordInventoryReturn({
+    type: "sale_return",
+    partyId: customer.id,
+    lines: [{ itemId: item.id, qty: 1, unit: item.baseUnit, rate: 200, gstRate: 0 }],
+    settlementMode: "cash",
+    idempotencyKey: "return-excess-test",
+  });
+  assert.deepEqual(returned.returnDetails, {
+    allocations: [],
+    balanceApplied: 100,
+    settlementAmount: 100,
+  });
+  assert.equal(returned.initialAmountPaid, 100);
+  assert.equal(returned.amountPaid, 100);
+  assert.equal(returned.amountDue, 0);
+  assert.equal((await db.parties.get(customer.id))?.currentBalance, 0);
+  assert.equal((await db.items.get(item.id))?.currentStock, 6);
+  assert.equal((await db.payments.where("partyId").equals(customer.id).count()), 0);
+  const retried = await recordInventoryReturn({
+    type: "sale_return",
+    partyId: customer.id,
+    lines: [{ itemId: item.id, qty: 1, unit: item.baseUnit, rate: 200, gstRate: 0 }],
+    idempotencyKey: "return-excess-test",
+  });
+  assert.equal(retried.id, returned.id);
+  assert.equal((await db.stockMovements.where("refInvoiceId").equals(returned.id).count()), 1);
+  await reconcilePartyBalances();
+  assert.equal((await db.parties.get(customer.id))?.currentBalance, 0);
+  await db.delete();
+});
+
+test("inventory operations replay chronologically and preserve backdated entries", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const item = (await db.items.get(sampleItems[0].id))!;
+  await setStockAbsolute({ itemId: item.id, actualStock: 10, reason: "Opening count", actor: "owner" });
+  await recordStockInward({ itemId: item.id, quantity: 2, unit: item.baseUnit, date: "2025-01-01" });
+  await recordStockOutward({ itemId: item.id, quantity: 1, unit: item.baseUnit, reason: "damage", date: "2025-01-02" });
+  assert.equal((await db.items.get(item.id))?.currentStock, 11);
+  await reconcileInventoryStock();
+  assert.equal((await db.items.get(item.id))?.currentStock, 11);
+  await db.delete();
+});
+
+test("repeated sale delete and restore cycles create fresh compensating stock movements", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const item = (await db.items.get(sampleItems[0].id))!;
+  const customer = await createParty({ name: "Lifecycle Buyer", type: "customer" });
+  await db.items.update(item.id, { currentStock: 10, updatedAt: new Date().toISOString(), isSynced: false });
+  const invoice = await saveSale({ party: customer, lines: [sampleInvoiceLine()], paid: 0, paymentMode: "credit" });
+  assert.equal((await db.items.get(item.id))?.currentStock, 9);
+  await softDeleteInvoice(invoice.id);
+  assert.equal((await db.items.get(item.id))?.currentStock, 10);
+  await restoreInvoice(invoice.id);
+  assert.equal((await db.items.get(item.id))?.currentStock, 9);
+  await softDeleteInvoice(invoice.id);
+  assert.equal((await db.items.get(item.id))?.currentStock, 10);
+  await restoreInvoice(invoice.id);
+  assert.equal((await db.items.get(item.id))?.currentStock, 9);
+  const lifecycle = await db.stockMovements.where("refInvoiceId").equals(invoice.id).toArray();
+  assert.equal(lifecycle.filter((movement) => movement.kind === "sale_void").length, 2);
+  assert.equal(lifecycle.filter((movement) => movement.kind === "sale_restore").length, 2);
+  await db.delete();
+});
+
+test("physical counts pause, resume, review without writes, and commit zero atomically", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const category = sampleCategories.find((entry) => entry.id === sampleItems[0].categoryId)!;
+  const session = await startCountSession(category.id);
+  const resumed = await startCountSession(category.id);
+  assert.equal(resumed.id, session.id);
+  const lines = await db.countLines.where("sessionId").equals(session.id).toArray();
+  for (const line of lines) await saveCountedStock(session.id, line.itemId, 0);
+  const beforeReview = await db.items.bulkGet(lines.map((line) => line.itemId));
+  const reviewed = await reviewCountSession(session.id);
+  assert.equal(reviewed.counted, reviewed.total);
+  assert.deepEqual(await db.items.bulkGet(lines.map((line) => line.itemId)), beforeReview);
+  await commitCountSession(session.id, reviewed.rows.map((row) => ({ itemId: row.line.itemId, systemStock: row.systemStock })), "owner");
+  assert.equal((await db.countSessions.get(session.id))?.status, "completed");
+  for (const line of lines) assert.equal((await db.items.get(line.itemId))?.currentStock, 0);
+  const movementCount = await db.stockMovements.where("countSessionId").equals(session.id).count();
+  await commitCountSession(session.id, reviewed.rows.map((row) => ({ itemId: row.line.itemId, systemStock: row.systemStock })), "owner");
+  assert.equal(await db.stockMovements.where("countSessionId").equals(session.id).count(), movementCount);
+  await db.delete();
+});
+
+test("low-stock alerts are opt-in and valuation flags missing cost and unknown stock", () => {
+  const base = sampleItems[0];
+  const rows: Item[] = [
+    { ...base, id: "known-low", currentStock: 2, lowStockAlert: 3, purchasePrice: 10 },
+    { ...base, id: "known-off", currentStock: 0, lowStockAlert: null, purchasePrice: 0 },
+    { ...base, id: "unknown-alert", currentStock: null, lowStockAlert: 3, purchasePrice: 10 },
+    { ...base, id: "missing-cost", currentStock: 4, lowStockAlert: null, purchasePrice: 0 },
+  ];
+  assert.deepEqual(lowStockItems(rows).map((item) => item.id), ["known-low"]);
+  const valuation = buildInventoryValuation(rows);
+  assert.equal(valuation.unknownStockCount, 1);
+  assert.equal(valuation.missingCostCount, 2);
+  assert.equal(valuation.totalValue, 20);
+});
+
+test("inventory audit tables and return settlement survive a full cloud round trip with null and zero intact", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const cloud = memorySupabase();
+  const item = (await db.items.get(sampleItems[0].id))!;
+  await db.items.update(item.id, { currentStock: null, updatedAt: new Date().toISOString(), isSynced: false });
+  await recordStockInward({ itemId: item.id, quantity: 3, unit: item.baseUnit, startFromZero: true, actor: "owner" });
+  const category = (await db.categories.get(item.categoryId))!;
+  const session = await startCountSession(category.id);
+  const firstLine = (await db.countLines.where("sessionId").equals(session.id).first())!;
+  await saveCountedStock(session.id, firstLine.itemId, 0);
+  const customer = await createParty({ name: "Cloud Return Buyer", type: "customer", openingBalance: 10 });
+  const returned = await recordInventoryReturn({
+    type: "sale_return",
+    partyId: customer.id,
+    lines: [{ itemId: item.id, qty: 1, unit: item.baseUnit, rate: 20, gstRate: 0 }],
+    idempotencyKey: "cloud-return-test",
+  });
+
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  assert.equal((await pendingCount()), 0);
+  assert.ok(cloud.rows("categories").length >= 1);
+  assert.ok(cloud.rows("stock_movements").length >= 2);
+  assert.equal(cloud.rows("count_sessions").length, 1);
+  assert.equal(cloud.rows("count_session_lines").find((row) => row.id === firstLine.id)?.counted_stock, 0);
+  assert.deepEqual(cloud.rows("invoices").find((row) => row.id === returned.id)?.return_details, returned.returnDetails);
+  for (const table of ["categories", "stock_movements", "count_sessions", "count_session_lines"]) {
+    for (const row of cloud.rows(table)) {
+      assert.equal(row.business_id, "7bdebe348faeda556a3005c310de23f8744f21cd7a0b3c9d8a745ef85695219a");
+      assert.notEqual(row.business_id, "test-business-sync-code-1234567890");
+    }
+  }
+
+  await db.transaction("rw", [db.stockMovements, db.countLines, db.countSessions, db.partyItemPrices, db.payments, db.accountEntries, db.expenses, db.invoices, db.items, db.parties, db.categories], async () => {
+    await db.stockMovements.clear();
+    await db.countLines.clear();
+    await db.countSessions.clear();
+    await db.partyItemPrices.clear();
+    await db.payments.clear();
+    await db.accountEntries.clear();
+    await db.expenses.clear();
+    await db.invoices.clear();
+    await db.items.clear();
+    await db.parties.clear();
+    await db.categories.clear();
+  });
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  assert.equal((await db.countLines.get(firstLine.id))?.countedStock, 0);
+  assert.equal((await db.items.get(item.id))?.currentStock, 4);
+  assert.deepEqual((await db.invoices.get(returned.id))?.returnDetails, returned.returnDetails);
+  assert.equal((await db.parties.get(customer.id))?.currentBalance, 0);
+  await db.delete();
+});
+
+test("same-stock Phase 2 baselines converge across replica-local upgrade clocks", async () => {
+  await db.delete();
+  await db.open();
+  await seedIfNeeded();
+  const cloud = memorySupabase();
+  const item = (await db.items.get(sampleItems[0].id))!;
+  const localCreatedAt = "2026-08-10T08:00:00.001Z";
+  await db.items.update(item.id, { currentStock: 9, updatedAt: localCreatedAt, isSynced: false });
+  await db.stockMovements.put({
+    id: `baseline:${item.id}`,
+    itemId: item.id,
+    kind: "baseline",
+    reason: "phase2_baseline",
+    note: "Opening tracked stock at Phase 2 upgrade",
+    qtyChange: null,
+    stockBefore: null,
+    stockAfter: 9,
+    applied: true,
+    date: "2026-08-10",
+    actor: "owner",
+    createdAt: localCreatedAt,
+    updatedAt: localCreatedAt,
+    isSynced: false,
+  });
+  assert.equal(await syncWithClient(cloud.client), "synced");
+
+  const remote = cloud.rows("stock_movements").find((row) => row.id === `baseline:${item.id}`)!;
+  const remoteCreatedAt = "2026-08-09T22:30:00.001Z";
+  cloud.setRow("stock_movements", {
+    ...remote,
+    date: "2026-08-09",
+    created_at: remoteCreatedAt,
+    updated_at: remoteCreatedAt,
+  });
+  await db.stockMovements.update(`baseline:${item.id}`, {
+    date: "2026-08-10",
+    createdAt: localCreatedAt,
+    updatedAt: localCreatedAt,
+    isSynced: false,
+  });
+
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  const converged = await db.stockMovements.get(`baseline:${item.id}`);
+  assert.equal(converged?.createdAt, remoteCreatedAt);
+  assert.equal(converged?.stockAfter, 9);
+  assert.equal(converged?.isSynced, true);
+  await db.delete();
+});
+
 test("ordinary customers can stay code-less while entered trade codes remain unique", async () => {
   await db.delete();
   await db.open();
@@ -2412,6 +2968,118 @@ test("ordinary customers can stay code-less while entered trade codes remain uni
   );
   assert.equal(await db.parties.count(), 3);
   await db.delete();
+});
+
+test("a full bill can be paid half cash and half UPI at checkout with no due", async (t) => {
+  await db.delete();
+  await db.open();
+  t.after(async () => { await db.delete(); });
+  await seedIfNeeded();
+  const customer = await createParty({
+    name: "Half Cash Half Online Buyer",
+    type: "customer",
+  });
+  const line = { ...sampleInvoiceLine(), rate: 1000, gstRate: 0 };
+  const total = calculateBill([line], 0).grandTotal;
+  const cashAmount = roundMoney(total / 2);
+  const upiAmount = roundMoney(total - cashAmount);
+  const invoice = await saveSale({
+    party: customer,
+    lines: [line],
+    paid: total,
+    paymentMode: "mixed",
+    paymentPlan: "full",
+    paymentBreakdown: [
+      { mode: "cash", amount: cashAmount },
+      { mode: "upi", amount: upiAmount, reference: "UPI-HALF-1000" },
+    ],
+    idempotencyKey: "full-cash-upi-split",
+  });
+  const storedCustomer = await db.parties.get(customer.id);
+  assert.ok(storedCustomer);
+  assert.equal(invoice.grandTotal, 1000);
+  assert.equal(invoice.initialAmountPaid, 1000);
+  assert.equal(invoice.amountPaid, 1000);
+  assert.equal(invoice.amountDue, 0);
+  assert.equal(invoice.paymentMode, "mixed");
+  assert.equal(invoice.paymentReceivedMode, undefined);
+  assert.deepEqual(invoice.paymentBreakdown, [
+    { mode: "cash", amount: 500 },
+    { mode: "upi", amount: 500, reference: "UPI-HALF-1000" },
+  ]);
+  assert.equal(storedCustomer.currentBalance, 0);
+
+  const statement = partyDueStatement(storedCustomer, [invoice], [], []);
+  assert.deepEqual(
+    statement.rows
+      .filter((row) => row.kind === "payment")
+      .map((row) => [row.paymentMode, row.paymentReceived, row.runningBalance]),
+    [
+      ["cash", 500, 500],
+      ["upi", 500, 0],
+    ],
+  );
+  assert.equal(statement.totalPaid, 1000);
+  assert.equal(statement.remainingDue, 0);
+
+  const closing = dailyCashSummary(
+    invoice.date,
+    [invoice],
+    [],
+    [],
+    0,
+    [storedCustomer],
+  );
+  assert.equal(closing.invoiceCash, 500);
+  assert.equal(closing.upiIn, 500);
+  const cashFlow = buildCashFlowReport({
+    invoices: [invoice],
+    payments: [],
+    parties: [storedCustomer],
+    accountEntries: [],
+    expenses: [],
+  });
+  assert.deepEqual(
+    Object.fromEntries(
+      cashFlow.movements.map((movement) => [movement.mode, movement.amount]),
+    ),
+    { cash: 500, upi: 500 },
+  );
+
+  const cloud = memorySupabase();
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  const remoteInvoice = cloud
+    .rows("invoices")
+    .find((row) => row.id === invoice.id);
+  assert.deepEqual(remoteInvoice?.payment_breakdown, [
+    { mode: "cash", amount: 500 },
+    { mode: "upi", amount: 500, reference: "UPI-HALF-1000" },
+  ]);
+  await db.invoices.delete(invoice.id);
+  assert.equal(await db.invoices.get(invoice.id), undefined);
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  assert.deepEqual((await db.invoices.get(invoice.id))?.paymentBreakdown, [
+    { mode: "cash", amount: 500 },
+    { mode: "upi", amount: 500, reference: "UPI-HALF-1000" },
+  ]);
+
+  await assert.rejects(
+    () => saveSale({
+      party: storedCustomer,
+      lines: [line],
+      paid: total,
+      paymentMode: "mixed",
+      paymentPlan: "full",
+      paymentBreakdown: [
+        { mode: "cash", amount: cashAmount },
+        { mode: "upi", amount: upiAmount + 0.01 },
+      ],
+      idempotencyKey: "invalid-overallocated-split",
+    }),
+    /add up/,
+  );
+  assert.equal(await db.invoices.count(), 1);
+  assert.equal((await db.parties.get(customer.id))?.currentBalance, 0);
 });
 
 test("a typed billing customer and four-way split payment save atomically", async (t) => {
@@ -2580,6 +3248,92 @@ test("workspace validation, quantity presets and variant families migrate safely
   assert.ok(quantityPresets("dozen").includes(12));
   const item = { ...sampleItems[0], festivalTags: withVariantFamily([], "Moti Mala 12 inch") };
   assert.equal(variantFamily(item), "Moti Mala 12 inch");
+});
+
+test("standalone archived products restore offline without reviving merged aliases", async () => {
+  await db.delete();
+  await db.open();
+  const archived: Item = {
+    ...sampleItems[0],
+    id: "restore-product-source",
+    skuCode: "RESTORE-ONE",
+    currentStock: 17,
+    imageUrl: "data:image/png;base64,restored-photo",
+    festivalTags: ["diwali", "family:Restore family"],
+    saleCount: 6,
+    lastSoldDate: "2026-08-01",
+    isActive: false,
+    updatedAt: "2026-08-09T10:00:00.000Z",
+    isSynced: true,
+  };
+  await db.items.put(archived);
+  assert.equal(isRestorableArchivedItem(archived), true);
+  assert.equal(
+    await db.items.filter((item) => item.id === archived.id && item.isActive).count(),
+    0,
+  );
+
+  const restored = await restoreArchivedItem(archived.id, "staff");
+  assert.equal(restored.isActive, true);
+  assert.equal(restored.isSynced, false);
+  assert.notEqual(restored.updatedAt, archived.updatedAt);
+  assert.equal(
+    await db.items.filter((item) => item.id === archived.id && item.isActive).count(),
+    1,
+  );
+  assert.deepEqual(
+    {
+      name: restored.name,
+      skuCode: restored.skuCode,
+      currentStock: restored.currentStock,
+      imageUrl: restored.imageUrl,
+      festivalTags: restored.festivalTags,
+      saleCount: restored.saleCount,
+      lastSoldDate: restored.lastSoldDate,
+      createdAt: restored.createdAt,
+    },
+    {
+      name: archived.name,
+      skuCode: archived.skuCode,
+      currentStock: archived.currentStock,
+      imageUrl: archived.imageUrl,
+      festivalTags: archived.festivalTags,
+      saleCount: archived.saleCount,
+      lastSoldDate: archived.lastSoldDate,
+      createdAt: archived.createdAt,
+    },
+  );
+  const firstRestoreStamp = restored.updatedAt;
+  const second = await restoreArchivedItem(archived.id, "owner");
+  assert.equal(second.updatedAt, firstRestoreStamp);
+  const restoreLogs = await db.activityLogs
+    .filter((entry) => entry.entityId === archived.id && entry.action === "item.restored")
+    .toArray();
+  assert.equal(restoreLogs.length, 1);
+  assert.equal(restoreLogs[0].actor, "staff");
+
+  const mergedSource = {
+    ...sampleItems[0],
+    id: "restore-merged-source",
+    skuCode: "RESTORE-MERGED-A",
+    isSynced: false,
+  };
+  const mergedTarget = {
+    ...sampleItems[0],
+    id: "restore-merged-target",
+    skuCode: "RESTORE-MERGED-B",
+    isSynced: false,
+  };
+  await db.items.bulkPut([mergedSource, mergedTarget]);
+  await mergeItems(mergedSource.id, mergedTarget.id);
+  const merged = await db.items.get(mergedSource.id);
+  assert.ok(merged);
+  assert.equal(isRestorableArchivedItem(merged), false);
+  await assert.rejects(
+    () => restoreArchivedItem(mergedSource.id),
+    /merged into another product/,
+  );
+  await db.delete();
 });
 
 test("reviewed party and item merges preserve ledger ownership and archive sources", async () => {
@@ -3345,6 +4099,29 @@ const remoteItem = (index: number): Record<string, unknown> => ({
   last_sold_date: null,
   created_at: "2026-01-01T00:00:00.000Z",
   updated_at: "2026-01-01T00:00:00.000Z",
+});
+
+test("a restored product uploads its active state and returns cleanly", async () => {
+  await db.delete();
+  await db.open();
+  const archived: Item = {
+    ...sampleItems[0],
+    id: "restore-sync-item",
+    skuCode: "RESTORE-SYNC",
+    isActive: false,
+    updatedAt: "2026-08-09T10:00:00.000Z",
+    isSynced: true,
+  };
+  await db.items.put(archived);
+  await restoreArchivedItem(archived.id);
+  const cloud = pagedSupabase({});
+  assert.equal(await syncWithClient(cloud.client), "synced");
+  const uploaded = cloud.rows("items").find((row) => row.id === archived.id);
+  assert.ok(uploaded);
+  assert.equal(uploaded.is_active, true);
+  assert.equal((await db.items.get(archived.id))?.isActive, true);
+  assert.equal((await db.items.get(archived.id))?.isSynced, true);
+  await db.delete();
 });
 
 test("sync downloads 2,501 products by page and uploads large changes in bounded batches", async () => {

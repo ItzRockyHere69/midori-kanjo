@@ -2,16 +2,25 @@ import { db, type Category, type Item, type Party, type PartyItemPrice } from ".
 
 const stamp = "2026-08-08T09:00:00.000Z";
 
+const category = (id: string, name: string, festivalSeason: string[]): Category => ({
+  id,
+  name,
+  festivalSeason,
+  createdAt: stamp,
+  updatedAt: stamp,
+  isSynced: false,
+});
+
 export const sampleCategories: Category[] = [
-  { id: "cat-uncategorized", name: "Uncategorized", festivalSeason: [] },
-  { id: "cat-mala", name: "Moti Mala", festivalSeason: ["durga_puja", "kali_puja", "wedding"] },
-  { id: "cat-puja", name: "Puja Decor", festivalSeason: ["durga_puja", "kali_puja", "saraswati_puja", "lakshmi_puja"] },
-  { id: "cat-diwali", name: "Diwali Lights & Torans", festivalSeason: ["diwali", "kali_puja"] },
-  { id: "cat-christmas", name: "Christmas Decor", festivalSeason: ["christmas"] },
-  { id: "cat-birthday", name: "Birthday Items", festivalSeason: ["birthday"] },
-  { id: "cat-patriotic", name: "Independence Day / Patriotic", festivalSeason: ["independence_day", "republic_day"] },
-  { id: "cat-wedding", name: "Wedding Decor", festivalSeason: ["wedding"] },
-  { id: "cat-party", name: "Balloons & Party Supplies", festivalSeason: ["birthday", "wedding"] }
+  category("cat-uncategorized", "Uncategorized", []),
+  category("cat-mala", "Moti Mala", ["durga_puja", "kali_puja", "wedding"]),
+  category("cat-puja", "Puja Decor", ["durga_puja", "kali_puja", "saraswati_puja", "lakshmi_puja"]),
+  category("cat-diwali", "Diwali Lights & Torans", ["diwali", "kali_puja"]),
+  category("cat-christmas", "Christmas Decor", ["christmas"]),
+  category("cat-birthday", "Birthday Items", ["birthday"]),
+  category("cat-patriotic", "Independence Day / Patriotic", ["independence_day", "republic_day"]),
+  category("cat-wedding", "Wedding Decor", ["wedding"]),
+  category("cat-party", "Balloons & Party Supplies", ["birthday", "wedding"]),
 ];
 
 const item = (

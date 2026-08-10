@@ -1,26 +1,27 @@
 # Midori Kanjo — required secret and configuration names
 
 Generated: **2026-08-10 (Asia/Kolkata)**  
-Source snapshot: base commit `f77e9e8bfd86d5d155cdf9b59bd759d6778c4b42` plus the verified 2026-08-10 feature working tree
+Source snapshot: verified 2026-08-10 integrated v0.1.2 feature working tree
 
 This file intentionally contains names and instructions only. It contains no
 credential, token, password, key, connection string, or business sync code.
 
 ## Runtime cloud configuration
 
-Use either the app's **More → Cloud backup** screen on each trusted device, or
-the build-time environment variables below. The in-app route is preferred for
-public web builds because it avoids embedding the private sync code in the
-JavaScript bundle.
+Use the app's **More → Cloud backup** screen on each trusted device for the
+private business sync code. Build-time variables may prefill only the public
+project URL and anon/publishable key.
 
 | Name | Required? | Purpose and source |
 |---|---:|---|
 | `VITE_SUPABASE_URL` | For preconfigured cloud sync | Supabase project URL from **Project Settings → API**. |
 | `VITE_SUPABASE_ANON_KEY` | For preconfigured cloud sync | Supabase publishable/legacy anon public key from **Project Settings → API**. Do not substitute the service-role key. |
-| `VITE_SUPABASE_SYNC_CODE` | For preconfigured cloud sync | Owner-generated private business code, at least 20 characters, identical on trusted devices. It is the RLS tenant boundary and must be stored like a password. |
 | `NEXT_PUBLIC_SUPABASE_URL` | Alternative only | Node/Vinext fallback alias for `VITE_SUPABASE_URL`. Do not set both to different values. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Alternative only | Node/Vinext fallback alias for `VITE_SUPABASE_ANON_KEY`. |
-| `NEXT_PUBLIC_SUPABASE_SYNC_CODE` | Alternative only | Node/Vinext fallback alias for `VITE_SUPABASE_SYNC_CODE`. |
+
+The app intentionally ignores client-public sync-code environment variables.
+Any `VITE_*` or `NEXT_PUBLIC_*` private credential would be extractable from
+the packaged JavaScript and must not be used.
 
 The app also stores cloud configuration locally under the browser key
 `mantu-supabase-config-v1`. That value is deliberately excluded from the local

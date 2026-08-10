@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 
-const tables = [
+const legacyTables = [
   "parties",
   "items",
   "party_item_prices",
@@ -10,6 +10,13 @@ const tables = [
   "payments",
   "account_entries",
   "expenses",
+];
+const tables = [
+  "categories",
+  ...legacyTables,
+  "count_sessions",
+  "count_session_lines",
+  "stock_movements",
 ];
 
 test("migration chain starts with a complete tenant-safe baseline", async () => {
@@ -26,9 +33,27 @@ test("migration chain starts with a complete tenant-safe baseline", async () => 
   assert.match(baseline, /current_business_id\(\)[\s\S]*extensions\.digest/);
   assert.match(baseline, /initial_amount_paid numeric not null default 0/);
   assert.match(baseline, /payment_breakdown jsonb not null default '\[\]'/);
+  assert.match(baseline, /return_details jsonb not null default '\{\}'/);
   assert.match(baseline, /payment_received_mode in \('cash', 'upi', 'bank', 'cheque'\)/);
   assert.match(baseline, /allocated_to jsonb not null default '\[\]'/);
   assert.equal((baseline.match(/drop policy if exists "business /g) || []).length, tables.length);
+});
+
+test("Phase 2 inventory migration adds tenant-safe audit tables and deterministic baselines", async () => {
+  const migration = await readFile(
+    "supabase/migrations/202608101500_phase2_inventory_sync.sql",
+    "utf8",
+  );
+  for (const table of ["categories", "count_sessions", "count_session_lines", "stock_movements"]) {
+    assert.match(migration, new RegExp(`create table if not exists public\\.${table} \\(`));
+  }
+  assert.match(migration, /add column if not exists return_details jsonb/);
+  assert.match(migration, /unique \(business_id, session_id, item_id\)/);
+  assert.match(migration, /'baseline:' \|\| id/);
+  assert.match(migration, /updated_at \+ interval '1 millisecond'/);
+  assert.match(migration, /reject_stock_movement_mutation/);
+  assert.match(migration, /stock_movements are immutable audit records/);
+  assert.match(migration, /supabase_realtime/);
 });
 
 test("split-tender migration upgrades existing invoice and payment rows safely", async () => {
@@ -60,7 +85,7 @@ test("tenant hardening rebuilds fresh and legacy constraints safely", async () =
   assert.match(migration, /extensions\.digest\(business_id, 'sha256'\)/);
   assert.match(migration, /update public\.payments set allocated_to = '\[\]'::jsonb/);
   assert.match(migration, /alter column allocated_to set not null/);
-  assert.equal((migration.match(/add primary key \(business_id, id\)/g) || []).length, tables.length);
+  assert.equal((migration.match(/add primary key \(business_id, id\)/g) || []).length, legacyTables.length);
   assert.match(migration, /on public\.items \(business_id, sku_code\)/);
   assert.match(migration, /foreign key \(business_id, party_id\)/);
   assert.match(migration, /having count\(distinct reference\.business_id\) = 1/);

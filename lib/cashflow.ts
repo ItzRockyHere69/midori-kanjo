@@ -15,6 +15,9 @@ export interface CashFlowMovement {
   createdAt: string;
   direction: "in" | "out";
   source: "sale" | "purchase" | "sale_return" | "purchase_return" | "customer_payment" | "supplier_payment" | "misc_expense";
+  invoiceId?: string;
+  paymentId?: string;
+  expenseId?: string;
   partyId?: string | null;
   expenseCategory?: ExpenseCategory;
   title: string;
@@ -117,11 +120,11 @@ export function buildCashFlowReport(input: { invoices: Invoice[]; payments: Paym
     if (!initialPaid) continue;
     if (invoice.type === "sale" || invoice.type === "purchase_return") {
       const source = invoice.type === "sale" ? "sale" : "purchase_return";
-      breakdown.forEach((entry, index) => movements.push({ id: `invoice-${invoice.id}-${index}`, date: invoice.date, createdAt: invoice.createdAt, direction: "in", source, partyId: invoice.partyId || null, title: invoice.type === "sale" ? `Sale ${invoice.invoiceNumber}` : `Purchase return ${invoice.invoiceNumber}`, details: [invoice.partyName, entry.reference].filter(Boolean).join(" · "), mode: entry.mode, amount: entry.amount }));
+      breakdown.forEach((entry, index) => movements.push({ id: `invoice-${invoice.id}-${index}`, invoiceId: invoice.id, date: invoice.date, createdAt: invoice.createdAt, direction: "in", source, partyId: invoice.partyId || null, title: invoice.type === "sale" ? `Sale ${invoice.invoiceNumber}` : `Purchase return ${invoice.invoiceNumber}`, details: [invoice.partyName, entry.reference].filter(Boolean).join(" · "), mode: entry.mode, amount: entry.amount }));
       receivedWithBills = roundMoney(receivedWithBills + initialPaid);
     } else if (invoice.type === "purchase" || invoice.type === "sale_return") {
       const source = invoice.type === "purchase" ? "purchase" : "sale_return";
-      breakdown.forEach((entry, index) => movements.push({ id: `invoice-${invoice.id}-${index}`, date: invoice.date, createdAt: invoice.createdAt, direction: "out", source, partyId: invoice.partyId || null, title: invoice.type === "purchase" ? `Purchase ${invoice.invoiceNumber}` : `Sale return ${invoice.invoiceNumber}`, details: [invoice.partyName, entry.reference].filter(Boolean).join(" · "), mode: entry.mode, amount: entry.amount }));
+      breakdown.forEach((entry, index) => movements.push({ id: `invoice-${invoice.id}-${index}`, invoiceId: invoice.id, date: invoice.date, createdAt: invoice.createdAt, direction: "out", source, partyId: invoice.partyId || null, title: invoice.type === "purchase" ? `Purchase ${invoice.invoiceNumber}` : `Sale return ${invoice.invoiceNumber}`, details: [invoice.partyName, entry.reference].filter(Boolean).join(" · "), mode: entry.mode, amount: entry.amount }));
       paidWithPurchases = roundMoney(paidWithPurchases + initialPaid);
     }
   }
@@ -134,6 +137,7 @@ export function buildCashFlowReport(input: { invoices: Invoice[]; payments: Paym
     const direction = party.type === "customer" ? "in" : "out";
     movements.push({
       id: `payment-${payment.id}`,
+      paymentId: payment.id,
       date: payment.date,
       createdAt: payment.createdAt,
       direction,
@@ -151,7 +155,7 @@ export function buildCashFlowReport(input: { invoices: Invoice[]; payments: Paym
   const expenseMap = new Map<ExpenseCategory, number>();
   for (const expense of activeExpenses) {
     expenseMap.set(expense.category, roundMoney((expenseMap.get(expense.category) || 0) + expense.amount));
-    movements.push({ id: `expense-${expense.id}`, date: expense.date, createdAt: expense.createdAt, direction: "out", source: "misc_expense", expenseCategory: expense.category, title: expense.description, details: expenseCategoryLabels[expense.category] + (expense.reference ? ` · ${expense.reference}` : ""), mode: expense.paymentMode, amount: expense.amount });
+    movements.push({ id: `expense-${expense.id}`, expenseId: expense.id, date: expense.date, createdAt: expense.createdAt, direction: "out", source: "misc_expense", expenseCategory: expense.category, title: expense.description, details: expenseCategoryLabels[expense.category] + (expense.reference ? ` · ${expense.reference}` : ""), mode: expense.paymentMode, amount: expense.amount });
   }
   const miscellaneousExpenses = roundMoney(activeExpenses.reduce((sum, expense) => sum + expense.amount, 0));
   const moneyIn = roundMoney(receivedWithBills + customerPayments);

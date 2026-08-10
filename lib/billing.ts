@@ -18,6 +18,7 @@ import {
   type PriceTier,
   type Unit,
 } from "./db";
+import { applyRelativeStockMovement, convertQuantity, resolveInventoryItem } from "./inventory";
 
 export const roundMoney = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100;
 export const formatMoney = (value: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(value || 0);
@@ -80,6 +81,8 @@ export function customerInvoiceHistory(invoices: Invoice[], partyId?: string) {
 export interface DueCustomerRow {
   party: Party;
   lastPayment?: Payment;
+  status: "outstanding" | "paid_in_full";
+  lastActivityAt: string;
 }
 
 function invoicePayments(invoice: Invoice, laterAllocated = 0): Payment[] {
@@ -99,9 +102,18 @@ function invoicePayments(invoice: Invoice, laterAllocated = 0): Payment[] {
   }));
 }
 
-export function dueCustomerRows(parties: Party[], payments: Payment[], query = "", invoices: Invoice[] = []): DueCustomerRow[] {
+export function dueCustomerRows(
+  parties: Party[],
+  payments: Payment[],
+  query = "",
+  invoices: Invoice[] = [],
+  accountEntries: AccountEntry[] = [],
+  includeSettled = false,
+): DueCustomerRow[] {
   const latestPayment = new Map<string, Payment>();
   const laterAllocated = new Map<string, number>();
+  const latestActivity = new Map<string, string>();
+  const dueHistoryIds = new Set<string>();
   for (const payment of payments) for (const allocation of payment.allocatedTo) {
     laterAllocated.set(allocation.invoiceId, roundMoney((laterAllocated.get(allocation.invoiceId) || 0) + allocation.amount));
   }
@@ -109,13 +121,49 @@ export function dueCustomerRows(parties: Party[], payments: Payment[], query = "
     .flatMap((invoice) => invoicePayments(invoice, laterAllocated.get(invoice.id) || 0));
   for (const payment of [...payments, ...receivedWithBills].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.date.localeCompare(a.date) || b.id.localeCompare(a.id))) {
     if (!latestPayment.has(payment.partyId)) latestPayment.set(payment.partyId, payment);
+    const previous = latestActivity.get(payment.partyId) || "";
+    if (payment.createdAt > previous) latestActivity.set(payment.partyId, payment.createdAt);
+  }
+  for (const payment of payments) dueHistoryIds.add(payment.partyId);
+  for (const entry of accountEntries) {
+    if (entry.amount > 0) dueHistoryIds.add(entry.partyId);
+    const previous = latestActivity.get(entry.partyId) || "";
+    if (entry.createdAt > previous) latestActivity.set(entry.partyId, entry.createdAt);
+  }
+  for (const invoice of invoices) {
+    if (!invoice.partyId || invoice.deletedAt) continue;
+    const previous = latestActivity.get(invoice.partyId) || "";
+    if (invoice.createdAt > previous) latestActivity.set(invoice.partyId, invoice.createdAt);
+    if (invoice.type === "sale") {
+      const initialPaid = invoiceInitialPaymentBreakdown(invoice, laterAllocated.get(invoice.id) || 0)
+        .reduce((sum, allocation) => sum + allocation.amount, 0);
+      if (roundMoney(invoice.grandTotal - initialPaid) >= 0.01) dueHistoryIds.add(invoice.partyId);
+    }
+    if (invoice.type === "sale_return" && (invoice.returnDetails?.balanceApplied || 0) > 0)
+      dueHistoryIds.add(invoice.partyId);
   }
   const needle = query.trim().toLowerCase();
   return parties
-    .filter((party) => party.type === "customer" && party.currentBalance > 0)
+    .filter((party) => party.type === "customer" && !party.tags.some((tag) => tag.startsWith("mergedInto:")))
+    .filter((party) => {
+      if (party.currentBalance > 0) return true;
+      if (!includeSettled) return false;
+      return party.openingBalance > 0 || dueHistoryIds.has(party.id);
+    })
     .filter((party) => !needle || party.name.toLowerCase().includes(needle) || party.codeName.toLowerCase().includes(needle))
-    .map((party) => ({ party, lastPayment: latestPayment.get(party.id) }))
-    .sort((a, b) => b.party.currentBalance - a.party.currentBalance || a.party.name.localeCompare(b.party.name));
+    .map((party) => ({
+      party,
+      lastPayment: latestPayment.get(party.id),
+      status: party.currentBalance > 0 ? "outstanding" as const : "paid_in_full" as const,
+      lastActivityAt: latestActivity.get(party.id) || party.updatedAt,
+    }))
+    .sort((a, b) =>
+      (a.status === b.status ? 0 : a.status === "outstanding" ? -1 : 1) ||
+      (a.status === "outstanding"
+        ? b.party.currentBalance - a.party.currentBalance
+        : b.lastActivityAt.localeCompare(a.lastActivityAt)) ||
+      a.party.name.localeCompare(b.party.name),
+    );
 }
 
 export interface CustomerPaymentHistoryRow {
@@ -126,6 +174,8 @@ export interface CustomerPaymentHistoryRow {
 export type PartyDueStatementKind =
   | "opening_balance"
   | "sale_invoice"
+  | "return_credit"
+  | "return_refund"
   | "manual_due"
   | "payment"
   | "balance_adjustment";
@@ -140,17 +190,28 @@ export interface PartyDueStatementRow {
   paymentMode?: Payment["mode"];
   dueAdded: number;
   paymentReceived: number;
+  /** Cash refunded for a return; shown for audit but has no due-balance effect. */
+  refundPaid?: number;
   runningBalance: number;
   payment?: Payment;
+  invoice?: Invoice;
 }
 
 export interface PartyDueStatement {
   party: Party;
   rows: PartyDueStatementRow[];
   totalDueAdded: number;
+  /** Actual customer receipts only; return credits and repairs are separate. */
   totalPaid: number;
+  totalReturnCredits: number;
+  totalRefunded: number;
+  totalBalanceAdjustments: number;
+  totalBalanceReductions: number;
   remainingDue: number;
   lastPayment?: Payment;
+  invoices: Invoice[];
+  payments: Payment[];
+  accountEntries: AccountEntry[];
 }
 
 export function partyDueStatement(
@@ -164,8 +225,10 @@ export function partyDueStatement(
   for (const payment of partyPayments) for (const allocation of payment.allocatedTo) {
     laterAllocated.set(allocation.invoiceId, roundMoney((laterAllocated.get(allocation.invoiceId) || 0) + allocation.amount));
   }
-  const receivedWithBills = invoices
-    .filter((invoice) => invoice.partyId === party.id)
+  const partyInvoices = invoices.filter((invoice) => invoice.partyId === party.id);
+  const partyEntries = accountEntries.filter((entry) => entry.partyId === party.id);
+  const receivedWithBills = partyInvoices
+    .filter((invoice) => !invoice.deletedAt)
     .flatMap((invoice) => invoicePayments(invoice, laterAllocated.get(invoice.id) || 0));
   type BalanceEvent = Omit<PartyDueStatementRow, "runningBalance"> & { priority: number };
   const events: BalanceEvent[] = [
@@ -192,6 +255,47 @@ export function partyDueStatement(
         reference: invoice.invoiceNumber,
         dueAdded: roundMoney(invoice.grandTotal),
         paymentReceived: 0,
+        invoice,
+      })),
+    ...invoices
+      .filter((invoice) =>
+        invoice.partyId === party.id &&
+        invoice.type === "sale_return" &&
+        !invoice.deletedAt &&
+        (invoice.returnDetails?.balanceApplied || 0) > 0,
+      )
+      .map((invoice) => ({
+        id: `return-credit-${invoice.id}`,
+        date: invoice.date,
+        timestamp: invoice.createdAt,
+        priority: 2,
+        kind: "return_credit" as const,
+        activity: "Sales return credit",
+        reference: invoice.invoiceNumber,
+        dueAdded: 0,
+        paymentReceived: roundMoney(invoice.returnDetails?.balanceApplied || 0),
+        invoice,
+      })),
+    ...invoices
+      .filter((invoice) =>
+        invoice.partyId === party.id &&
+        invoice.type === "sale_return" &&
+        !invoice.deletedAt &&
+        (invoice.returnDetails?.settlementAmount || 0) > 0,
+      )
+      .map((invoice) => ({
+        id: `return-refund-${invoice.id}`,
+        date: invoice.date,
+        timestamp: invoice.createdAt,
+        priority: 2,
+        kind: "return_refund" as const,
+        activity: "Sales return refund",
+        reference: `${invoice.invoiceNumber}${invoice.paymentBreakdown?.[0]?.reference ? ` · ${invoice.paymentBreakdown[0].reference}` : ""}`,
+        paymentMode: invoice.paymentReceivedMode || invoice.paymentBreakdown?.[0]?.mode,
+        dueAdded: 0,
+        paymentReceived: 0,
+        refundPaid: roundMoney(invoice.returnDetails?.settlementAmount || 0),
+        invoice,
       })),
     ...receivedWithBills.map((payment) => ({
       id: payment.id,
@@ -206,8 +310,7 @@ export function partyDueStatement(
       paymentReceived: roundMoney(payment.amount),
       payment,
     })),
-    ...accountEntries
-      .filter((entry) => entry.partyId === party.id)
+    ...partyEntries
       .map((entry) => ({
         id: entry.id,
         date: entry.date,
@@ -234,25 +337,28 @@ export function partyDueStatement(
     })),
   ];
   events.sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.priority - b.priority || a.id.localeCompare(b.id));
-  let balance = 0;
+  // Keep the chronological ledger signed internally. This preserves an older
+  // receipt that was moved ahead of an opening-balance event by a customer
+  // merge, instead of discarding it when the visible balance is clamped at 0.
+  let signedBalance = 0;
   const rows: PartyDueStatementRow[] = [];
   for (const event of events) {
-    balance = Math.max(0, roundMoney(balance + event.dueAdded - event.paymentReceived));
+    signedBalance = roundMoney(signedBalance + event.dueAdded - event.paymentReceived);
     const { priority: _priority, ...row } = event;
     void _priority;
-    rows.push({ ...row, runningBalance: balance });
+    rows.push({ ...row, runningBalance: Math.max(0, signedBalance) });
   }
 
   // A legacy import or an older app version can leave the saved party balance
   // without a matching ledger event. Surface that difference instead of
   // allowing the statement total to silently disagree with the Dues screen.
   const remainingDue = roundMoney(Math.max(0, party.currentBalance));
-  const difference = roundMoney(remainingDue - balance);
+  const visibleLedgerBalance = roundMoney(Math.max(0, signedBalance));
+  const difference = roundMoney(remainingDue - visibleLedgerBalance);
   if (Math.abs(difference) >= 0.01) {
     const date = party.updatedAt.slice(0, 10) || localDate();
     const dueAdded = difference > 0 ? difference : 0;
     const paymentReceived = difference < 0 ? Math.abs(difference) : 0;
-    balance = remainingDue;
     rows.push({
       id: `balance-adjustment-${party.id}`,
       date,
@@ -262,7 +368,7 @@ export function partyDueStatement(
       reference: "Imported / legacy balance",
       dueAdded,
       paymentReceived,
-      runningBalance: balance,
+      runningBalance: remainingDue,
     });
   }
 
@@ -271,9 +377,16 @@ export function partyDueStatement(
     party,
     rows,
     totalDueAdded: roundMoney(rows.reduce((sum, row) => sum + row.dueAdded, 0)),
-    totalPaid: roundMoney(rows.reduce((sum, row) => sum + row.paymentReceived, 0)),
+    totalPaid: roundMoney(rows.filter((row) => row.kind === "payment").reduce((sum, row) => sum + row.paymentReceived, 0)),
+    totalReturnCredits: roundMoney(rows.filter((row) => row.kind === "return_credit").reduce((sum, row) => sum + row.paymentReceived, 0)),
+    totalRefunded: roundMoney(rows.reduce((sum, row) => sum + (row.refundPaid || 0), 0)),
+    totalBalanceAdjustments: roundMoney(rows.filter((row) => row.kind === "balance_adjustment").reduce((sum, row) => sum + row.paymentReceived - row.dueAdded, 0)),
+    totalBalanceReductions: roundMoney(rows.reduce((sum, row) => sum + row.paymentReceived, 0)),
     remainingDue,
     lastPayment: paymentRows.at(-1)?.payment,
+    invoices: partyInvoices,
+    payments: partyPayments,
+    accountEntries: partyEntries,
   };
 }
 
@@ -527,14 +640,17 @@ function normalizedPaymentBreakdown(
       ...(entry.reference?.trim() ? { reference: entry.reference.trim() } : {}),
     });
   }
-  if (!normalized.length && expectedPaid > 0) {
+  if (!normalized.length && expectedPaid > 0 && entries === undefined) {
     normalized.push({
       mode: isPaymentChannel(fallbackMode) ? fallbackMode : "cash",
       amount: expectedPaid,
     });
   }
+  if (!normalized.length && expectedPaid > 0) {
+    throw new Error("Enter at least one payment amount.");
+  }
   const allocated = roundMoney(normalized.reduce((sum, entry) => sum + entry.amount, 0));
-  if (Math.abs(allocated - expectedPaid) >= 0.01) {
+  if (Math.abs(roundMoney(allocated - expectedPaid)) >= 0.01) {
     throw new Error(`Split payment must add up to ${formatMoney(expectedPaid)}.`);
   }
   return normalized;
@@ -555,7 +671,7 @@ export async function saveSale(input: { party?: Party; customerDraft?: BillingCu
   if (input.paymentMode === "mixed" && input.paid <= 0) throw new Error("Enter the amount received for a mixed payment.");
   const otherCharges = (input.otherCharges || []).filter((charge) => charge.amount > 0).map((charge) => ({ ...charge, amount: roundMoney(charge.amount) }));
   const preview = calculateBill(input.lines, 0, otherCharges);
-  if (input.paid - preview.grandTotal >= 0.01) throw new Error("Amount received cannot be more than the final total.");
+  if (roundMoney(input.paid - preview.grandTotal) >= 0.01) throw new Error("Amount received cannot be more than the final total.");
   const paymentPlan = input.paymentPlan || (input.paymentMode === "credit" ? "credit" : input.paymentMode === "mixed" || (input.paid > 0 && input.paid < preview.grandTotal) ? "partial" : "full");
   if (paymentPlan === "partial" && input.paid <= 0) throw new Error("Enter the amount received for this part payment.");
   if (paymentPlan === "partial" && input.paid >= preview.grandTotal) throw new Error("Part payment must be less than the final total. Choose Full payment instead.");
@@ -580,7 +696,7 @@ export async function saveSale(input: { party?: Party; customerDraft?: BillingCu
   const lineItems = await snapshotLineCosts(input.lines);
   const id = input.idempotencyKey || makeId();
   const invoiceNumber = await nextInvoiceNumber();
-  return db.transaction("rw", [db.invoices, db.parties, db.items, db.partyItemPrices], async () => {
+  return db.transaction("rw", [db.invoices, db.parties, db.items, db.partyItemPrices, db.stockMovements], async () => {
     const alreadySaved = await db.invoices.get(id);
     if (alreadySaved) {
       if (alreadySaved.type !== "sale") throw new Error("This saved draft ID already belongs to another document.");
@@ -604,16 +720,29 @@ export async function saveSale(input: { party?: Party; customerDraft?: BillingCu
     if (customer && invoice.amountDue) {
       await db.parties.update(customer.id, { currentBalance: roundMoney(customer.currentBalance + invoice.amountDue), updatedAt: timestamp, isSynced: false });
     }
-    for (const line of invoice.lineItems) {
-      const existing = customer ? await db.partyItemPrices.get(priceKey(customer.id, line.itemId)) : undefined;
-      const soldItem = await db.items.get(line.itemId);
+    for (const [lineIndex, line] of invoice.lineItems.entries()) {
+      const soldItem = await resolveInventoryItem(line.itemId);
+      const existing = customer && soldItem ? await db.partyItemPrices.get(priceKey(customer.id, soldItem.id)) : undefined;
       const normalizedRate = soldItem ? convertUnitRate(line.rate, line.unit, soldItem.baseUnit) : line.rate;
-      if (customer) await db.partyItemPrices.put({
-        id: priceKey(customer.id, line.itemId), partyId: customer.id, itemId: line.itemId,
+      if (customer && soldItem) await db.partyItemPrices.put({
+        id: priceKey(customer.id, soldItem.id), partyId: customer.id, itemId: soldItem.id,
         lastPrice: existing?.lockedPrice && line.lockPrice ? existing.lastPrice : normalizedRate,
         lastSoldDate: invoice.date, timesSold: (existing?.timesSold || 0) + 1, lockedPrice: Boolean(line.lockPrice), updatedAt: timestamp, isSynced: false
       });
-      if (soldItem) await db.items.update(line.itemId, { saleCount: soldItem.saleCount + 1, lastSoldDate: invoice.date, updatedAt: timestamp, isSynced: false });
+      if (soldItem) await db.items.update(soldItem.id, { saleCount: soldItem.saleCount + 1, lastSoldDate: invoice.date, updatedAt: timestamp, isSynced: false });
+      if (soldItem) await applyRelativeStockMovement({
+        id: `sale:${invoice.id}:${lineIndex}`,
+        itemId: soldItem.id,
+        kind: "sale",
+        reason: "sale",
+        qtyChange: -convertQuantity(line.qty, line.unit, soldItem.baseUnit),
+        entryQty: line.qty,
+        entryUnit: line.unit,
+        refInvoiceId: invoice.id,
+        partyId: invoice.partyId,
+        date: invoice.date,
+        actor: "staff",
+      });
     }
     return invoice;
   });
@@ -664,7 +793,7 @@ export function convertedInvoiceId(quotation: Invoice) {
 }
 
 export async function convertQuotationToInvoice(quotationId: string) {
-  return db.transaction("rw", [db.invoices, db.parties, db.items, db.partyItemPrices, db.meta], async () => {
+  return db.transaction("rw", [db.invoices, db.parties, db.items, db.partyItemPrices, db.stockMovements, db.meta], async () => {
     const quotation = await db.invoices.get(quotationId);
     if (!quotation || quotation.type !== "quotation" || quotation.deletedAt) throw new Error("This quotation is no longer available.");
     const marker = quotationOriginMarker(quotation.id);
@@ -692,16 +821,29 @@ export async function convertQuotationToInvoice(quotationId: string) {
       if (!party) throw new Error("The quotation customer no longer exists.");
       await db.parties.update(party.id, { currentBalance: roundMoney(party.currentBalance + invoice.amountDue), updatedAt: timestamp, isSynced: false });
     }
-    for (const line of invoice.lineItems) {
-      const soldItem = await db.items.get(line.itemId);
-      const existingPrice = quotation.partyId ? await db.partyItemPrices.get(priceKey(quotation.partyId, line.itemId)) : undefined;
+    for (const [lineIndex, line] of invoice.lineItems.entries()) {
+      const soldItem = await resolveInventoryItem(line.itemId);
+      const existingPrice = quotation.partyId && soldItem ? await db.partyItemPrices.get(priceKey(quotation.partyId, soldItem.id)) : undefined;
       const normalizedRate = soldItem ? convertUnitRate(line.rate, line.unit, soldItem.baseUnit) : line.rate;
-      if (quotation.partyId) await db.partyItemPrices.put({
-        id: priceKey(quotation.partyId, line.itemId), partyId: quotation.partyId, itemId: line.itemId,
+      if (quotation.partyId && soldItem) await db.partyItemPrices.put({
+        id: priceKey(quotation.partyId, soldItem.id), partyId: quotation.partyId, itemId: soldItem.id,
         lastPrice: existingPrice?.lockedPrice && line.lockPrice ? existingPrice.lastPrice : normalizedRate,
         lastSoldDate: date, timesSold: (existingPrice?.timesSold || 0) + 1, lockedPrice: Boolean(line.lockPrice), updatedAt: timestamp, isSynced: false
       });
-      if (soldItem) await db.items.update(line.itemId, { saleCount: soldItem.saleCount + 1, lastSoldDate: date, updatedAt: timestamp, isSynced: false });
+      if (soldItem) await db.items.update(soldItem.id, { saleCount: soldItem.saleCount + 1, lastSoldDate: date, updatedAt: timestamp, isSynced: false });
+      if (soldItem) await applyRelativeStockMovement({
+        id: `sale:${invoice.id}:${lineIndex}`,
+        itemId: soldItem.id,
+        kind: "sale",
+        reason: "quotation_conversion",
+        qtyChange: -convertQuantity(line.qty, line.unit, soldItem.baseUnit),
+        entryQty: line.qty,
+        entryUnit: line.unit,
+        refInvoiceId: invoice.id,
+        partyId: invoice.partyId,
+        date,
+        actor: "staff",
+      });
     }
     await db.invoices.update(quotation.id, { notes: `${quotation.notes} ${quotationConvertedMarker(invoice.id)}`.trim(), updatedAt: timestamp, isSynced: false });
     return invoice;
@@ -970,10 +1112,24 @@ async function refreshInvoiceSaleStats(
 }
 
 export async function softDeleteInvoice(invoiceId: string) {
-  return db.transaction("rw", [db.invoices, db.payments, db.parties, db.items, db.partyItemPrices], async () => {
+  return db.transaction("rw", [db.invoices, db.payments, db.parties, db.items, db.partyItemPrices, db.stockMovements], async () => {
     const invoice = await db.invoices.get(invoiceId);
     if (!invoice) throw new Error("This invoice no longer exists.");
     if (invoice.deletedAt) return invoice;
+    if (invoice.type === "sale_return" || invoice.type === "purchase_return") {
+      throw new Error("Returns cannot be deleted because they settle stock and party balances.");
+    }
+    const linkedReturn = await db.invoices
+      .filter((candidate) =>
+        !candidate.deletedAt &&
+        (candidate.type === "sale_return" || candidate.type === "purchase_return") &&
+        (candidate.returnDetails?.sourceInvoiceId === invoice.id ||
+          (candidate.returnDetails?.allocations || []).some((allocation) => allocation.invoiceId === invoice.id)),
+      )
+      .first();
+    if (linkedReturn) {
+      throw new Error("This bill has a linked return and cannot be deleted.");
+    }
     if (
       invoice.amountPaid >= 0.01 ||
       (invoice.initialAmountPaid ?? 0) >= 0.01
@@ -1002,6 +1158,26 @@ export async function softDeleteInvoice(invoiceId: string) {
       isSynced: false,
     });
     await refreshInvoiceSaleStats(invoice, -1, stamp);
+    if (invoice.type === "sale") {
+      for (const [lineIndex, line] of invoice.lineItems.entries()) {
+        const original = await db.stockMovements.get(`sale:${invoice.id}:${lineIndex}`);
+        const item = original?.applied ? await resolveInventoryItem(line.itemId) : undefined;
+        if (!item) continue;
+        await applyRelativeStockMovement({
+          id: `sale_void:${invoice.id}:${lineIndex}:${makeId()}`,
+          itemId: item.id,
+          kind: "sale_void",
+          reason: "sale_deleted",
+          qtyChange: convertQuantity(line.qty, line.unit, item.baseUnit),
+          entryQty: line.qty,
+          entryUnit: line.unit,
+          refInvoiceId: invoice.id,
+          partyId: invoice.partyId,
+          date: localDate(),
+          actor: "staff",
+        });
+      }
+    }
     if (
       invoice.partyId &&
       ["sale", "purchase"].includes(invoice.type) &&
@@ -1023,7 +1199,7 @@ export async function softDeleteInvoice(invoiceId: string) {
 }
 
 export async function restoreInvoice(invoiceId: string) {
-  return db.transaction("rw", [db.invoices, db.parties, db.items, db.partyItemPrices], async () => {
+  return db.transaction("rw", [db.invoices, db.parties, db.items, db.partyItemPrices, db.stockMovements], async () => {
     const invoice = await db.invoices.get(invoiceId);
     if (!invoice) throw new Error("This invoice no longer exists.");
     if (!invoice.deletedAt) return invoice;
@@ -1034,6 +1210,36 @@ export async function restoreInvoice(invoiceId: string) {
       isSynced: false,
     });
     await refreshInvoiceSaleStats(invoice, 1, stamp);
+    if (invoice.type === "sale") {
+      for (const [lineIndex, line] of invoice.lineItems.entries()) {
+        const original = await db.stockMovements.get(`sale:${invoice.id}:${lineIndex}`);
+        const voidMovement = (await db.stockMovements
+          .where("refInvoiceId")
+          .equals(invoice.id)
+          .filter((movement) =>
+            movement.kind === "sale_void" &&
+            movement.id.startsWith(`sale_void:${invoice.id}:${lineIndex}`),
+          )
+          .toArray())
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+          .at(-1);
+        const item = original?.applied && voidMovement?.applied ? await resolveInventoryItem(line.itemId) : undefined;
+        if (!item) continue;
+        await applyRelativeStockMovement({
+          id: `sale_restore:${invoice.id}:${lineIndex}:${makeId()}`,
+          itemId: item.id,
+          kind: "sale_restore",
+          reason: "sale_restored",
+          qtyChange: -convertQuantity(line.qty, line.unit, item.baseUnit),
+          entryQty: line.qty,
+          entryUnit: line.unit,
+          refInvoiceId: invoice.id,
+          partyId: invoice.partyId,
+          date: localDate(),
+          actor: "staff",
+        });
+      }
+    }
     if (
       invoice.partyId &&
       ["sale", "purchase"].includes(invoice.type) &&

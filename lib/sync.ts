@@ -2,15 +2,21 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import {
   db,
   type AccountEntry,
+  type Category,
+  type CountLine,
+  type CountSession,
   type Expense,
   type Invoice,
   type Item,
   type Party,
   type PartyItemPrice,
   type Payment,
+  type StockMovement,
 } from "./db";
 import { paymentChannels, roundMoney } from "./billing";
+import { reconcileInventoryStock } from "./inventory";
 import { sha256Hex } from "./qol";
+import { normalizeMergedFestivalTags } from "./festivals";
 
 export type SyncState = "synced" | "pending" | "offline" | "syncing";
 export interface CloudConfig {
@@ -181,6 +187,10 @@ async function hasBusinessData() {
     db.payments.count(),
     db.accountEntries.count(),
     db.expenses.count(),
+    db.categories.count(),
+    db.stockMovements.count(),
+    db.countSessions.count(),
+    db.countLines.count(),
   ]);
   return counts.some(Boolean);
 }
@@ -354,6 +364,14 @@ const partyToRow = (x: Party) => ({
   created_at: x.createdAt,
   updated_at: x.updatedAt,
 });
+const categoryToRow = (x: Category) => ({
+  id: x.id,
+  name: x.name,
+  parent_id: x.parentId || null,
+  festival_season: x.festivalSeason,
+  created_at: x.createdAt,
+  updated_at: x.updatedAt,
+});
 const itemToRow = (x: Item) => ({
   id: x.id,
   name: x.name,
@@ -413,6 +431,7 @@ const invoiceToRow = (x: Invoice) => ({
   payment_mode: x.paymentMode,
   payment_received_mode: x.paymentReceivedMode || null,
   payment_breakdown: x.paymentBreakdown || [],
+  return_details: x.returnDetails || {},
   notes: x.notes,
   deleted_at: x.deletedAt || null,
   created_at: x.createdAt,
@@ -452,6 +471,74 @@ const expenseToRow = (x: Expense) => ({
   created_at: x.createdAt,
   updated_at: x.updatedAt,
 });
+const countSessionToRow = (x: CountSession) => ({
+  id: x.id,
+  category_id: x.categoryId,
+  category_name: x.categoryName,
+  status: x.status,
+  item_ids: x.itemIds,
+  started_at: x.startedAt,
+  completed_at: x.completedAt || null,
+  updated_at: x.updatedAt,
+});
+const countLineToRow = (x: CountLine) => ({
+  id: x.id,
+  session_id: x.sessionId,
+  item_id: x.itemId,
+  item_name: x.itemName,
+  sku_code: x.skuCode,
+  base_unit: x.baseUnit,
+  system_stock_at_start: x.systemStockAtStart,
+  counted_stock: x.countedStock,
+  counted_at: x.countedAt || null,
+  created_at: x.createdAt,
+  updated_at: x.updatedAt,
+});
+const stockMovementToRow = (x: StockMovement) => ({
+  id: x.id,
+  item_id: x.itemId,
+  kind: x.kind,
+  reason: x.reason,
+  note: x.note,
+  qty_change: x.qtyChange,
+  stock_before: x.stockBefore,
+  stock_after: x.stockAfter,
+  applied: x.applied,
+  entry_qty: x.entryQty ?? null,
+  entry_unit: x.entryUnit || null,
+  pack_count: x.packCount ?? null,
+  units_per_pack: x.unitsPerPack ?? null,
+  contained_unit: x.containedUnit || null,
+  ref_invoice_id: x.refInvoiceId || null,
+  source_invoice_id: x.sourceInvoiceId || null,
+  count_session_id: x.countSessionId || null,
+  party_id: x.partyId || null,
+  supplier_reference: x.supplierReference || null,
+  date: x.date,
+  actor: x.actor,
+  created_at: x.createdAt,
+  updated_at: x.updatedAt,
+});
+const sameStockMovement = (left: StockMovement, right: StockMovement) => {
+  const normalize = (movement: StockMovement) => ({
+    ...stockMovementToRow(movement),
+    created_at: Number.isNaN(Date.parse(movement.createdAt)) ? movement.createdAt : new Date(movement.createdAt).toISOString(),
+    updated_at: Number.isNaN(Date.parse(movement.updatedAt)) ? movement.updatedAt : new Date(movement.updatedAt).toISOString(),
+  });
+  const leftRow = normalize(left);
+  const rightRow = normalize(right);
+  if (left.kind === "baseline" && right.kind === "baseline") {
+    const withoutReplicaClock = (row: ReturnType<typeof normalize>) => {
+      const stable: Record<string, unknown> = { ...row };
+      delete stable.date;
+      delete stable.created_at;
+      delete stable.updated_at;
+      return stable;
+    };
+    return JSON.stringify(withoutReplicaClock(leftRow)) === JSON.stringify(withoutReplicaClock(rightRow));
+  }
+  return JSON.stringify(leftRow) === JSON.stringify(rightRow);
+};
 
 async function ensureSession(
   supabase: SupabaseClient,
@@ -518,6 +605,8 @@ async function pushTable<T extends { id: string }>(
 type RemoteRow = Record<string, unknown>;
 const text = (value: unknown) => (value == null ? "" : String(value));
 const number = (value: unknown) => Number(value || 0);
+const nullableNumber = (value: unknown) =>
+  value == null || value === "" ? null : Number(value);
 const list = (value: unknown) =>
   Array.isArray(value) ? value.map(String) : [];
 const invoicePaymentBreakdown = (value: unknown): NonNullable<Invoice["paymentBreakdown"]> =>
@@ -536,6 +625,29 @@ const invoicePaymentBreakdown = (value: unknown): NonNullable<Invoice["paymentBr
         }];
       })
     : [];
+const invoiceReturnDetails = (value: unknown): Invoice["returnDetails"] => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  const sourceInvoiceId = text(row.sourceInvoiceId || row.source_invoice_id).trim();
+  const allocations = Array.isArray(row.allocations)
+    ? row.allocations.flatMap((entry) => {
+        if (!entry || typeof entry !== "object") return [];
+        const allocation = entry as Record<string, unknown>;
+        const invoiceId = text(allocation.invoiceId || allocation.invoice_id).trim();
+        const amount = roundMoney(number(allocation.amount));
+        return invoiceId && amount > 0 ? [{ invoiceId, amount }] : [];
+      })
+    : [];
+  const balanceApplied = roundMoney(Math.max(0, number(row.balanceApplied ?? row.balance_applied)));
+  const settlementAmount = roundMoney(Math.max(0, number(row.settlementAmount ?? row.settlement_amount)));
+  if (!sourceInvoiceId && !allocations.length && balanceApplied === 0 && settlementAmount === 0) return undefined;
+  return {
+    ...(sourceInvoiceId ? { sourceInvoiceId } : {}),
+    allocations,
+    balanceApplied,
+    settlementAmount,
+  };
+};
 
 async function selectAll(supabase: SupabaseClient, table: string) {
   const rows: RemoteRow[] = [];
@@ -567,6 +679,7 @@ async function selectAll(supabase: SupabaseClient, table: string) {
 
 async function pullRemote(supabase: SupabaseClient) {
   const [
+    categoriesResult,
     partiesResult,
     itemsResult,
     pricesResult,
@@ -574,7 +687,11 @@ async function pullRemote(supabase: SupabaseClient) {
     paymentsResult,
     accountEntriesResult,
     expensesResult,
+    countSessionsResult,
+    countLinesResult,
+    stockMovementsResult,
   ] = await Promise.all([
+    selectAll(supabase, "categories"),
     selectAll(supabase, "parties"),
     selectAll(supabase, "items"),
     selectAll(supabase, "party_item_prices"),
@@ -582,7 +699,21 @@ async function pullRemote(supabase: SupabaseClient) {
     selectAll(supabase, "payments"),
     selectAll(supabase, "account_entries"),
     selectAll(supabase, "expenses"),
+    selectAll(supabase, "count_sessions"),
+    selectAll(supabase, "count_session_lines"),
+    selectAll(supabase, "stock_movements"),
   ]);
+  const categories = categoriesResult.map(
+    (r): Category => ({
+      id: text(r.id),
+      name: text(r.name),
+      parentId: text(r.parent_id) || undefined,
+      festivalSeason: list(r.festival_season),
+      createdAt: text(r.created_at),
+      updatedAt: text(r.updated_at),
+      isSynced: true,
+    }),
+  );
   const parties = partiesResult.map(
     (r): Party => ({
       id: text(r.id),
@@ -676,6 +807,7 @@ async function pullRemote(supabase: SupabaseClient) {
         ? (text(r.payment_received_mode) as Invoice["paymentReceivedMode"])
         : undefined,
       paymentBreakdown: invoicePaymentBreakdown(r.payment_breakdown),
+      returnDetails: invoiceReturnDetails(r.return_details),
       notes: text(r.notes),
       deletedAt: text(r.deleted_at) || undefined,
       createdAt: text(r.created_at),
@@ -728,10 +860,68 @@ async function pullRemote(supabase: SupabaseClient) {
       isSynced: true,
     }),
   );
+  const countSessions = countSessionsResult.map(
+    (r): CountSession => ({
+      id: text(r.id),
+      categoryId: text(r.category_id),
+      categoryName: text(r.category_name),
+      status: r.status === "completed" ? "completed" : "in_progress",
+      itemIds: list(r.item_ids),
+      startedAt: text(r.started_at),
+      completedAt: text(r.completed_at) || undefined,
+      updatedAt: text(r.updated_at),
+      isSynced: true,
+    }),
+  );
+  const countLines = countLinesResult.map(
+    (r): CountLine => ({
+      id: text(r.id),
+      sessionId: text(r.session_id),
+      itemId: text(r.item_id),
+      itemName: text(r.item_name),
+      skuCode: text(r.sku_code),
+      baseUnit: r.base_unit as CountLine["baseUnit"],
+      systemStockAtStart: nullableNumber(r.system_stock_at_start),
+      countedStock: nullableNumber(r.counted_stock),
+      countedAt: text(r.counted_at) || undefined,
+      createdAt: text(r.created_at),
+      updatedAt: text(r.updated_at),
+      isSynced: true,
+    }),
+  );
+  const stockMovements = stockMovementsResult.map(
+    (r): StockMovement => ({
+      id: text(r.id),
+      itemId: text(r.item_id),
+      kind: r.kind as StockMovement["kind"],
+      reason: text(r.reason),
+      note: text(r.note),
+      qtyChange: nullableNumber(r.qty_change),
+      stockBefore: nullableNumber(r.stock_before),
+      stockAfter: nullableNumber(r.stock_after),
+      applied: Boolean(r.applied),
+      ...(nullableNumber(r.entry_qty) === null ? {} : { entryQty: nullableNumber(r.entry_qty)! }),
+      ...(text(r.entry_unit) ? { entryUnit: r.entry_unit as StockMovement["entryUnit"] } : {}),
+      ...(nullableNumber(r.pack_count) === null ? {} : { packCount: nullableNumber(r.pack_count)! }),
+      ...(nullableNumber(r.units_per_pack) === null ? {} : { unitsPerPack: nullableNumber(r.units_per_pack)! }),
+      ...(text(r.contained_unit) ? { containedUnit: r.contained_unit as StockMovement["containedUnit"] } : {}),
+      ...(text(r.ref_invoice_id) ? { refInvoiceId: text(r.ref_invoice_id) } : {}),
+      ...(text(r.source_invoice_id) ? { sourceInvoiceId: text(r.source_invoice_id) } : {}),
+      ...(text(r.count_session_id) ? { countSessionId: text(r.count_session_id) } : {}),
+      ...(text(r.party_id) ? { partyId: text(r.party_id) } : {}),
+      ...(text(r.supplier_reference) ? { supplierReference: text(r.supplier_reference) } : {}),
+      date: text(r.date),
+      actor: r.actor === "owner" ? "owner" : "staff",
+      createdAt: text(r.created_at),
+      updatedAt: text(r.updated_at),
+      isSynced: true,
+    }),
+  );
   const conflicts: Array<{ table: string; id: string; localUpdatedAt: string; remoteUpdatedAt: string; detectedAt: string }> = [];
   await db.transaction(
     "rw",
     [
+      db.categories,
       db.parties,
       db.items,
       db.partyItemPrices,
@@ -739,9 +929,13 @@ async function pullRemote(supabase: SupabaseClient) {
       db.payments,
       db.accountEntries,
       db.expenses,
+      db.countSessions,
+      db.countLines,
+      db.stockMovements,
     ],
     async () => {
       const [
+        localCategories,
         localParties,
         localItems,
         localPrices,
@@ -749,7 +943,11 @@ async function pullRemote(supabase: SupabaseClient) {
         localPayments,
         localAccountEntries,
         localExpenses,
+        localCountSessions,
+        localCountLines,
+        localStockMovements,
       ] = await Promise.all([
+        db.categories.bulkGet(categories.map((x) => x.id)),
         db.parties.bulkGet(parties.map((x) => x.id)),
         db.items.bulkGet(items.map((x) => x.id)),
         db.partyItemPrices.bulkGet(prices.map((x) => x.id)),
@@ -757,6 +955,9 @@ async function pullRemote(supabase: SupabaseClient) {
         db.payments.bulkGet(payments.map((x) => x.id)),
         db.accountEntries.bulkGet(accountEntries.map((x) => x.id)),
         db.expenses.bulkGet(expenses.map((x) => x.id)),
+        db.countSessions.bulkGet(countSessions.map((x) => x.id)),
+        db.countLines.bulkGet(countLines.map((x) => x.id)),
+        db.stockMovements.bulkGet(stockMovements.map((x) => x.id)),
       ]);
       const collectConflicts = <T extends { id: string; updatedAt: string; isSynced: boolean }>(table: string, remote: T[], local: Array<T | undefined>) => {
         remote.forEach((row, index) => {
@@ -764,6 +965,7 @@ async function pullRemote(supabase: SupabaseClient) {
           if (stored && !stored.isSynced && row.updatedAt > stored.updatedAt) conflicts.push({ table, id: row.id, localUpdatedAt: stored.updatedAt, remoteUpdatedAt: row.updatedAt, detectedAt: new Date().toISOString() });
         });
       };
+      collectConflicts("categories", categories, localCategories);
       collectConflicts("parties", parties, localParties);
       collectConflicts("items", items, localItems);
       collectConflicts("party_item_prices", prices, localPrices);
@@ -771,6 +973,32 @@ async function pullRemote(supabase: SupabaseClient) {
       collectConflicts("payments", payments, localPayments);
       collectConflicts("account_entries", accountEntries, localAccountEntries);
       collectConflicts("expenses", expenses, localExpenses);
+      collectConflicts("count_sessions", countSessions, localCountSessions);
+      collectConflicts("count_session_lines", countLines, localCountLines);
+      stockMovements.forEach((remote, index) => {
+        const stored = localStockMovements[index];
+        if (
+          stored &&
+          !stored.isSynced &&
+          !sameStockMovement(stored, remote)
+        ) {
+          conflicts.push({
+            table: "stock_movements",
+            id: remote.id,
+            localUpdatedAt: stored.updatedAt,
+            remoteUpdatedAt: remote.updatedAt,
+            detectedAt: new Date().toISOString(),
+          });
+        }
+      });
+      await db.categories.bulkPut(
+        categories.filter(
+          (remote, index) =>
+            !localCategories[index] ||
+            localCategories[index]!.isSynced ||
+            remote.updatedAt >= localCategories[index]!.updatedAt,
+        ),
+      );
       await db.parties.bulkPut(
         parties.filter(
           (remote, index) =>
@@ -827,12 +1055,37 @@ async function pullRemote(supabase: SupabaseClient) {
             remote.updatedAt >= localExpenses[index]!.updatedAt,
         ),
       );
+      await db.countSessions.bulkPut(
+        countSessions.filter(
+          (remote, index) =>
+            !localCountSessions[index] ||
+            localCountSessions[index]!.isSynced ||
+            remote.updatedAt >= localCountSessions[index]!.updatedAt,
+        ),
+      );
+      await db.countLines.bulkPut(
+        countLines.filter(
+          (remote, index) =>
+            !localCountLines[index] ||
+            localCountLines[index]!.isSynced ||
+            remote.updatedAt >= localCountLines[index]!.updatedAt,
+        ),
+      );
+      await db.stockMovements.bulkPut(
+        stockMovements.filter((remote, index) => {
+          const stored = localStockMovements[index];
+          return !stored || stored.isSynced || sameStockMovement(stored, remote);
+        }),
+      );
     },
   );
   if (conflicts.length) {
     let previous: unknown[] = [];
     try { previous = JSON.parse(String((await db.meta.get("sync-conflicts-v1"))?.value || "[]")) as unknown[]; } catch {}
     await db.meta.put({ key: "sync-conflicts-v1", value: JSON.stringify([...previous, ...conflicts].slice(-100)) });
+  }
+  if (conflicts.some((conflict) => conflict.table === "stock_movements")) {
+    throw new Error("A stock audit record conflicts with the cloud copy. No inventory rows were uploaded; review Sync Center before retrying.");
   }
 }
 
@@ -856,6 +1109,21 @@ export async function reconcilePartyBalances() {
           ),
         );
       }
+    const returnCreditsByInvoice = new Map<string, number>();
+    for (const invoice of invoices) {
+      if (
+        invoice.deletedAt ||
+        (invoice.type !== "sale_return" && invoice.type !== "purchase_return")
+      ) continue;
+      for (const allocation of invoice.returnDetails?.allocations || []) {
+        const amount = roundMoney(Number(allocation.amount || 0));
+        if (!allocation.invoiceId || amount <= 0) continue;
+        returnCreditsByInvoice.set(
+          allocation.invoiceId,
+          roundMoney((returnCreditsByInvoice.get(allocation.invoiceId) || 0) + amount),
+        );
+      }
+    }
     const stamp = new Date().toISOString();
     const canonicalInvoices = new Map<string, Invoice>();
     for (const invoice of invoices) {
@@ -879,6 +1147,44 @@ export async function reconcilePartyBalances() {
             updatedAt: stamp,
             isSynced: false,
           });
+        continue;
+      }
+      if (invoice.type === "sale_return" || invoice.type === "purchase_return") {
+        if (invoice.deletedAt) {
+          canonicalInvoices.set(invoice.id, invoice);
+          continue;
+        }
+        const settlementAmount = Math.min(
+          invoice.grandTotal,
+          Math.max(
+            0,
+            roundMoney(
+              invoice.returnDetails?.settlementAmount ??
+              invoice.initialAmountPaid ??
+              invoice.amountPaid,
+            ),
+          ),
+        );
+        const canonical = {
+          ...invoice,
+          initialAmountPaid: settlementAmount,
+          amountPaid: settlementAmount,
+          amountDue: 0,
+        };
+        canonicalInvoices.set(invoice.id, canonical);
+        if (
+          invoice.initialAmountPaid == null ||
+          Math.abs(invoice.amountPaid - settlementAmount) >= 0.01 ||
+          Math.abs(invoice.amountDue) >= 0.01
+        ) {
+          await db.invoices.update(invoice.id, {
+            initialAmountPaid: settlementAmount,
+            amountPaid: settlementAmount,
+            amountDue: 0,
+            updatedAt: stamp,
+            isSynced: false,
+          });
+        }
         continue;
       }
       const laterPaid = allocatedByInvoice.get(invoice.id) || 0;
@@ -907,9 +1213,10 @@ export async function reconcilePartyBalances() {
         invoice.grandTotal,
         roundMoney(initialAmountPaid + laterPaid),
       );
+      const returnCredit = returnCreditsByInvoice.get(invoice.id) || 0;
       const amountDue = Math.max(
         0,
-        roundMoney(invoice.grandTotal - amountPaid),
+        roundMoney(invoice.grandTotal - amountPaid - returnCredit),
       );
       const canonical = {
         ...invoice,
@@ -947,6 +1254,13 @@ export async function reconcilePartyBalances() {
       }
       for (const due of dues) if (due.partyId === party.id) balance += due.amount;
       for (const payment of payments) if (payment.partyId === party.id) balance -= payment.amount;
+      for (const invoice of canonicalInvoices.values()) {
+        if (
+          invoice.partyId === party.id &&
+          !invoice.deletedAt &&
+          (invoice.type === "sale_return" || invoice.type === "purchase_return")
+        ) balance -= Math.max(0, roundMoney(invoice.returnDetails?.balanceApplied || 0));
+      }
       balance = roundMoney(Math.max(0, balance));
       if (Math.abs(balance - party.currentBalance) >= 0.01) {
         await db.parties.update(party.id, { currentBalance: balance, updatedAt: stamp, isSynced: false });
@@ -961,6 +1275,7 @@ export async function pendingCount() {
 }
 
 export interface PendingBreakdown {
+  categories: number;
   parties: number;
   items: number;
   prices: number;
@@ -968,11 +1283,15 @@ export interface PendingBreakdown {
   payments: number;
   dues: number;
   expenses: number;
+  countSessions: number;
+  countLines: number;
+  stockMovements: number;
 }
 
 export async function pendingBreakdown(): Promise<PendingBreakdown> {
-  const [parties, items, prices, invoices, payments, dues, expenses] =
+  const [categories, parties, items, prices, invoices, payments, dues, expenses, countSessions, countLines, stockMovements] =
     await Promise.all([
+      db.categories.filter((x) => !x.isSynced).count(),
       db.parties.filter((x) => !x.isSynced).count(),
       db.items.filter((x) => !x.isSynced).count(),
       db.partyItemPrices.filter((x) => !x.isSynced).count(),
@@ -980,8 +1299,11 @@ export async function pendingBreakdown(): Promise<PendingBreakdown> {
       db.payments.filter((x) => !x.isSynced).count(),
       db.accountEntries.filter((x) => !x.isSynced).count(),
       db.expenses.filter((x) => !x.isSynced).count(),
+      db.countSessions.filter((x) => !x.isSynced).count(),
+      db.countLines.filter((x) => !x.isSynced).count(),
+      db.stockMovements.filter((x) => !x.isSynced).count(),
     ]);
-  return { parties, items, prices, invoices, payments, dues, expenses };
+  return { categories, parties, items, prices, invoices, payments, dues, expenses, countSessions, countLines, stockMovements };
 }
 
 export interface SyncDiagnostics {
@@ -1038,8 +1360,15 @@ async function performSyncWithClient(
     // compare-and-swap: Sync Center still records conflicts for review, and a
     // future schema revision should replace client-clock LWW with server versions.
     await pullRemote(supabase);
+    // Older synced databases can still contain festival membership on an
+    // inactive merged source. Move it to the editable active product before
+    // collecting this sync's upload batch so a cloud-first device is repaired
+    // immediately, without waiting for an app restart or a second sync.
+    await normalizeMergedFestivalTags();
+    await reconcileInventoryStock();
     await reconcilePartyBalances();
     const [
+      categories,
       parties,
       items,
       prices,
@@ -1047,7 +1376,11 @@ async function performSyncWithClient(
       payments,
       accountEntries,
       expenses,
+      countSessions,
+      countLines,
+      stockMovements,
     ] = await Promise.all([
+      db.categories.filter((x) => !x.isSynced).toArray(),
       db.parties.filter((x) => !x.isSynced).toArray(),
       db.items.filter((x) => !x.isSynced).toArray(),
       db.partyItemPrices.filter((x) => !x.isSynced).toArray(),
@@ -1055,7 +1388,11 @@ async function performSyncWithClient(
       db.payments.filter((x) => !x.isSynced).toArray(),
       db.accountEntries.filter((x) => !x.isSynced).toArray(),
       db.expenses.filter((x) => !x.isSynced).toArray(),
+      db.countSessions.filter((x) => !x.isSynced).toArray(),
+      db.countLines.filter((x) => !x.isSynced).toArray(),
+      db.stockMovements.filter((x) => !x.isSynced).toArray(),
     ]);
+    await pushTable(supabase, "categories", categories, categoryToRow, businessId);
     await pushTable(supabase, "parties", parties, partyToRow, businessId);
     await pushTable(supabase, "items", items, itemToRow, businessId);
     await pushTable(supabase, "party_item_prices", prices, priceToRow, businessId);
@@ -1069,9 +1406,13 @@ async function performSyncWithClient(
       businessId,
     );
     await pushTable(supabase, "expenses", expenses, expenseToRow, businessId);
+    await pushTable(supabase, "count_sessions", countSessions, countSessionToRow, businessId);
+    await pushTable(supabase, "count_session_lines", countLines, countLineToRow, businessId);
+    await pushTable(supabase, "stock_movements", stockMovements, stockMovementToRow, businessId);
     await db.transaction(
       "rw",
       [
+        db.categories,
         db.parties,
         db.items,
         db.partyItemPrices,
@@ -1079,8 +1420,18 @@ async function performSyncWithClient(
         db.payments,
         db.accountEntries,
         db.expenses,
+        db.countSessions,
+        db.countLines,
+        db.stockMovements,
       ],
       async () => {
+        await Promise.all(
+          categories.map(async (x) => {
+            const current = await db.categories.get(x.id);
+            if (current?.updatedAt === x.updatedAt)
+              await db.categories.update(x.id, { isSynced: true });
+          }),
+        );
         await Promise.all(
           parties.map(async (x) => {
             const current = await db.parties.get(x.id);
@@ -1128,6 +1479,27 @@ async function performSyncWithClient(
             const current = await db.expenses.get(x.id);
             if (current?.updatedAt === x.updatedAt)
               await db.expenses.update(x.id, { isSynced: true });
+          }),
+        );
+        await Promise.all(
+          countSessions.map(async (x) => {
+            const current = await db.countSessions.get(x.id);
+            if (current?.updatedAt === x.updatedAt)
+              await db.countSessions.update(x.id, { isSynced: true });
+          }),
+        );
+        await Promise.all(
+          countLines.map(async (x) => {
+            const current = await db.countLines.get(x.id);
+            if (current?.updatedAt === x.updatedAt)
+              await db.countLines.update(x.id, { isSynced: true });
+          }),
+        );
+        await Promise.all(
+          stockMovements.map(async (x) => {
+            const current = await db.stockMovements.get(x.id);
+            if (current?.updatedAt === x.updatedAt)
+              await db.stockMovements.update(x.id, { isSynced: true });
           }),
         );
       },

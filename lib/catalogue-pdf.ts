@@ -1,6 +1,12 @@
 import type { Item, Language, Unit } from "./db";
 import type { BusinessSettings } from "./pdf";
-import { isNativeApp, shareNativeBlob } from "./native-files";
+import {
+  isNativeApp,
+  isTauriApp,
+  openExternalUrl,
+  saveDesktopBlob,
+  shareNativeBlob,
+} from "./native-files";
 import {
   normalizePdfLanguage,
   pdfDate,
@@ -237,6 +243,19 @@ export async function shareCatalogue(
   const blob = doc.output("blob");
   const title = copy.shareTitle(tierLabel);
   const text = customMessage?.trim() || copy.shareText(business.name || "Midori Kanjo", items.length);
+  if (isTauriApp()) {
+    preparedWindow?.close();
+    const savedPath = await saveDesktopBlob(blob, {
+      fileName: name,
+      title,
+      dialogTitle: copy.dialogShare,
+    });
+    if (!savedPath) return false;
+    await openExternalUrl(
+      `https://wa.me/?text=${encodeURIComponent(`${text}\n${copy.downloaded}`)}`,
+    );
+    return true;
+  }
   if (isNativeApp()) {
     preparedWindow?.close();
     await shareNativeBlob(blob, { fileName: name, title, text, dialogTitle: copy.dialogShare });

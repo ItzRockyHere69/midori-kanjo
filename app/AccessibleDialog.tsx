@@ -152,6 +152,7 @@ export function useDialogFocus(
 export function AccessibleSheet({
   title,
   onClose,
+  closeDisabled = false,
   children,
   panelClassName = "max-w-xl",
   backdropClassName = "z-50 bg-[#102d27]/45",
@@ -159,19 +160,21 @@ export function AccessibleSheet({
 }: {
   title: string;
   onClose: () => void;
+  closeDisabled?: boolean;
   children: ReactNode;
   panelClassName?: string;
   backdropClassName?: string;
   scrollClassName?: string;
 }) {
   const titleId = useId();
-  const panelRef = useDialogFocus(onClose);
+  const requestClose = closeDisabled ? () => undefined : onClose;
+  const panelRef = useDialogFocus(requestClose);
   return (
     <div
       data-dialog-backdrop
       className={`sheet-backdrop fixed inset-0 ${backdropClassName} backdrop-blur-[2px]`}
       onPointerDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget) requestClose();
       }}
     >
       <section
@@ -194,7 +197,8 @@ export function AccessibleSheet({
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={requestClose}
+            disabled={closeDisabled}
             aria-label={closeLabelForTitle(title)}
             className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-[#eeeae1] text-xl font-black"
           >

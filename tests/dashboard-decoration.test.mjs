@@ -41,5 +41,9 @@ test("dot-square is decorative, deterministic and motion-safe", async () => {
   assert.match(styles, /@media \(min-width:1024px\)[\s\S]*\.reports-dashboard-decoration \{ display:block; width:72px; height:72px; \}/);
   assert.doesNotMatch(keyframes, /transform:/);
   assert.match(styles, /@media \(prefers-reduced-motion:reduce\)[\s\S]*\.dotm-square12--animated \.dotm-square12__dot \{ animation:none!important/);
-  assert.match(styles, /nav,button,\.reports-dashboard-decoration\{display:none!important\}/);
+  const printRules = styles.slice(styles.indexOf("@media print"));
+  for (const selector of ["nav", "button", ".reports-dashboard-decoration"]) {
+    assert.match(printRules, new RegExp(selector.replace(".", "\\.")));
+  }
+  assert.match(printRules, /display:none!important/);
 });

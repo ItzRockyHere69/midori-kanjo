@@ -38,10 +38,12 @@ The push starts **Build and test Tauri desktop installers** automatically. Open:
 
 When both matrix jobs are green, open the run and download these artifacts:
 
-- `midori-kanjo-windows-x64-installers`
-- `midori-kanjo-macos-universal-dmg`
+- `midori-kanjo-v0.1.2-windows-x64-installers`
+- `midori-kanjo-v0.1.2-macos-universal-dmg`
 
-Artifacts are retained for 14 days. These internal-test installers are not yet
+Each artifact also contains a SHA-256 checksum file and the Rust dependency
+lock generated for that build. Artifacts are retained for 30 days. These
+internal-test installers are not yet
 commercially code-signed or Apple-notarized, so Windows SmartScreen and macOS
 Gatekeeper may show warnings.
 

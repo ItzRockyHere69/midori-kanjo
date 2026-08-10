@@ -1,7 +1,14 @@
 import type { Invoice, InvoiceLine, Language } from "./db";
 import { invoiceInitialPaymentBreakdown, roundMoney } from "./billing";
 import { localizedInvoicePartyName } from "./i18n";
-import { isNativeApp, shareNativeBlob } from "./native-files";
+import {
+  isNativeApp,
+  isTauriApp,
+  openDesktopPrintBlob,
+  openExternalUrl,
+  saveDesktopBlob,
+  shareNativeBlob,
+} from "./native-files";
 import {
   normalizePdfLanguage,
   pdfAmountInWords,
@@ -926,6 +933,21 @@ export async function shareInvoice(invoice: Invoice, business: BusinessSettings,
   const money = (value: number) => pdfMoney(value, activeLanguage);
   const defaultMessage = invoice.type === "quotation" ? `${partyName} | ${copy.quoted} ${money(invoice.grandTotal)}` : `${partyName} | ${money(invoice.grandTotal)} | ${copy.due} ${money(invoice.amountDue)}`;
   const shareText = customMessage?.trim() || defaultMessage;
+  if (isTauriApp()) {
+    preparedWindow?.close();
+    const doc = await invoicePdf(invoice, business, format, activeLanguage);
+    const fileName = `${invoice.invoiceNumber}.pdf`;
+    const savedPath = await saveDesktopBlob(doc.output("blob"), {
+      fileName,
+      title: `${invoice.type === "quotation" ? copy.quotation : copy.invoice} ${invoice.invoiceNumber}`,
+      dialogTitle: copy.shareInvoicePdf,
+    });
+    if (!savedPath) return false;
+    await openExternalUrl(
+      `https://wa.me/?text=${encodeURIComponent(`${shareText}\n${copy.pdfDownloaded}`)}`,
+    );
+    return true;
+  }
   if (isNativeApp()) {
     preparedWindow?.close();
     const doc = await invoicePdf(invoice, business, format, activeLanguage);
@@ -969,6 +991,13 @@ export async function printInvoice(invoice: Invoice, business: BusinessSettings,
     const doc = await invoicePdf(invoice, business, format, activeLanguage);
     if (native) {
       preparedWindow?.close();
+      if (isTauriApp()) {
+        await openDesktopPrintBlob(doc.output("blob"), {
+          fileName: `${invoice.invoiceNumber}.pdf`,
+          title: `${copy.printTitle} ${invoice.invoiceNumber}`,
+        });
+        return;
+      }
       await shareNativeBlob(doc.output("blob"), {
         fileName: `${invoice.invoiceNumber}.pdf`,
         title: `${copy.printTitle} ${invoice.invoiceNumber}`,

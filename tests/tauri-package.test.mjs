@@ -16,6 +16,7 @@ test("Tauri wraps the existing production SPA with stable desktop identity", asy
   assert.equal(config.app.windows[0].height, 800);
   assert.equal(config.app.windows[0].resizable, true);
   assert.deepEqual(config.bundle.targets, ["msi", "nsis", "dmg"]);
+  assert.equal(config.bundle.windows.webviewInstallMode.type, "offlineInstaller");
   assert.equal(config.bundle.macOS.minimumSystemVersion, "12.0");
   assert.ok(config.app.security.csp.includes("https:"));
 });
@@ -31,7 +32,16 @@ test("desktop icons and window persistence plugin are configured", async () => {
   const rust = await read("src-tauri/src/main.rs");
   const cargo = await read("src-tauri/Cargo.toml");
   assert.match(rust, /tauri_plugin_window_state/);
+  assert.match(rust, /tauri_plugin_single_instance::init/);
+  assert.match(rust, /tauri_plugin_dialog::init/);
+  assert.match(rust, /tauri_plugin_fs::init/);
+  assert.match(rust, /tauri_plugin_opener::init/);
+  assert.match(rust, /tauri::RunEvent::Reopen/);
   assert.match(rust, /cfg\(feature = "desktop-e2e"\)/);
+  assert.match(cargo, /tauri-plugin-single-instance = "2"/);
+  assert.match(cargo, /tauri-plugin-dialog = "2"/);
+  assert.match(cargo, /tauri-plugin-fs = "2"/);
+  assert.match(cargo, /tauri-plugin-opener = "2"/);
   assert.match(
     cargo,
     /desktop-e2e = \["dep:tauri-plugin-wdio-webdriver"\]/,
@@ -62,8 +72,10 @@ test("GitHub Actions produces both requested installer artifact groups", async (
   assert.match(workflow, /macos-latest/);
   assert.match(workflow, /--bundles msi,nsis/);
   assert.match(workflow, /--target universal-apple-darwin --bundles dmg/);
-  assert.match(workflow, /midori-kanjo-windows-x64-installers/);
-  assert.match(workflow, /midori-kanjo-macos-universal-dmg/);
+  assert.match(workflow, /midori-kanjo-v0\.1\.2-windows-x64-installers/);
+  assert.match(workflow, /midori-kanjo-v0\.1\.2-macos-universal-dmg/);
+  assert.match(workflow, /SHA256SUMS-windows\.txt/);
+  assert.match(workflow, /SHA256SUMS-macos\.txt/);
   assert.match(workflow, /run_native_offline_sync_test/);
   assert.match(workflow, /test:tauri:e2e/);
 });

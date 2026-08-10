@@ -50,11 +50,12 @@ when reduced motion is requested.
 
 ## Verification
 
-- Unit tests: 62/62 passed.
-- Mobile package tests: 23/23 passed.
-- Platform, native-security, schema and dashboard tests: 19/19 passed.
+- Unit tests: 99/99 passed.
+- Mobile package tests: 28/28 passed.
+- Platform, native-security, schema, dues-backup and calendar tests: 51/51 passed.
 - Localization regression tests: 6/6 passed.
-- Indic PDF and receipt-sharing regressions: 2/2 passed.
+- Dues TXT/PDF regressions include bulk snapshots and per-customer statements
+  in English, Hindi and Bengali.
 - Tauri package tests: 4/4 passed; desktop package test: 1/1 passed.
 - Recovery-tool mock regression tests: 16/16 passed.
 - TypeScript, targeted ESLint, production web build and clean Android sync all

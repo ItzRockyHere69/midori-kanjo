@@ -1,9 +1,10 @@
 # Midori Kanjo — setup and disaster-recovery guide
 
 **Generated:** 2026-08-10 (Asia/Kolkata)  
-**Application version:** 0.1.1  
-**Android version:** 0.1.1, version code 2  
-**Source snapshot:** `main` at base commit `f77e9e8bfd86d5d155cdf9b59bd759d6778c4b42`, plus the verified 2026-08-10 feature working tree  
+**Application version:** 0.1.2  
+**Android version:** 0.1.2, version code 3  
+**Source snapshot:** the completed 2026-08-10 dark-mode readability and theme-lifecycle release on complete-recovery baseline `7f2ac4d`
+
 **Repository at generation:** OpenAI Sites project `appgprj_6a76356b6e7c8191bbe5a03637a9ac77`
 
 This guide is written for a person with no memory of the project. Follow the
@@ -27,13 +28,17 @@ Midori Kanjo has one React/TypeScript application shared by:
 Dexie/IndexedDB is the local source of truth. The app can create records while
 offline; Supabase is an optional synchronization and cloud-copy layer.
 
-The repository contains billing, parties, dues, payments, items, product
-photos, inventory-related stores, reports, PDFs, expenses, quotations, PWA
-assets, native wrappers and automated billing/sync tests. Do not assume that
-every feature described in old project conversations exists: the checked-in
-README at this snapshot says Phase 2 counting and Phase 3 festival planning are
-not fully built, which conflicts with some earlier project descriptions. The
-source and tests at the commit above are authoritative.
+The repository contains billing, parties, complete PDF/TXT dues-ledger backup
+and restore, owner-locked master recovery, payments, items, product photos, the
+complete Phase 2 inventory workflow, Phase 3 festival planning with the
+expanded month/year calendar, readable light/dark themes, reports, PDFs,
+expenses, quotations, PWA assets, native wrappers and automated
+billing/inventory/sync/theme tests. The source and tests in this verified
+snapshot are authoritative.
+
+The interface-size preference is device-local. In **More → Interface size**,
+the operator can choose 100%, 110%, 120% or 130%. It enlarges and reflows the
+software interface but deliberately does not alter printed bills or PDFs.
 
 ## 2. External services and accounts
 
@@ -88,7 +93,6 @@ Preferred build-time names:
 ```text
 VITE_SUPABASE_URL
 VITE_SUPABASE_ANON_KEY
-VITE_SUPABASE_SYNC_CODE
 ```
 
 Supported Node/Vinext fallback aliases:
@@ -96,19 +100,16 @@ Supported Node/Vinext fallback aliases:
 ```text
 NEXT_PUBLIC_SUPABASE_URL
 NEXT_PUBLIC_SUPABASE_ANON_KEY
-NEXT_PUBLIC_SUPABASE_SYNC_CODE
 ```
 
 Obtain the URL and publishable/legacy anon key from **Supabase project →
 Project Settings → API**. Never use the Supabase `service_role` key in a client
 build. Generate the business sync code yourself; it must be at least 20
 characters and must be identical on every trusted device for the same business.
-It is effectively the tenant password used by the current RLS policies.
-
-For public web builds, leave `VITE_SUPABASE_SYNC_CODE` blank and enter the
-configuration per trusted device in **More → Cloud backup**. A `VITE_*` value is
-compiled into readable browser JavaScript; embedding the private sync code in a
-public build defeats its secrecy.
+It is effectively the tenant password used by the current RLS policies. Enter
+it only per trusted device in **More → Cloud backup**. The application
+intentionally ignores client-public sync-code environment variables because
+they would be extractable from the JavaScript bundle.
 
 Create an ignored local file only when a preconfigured internal build is needed:
 
@@ -233,15 +234,15 @@ From the source repository, when you have access:
 ```bash
 git clone YOUR_AUTHORIZED_SOURCE_REPOSITORY_URL
 cd midori-kanjo
-git checkout f77e9e8bfd86d5d155cdf9b59bd759d6778c4b42
+git checkout main
 npm ci
 ```
 
-The base commit alone does not include the 2026-08-10 feature working tree.
-Use the dated backup ZIP below to recover the exact verified snapshot:
+Use the dated backup ZIP below to recover the exact verified snapshot without
+depending on repository access:
 
 ```bash
-unzip midori-kanjo-full-backup-2026-08-09.zip
+unzip "Midori Kanjo V2 final version.zip"
 cd midori-kanjo
 npm ci
 ```
@@ -287,10 +288,12 @@ controls before broad distribution.
 
 ### 6.3 Apply the schema and RLS policies
 
-The migration chain is now self-contained. The added baseline
-`supabase/migrations/202608080000_initial_complete_schema.sql` creates all seven
-cloud tables, relationships, indexes, RLS state and policies. The later three
-migrations are idempotent historical changes and apply in filename order.
+The migration chain is self-contained. The baseline
+`supabase/migrations/202608080000_initial_complete_schema.sql` creates all 11
+cloud tables, relationships, indexes, RLS state and policies. Later migrations
+are idempotent incremental changes and apply in filename order; the Phase 2
+upgrade for an existing database is
+`202608101500_phase2_inventory_sync.sql`.
 
 Recommended CLI route:
 
@@ -319,8 +322,9 @@ select tablename, rowsecurity
 from pg_tables
 where schemaname = 'public'
   and tablename in (
-    'parties', 'items', 'party_item_prices', 'invoices',
-    'payments', 'account_entries', 'expenses'
+    'categories', 'parties', 'items', 'party_item_prices', 'invoices',
+    'payments', 'account_entries', 'expenses', 'count_sessions',
+    'count_session_lines', 'stock_movements'
   )
 order by tablename;
 
@@ -333,12 +337,13 @@ order by tablename, policyname;
 Every listed table should have RLS enabled and one `business ...` policy for
 the `authenticated` role.
 
-### 6.4 Enable Realtime for synchronized tables
+### 6.4 Verify Realtime for synchronized tables
 
-In **Database → Publications / Replication**, include the seven public tables
-above in the `supabase_realtime` publication. The app still performs explicit
+The fresh schema and Phase 2 migration idempotently add all 11 synchronized
+tables to `supabase_realtime` when that publication exists. Verify them in
+**Database → Publications / Replication**. The app still performs explicit
 push/pull sync without Realtime, but another device's changes will not trigger
-an immediate refresh unless the tables publish changes.
+an immediate refresh when a table is absent from the publication.
 
 ### 6.5 Obtain the application values
 
@@ -385,8 +390,9 @@ all tenants or Auth users.
 
 ### 7.2 Export device-local IndexedDB
 
-Supabase omits categories, stock movements, count sessions, activity logs,
-daily closes and `meta`. It may also be missing offline rows not yet synced.
+Supabase mirrors the 11 business tables listed in section 6.3. Festival
+calendar entries/tasks, activity logs, daily closes and `meta` remain
+device-local, and any store may contain rows that have not synced yet.
 
 For each authoritative browser profile/device:
 
@@ -400,12 +406,13 @@ The tool exports every Dexie store but deliberately excludes localStorage,
 sessionStorage, the Supabase key and the business sync code. Production Tauri
 and Android containers may not expose DevTools conveniently; if the only
 authoritative data is inside one of those containers, do not uninstall it.
-First sync every supported store to Supabase and plan an app-level encrypted
-export feature for the remaining local-only stores.
+First sync every supported store to Supabase and preserve a local export for
+the remaining device-local stores.
 
 ### 7.3 Restore cloud rows into the new empty project
 
-Apply the schema first. Confirm the seven application tables contain zero rows.
+Apply the schema first. Confirm the 11 synchronized application tables contain
+zero rows.
 Then:
 
 ```bash
@@ -419,7 +426,7 @@ The restore verifies CSV checksums, refuses a nonempty destination, loads rows
 in foreign-key order in one transaction and rebinds them to the new business
 code.
 
-### 7.4 Restore local-only data
+### 7.4 Restore device-local data
 
 1. Open the new app once so Dexie creates the current database version.
 2. Open the developer console on that same origin/profile.
@@ -432,7 +439,7 @@ code.
 
 Do not merge multiple device JSON files blindly. Choose one authoritative local
 snapshot, then let the stable IDs and Supabase sync reconcile supported stores.
-Manually review local-only differences from secondary devices.
+Manually review device-local differences from secondary devices.
 
 ## 8. Run the web/PWA version locally
 
@@ -543,7 +550,7 @@ not merely closing and reopening a tab.
 
 ## 11. Build the Capacitor Android app
 
-Run on a machine with Node, Java 17, Android Studio and SDK 34:
+Run on a machine with Node, Java 17, Android Studio and SDK 35:
 
 ```bash
 npm ci
@@ -590,16 +597,15 @@ On a physical device test:
 - [ ] `npm ci`, lint, unit tests and production web build pass.
 - [ ] New Supabase production and E2E projects exist.
 - [ ] Anonymous Sign-Ins are enabled.
-- [ ] All seven tables, foreign keys, indexes and RLS policies exist.
-- [ ] Realtime publication includes the seven synchronized tables.
+- [ ] All 11 synchronized tables, foreign keys, indexes and RLS policies exist.
+- [ ] Realtime publication includes all 11 synchronized tables.
 - [ ] Production URL/key/sync code are stored only in the password manager and
       trusted device configuration.
 - [ ] Sensitive Supabase CSV and local IndexedDB JSON exports are encrypted and
       checksummed.
-- [ ] Parties, items, invoices, payments, expenses and product images match the
-      old system.
-- [ ] Local-only categories, stock history, count sessions, daily closes,
-      activity logs and device settings were reviewed.
+- [ ] Parties, items, invoices, payments, expenses, categories, stock history,
+      count sessions and product images match the old system.
+- [ ] Device-local daily closes, activity logs and settings were reviewed.
 - [ ] Offline create → quit/restart → reconnect → double-sync passes on web,
       Windows, macOS and a physical Android device.
 - [ ] Printed A4/A5/thermal output was checked on the actual shop printer.
@@ -612,8 +618,9 @@ On a physical device test:
    documentation says to create it as private. It currently passed a tracked-
    source secret scan, but public visibility increases the cost of any future
    mistake.
-2. **Supabase is not a full backup.** Five operational stores plus `meta` are
-   local-only. An app-level encrypted export/import should be a future priority.
+2. **Supabase is not a full backup.** Activity logs, daily closes and `meta`
+   remain device-local, and unsynced rows can exist in any local store. Keep the
+   IndexedDB export alongside the 11-table cloud export.
 3. **The production live schema was not readable during packaging.** The new
    baseline closes the obvious repository migration gap, but dashboard-only
    live changes must be captured with `supabase db dump`/`db pull` before the
@@ -639,15 +646,20 @@ On a physical device test:
     thumbnails is not implemented.
 11. **`sharp` is an undeclared direct tool dependency**, although the npm
     lockfile currently provides it transitively.
-12. **Realtime requires a publication toggle** that SQL files do not currently
-    enforce. Document and verify it on every new project.
+12. **Realtime still needs verification.** The SQL adds synchronized tables to
+    `supabase_realtime` when the publication exists, but verify the hosted
+    project's publication after every restore or provider change.
 13. **Real Android offline-sync is not in the GitHub workflow.** The native
     desktop path has a conditional E2E test; Android still needs a physical-
     device acceptance run.
-14. **Feature documentation conflicts.** Earlier claims of complete festival
-    planning do not match this snapshot's README. Reconcile product scope before
-    promising it to another user.
-15. **The production mobile/desktop bundle has an 853 kB minified main chunk.**
+14. **Choose the recovery file for the intended scope.** Current `MKDUES2`
+    PDF/text files restore the complete due-contributing customer ledger,
+    including raw invoices/returns, payments, allocations and manual entries;
+    legacy `MKDUES1` remains a clearly labelled balance-only path. `MKMASTER1`
+    replaces all 16 local stores and portable settings. Both file types are
+    checksummed but unencrypted, and neither contains the owner PIN or cloud
+    credentials.
+15. **The production mobile/desktop bundle has an approximately 2.39 MB minified main chunk.**
     Vite reports it above the 500 kB warning threshold. It is functional, but
     lower-end phones would benefit from reviewed code splitting and lazy loading.
 

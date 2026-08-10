@@ -4,6 +4,31 @@
   "description": "Minimal permissions for the Midori Kanjo desktop window",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "dialog:allow-save",
+    {
+      "identifier": "fs:allow-mkdir",
+      "allow": [
+        { "path": "$APPCACHE/midori-kanjo-print" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": [
+        { "path": "$APPCACHE/midori-kanjo-print/*" }
+      ]
+    },
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$APPCACHE/midori-kanjo-print/*" }
+      ]
+    },
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://wa.me/**" }
+      ]
+    }
   ]
 }

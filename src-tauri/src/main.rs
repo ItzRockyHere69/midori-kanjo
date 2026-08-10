@@ -1,6 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg(feature = "desktop-e2e")]
 use tauri::Manager;
 
 #[cfg(feature = "desktop-e2e")]
@@ -11,8 +10,24 @@ const DESKTOP_E2E_CAPABILITY: &str = r#"{
   "permissions": ["wdio-webdriver:default"]
 }"#;
 
+fn focus_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 fn main() {
     let builder = tauri::Builder::default()
+        // Single-instance must be registered first so a second launch cannot
+        // race the existing IndexedDB profile or its cloud-sync worker.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            focus_main_window(app);
+        }))
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build());
 
     #[cfg(feature = "desktop-e2e")]
@@ -26,7 +41,20 @@ fn main() {
             Ok(())
         });
 
-    builder
-        .run(tauri::generate_context!())
+    let app = builder
+        .build(tauri::generate_context!())
         .expect("Midori Kanjo could not start");
+
+    app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } = event
+        {
+            if !has_visible_windows {
+                focus_main_window(app_handle);
+            }
+        }
+    });
 }

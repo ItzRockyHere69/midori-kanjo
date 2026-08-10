@@ -51,7 +51,7 @@ test("desktop workflow executes immutable reviewed action revisions", async () =
   const workflow = await read(".github/workflows/tauri-desktop.yml");
   const actionRefs = [...workflow.matchAll(/^\s*uses:\s+([^@\s]+)@([^\s#]+)/gm)]
     .map((match) => [match[1], match[2]]);
-  assert.deepEqual(actionRefs, [
+  const reviewed = new Map([
     ["actions/checkout", "11d5960a326750d5838078e36cf38b85af677262"],
     ["actions/setup-node", "49933ea5288caeca8642d1e84afbd3f7d6820020"],
     ["dtolnay/rust-toolchain", "e97e2d8cc328f1b50210efc529dca0028893a2d9"],
@@ -59,10 +59,71 @@ test("desktop workflow executes immutable reviewed action revisions", async () =
     ["tauri-apps/tauri-action", "1deb371b0cd8bd54025b384f1cd735e725c4060f"],
     ["actions/upload-artifact", "ea165f8d65b6e75b540449e92b4886f43607fa02"],
   ]);
-  for (const [, revision] of actionRefs) {
+  assert.deepEqual(new Set(actionRefs.map(([action]) => action)), new Set(reviewed.keys()));
+  for (const [action, revision] of actionRefs) {
+    assert.equal(revision, reviewed.get(action), `${action} must use the reviewed revision`);
     assert.match(revision, /^[a-f0-9]{40}$/, `${revision} must be a full commit SHA`);
   }
   assert.match(workflow, /dtolnay\/rust-toolchain@[a-f0-9]{40} # v1[\s\S]*toolchain: stable/);
+});
+
+test("Tauri desktop file handling is native, scoped and offline-installable", async () => {
+  const [source, cargo, rust, capability, mobileHtml, config, packageJson] =
+    await Promise.all([
+      read("lib/native-files.ts"),
+      read("src-tauri/Cargo.toml"),
+      read("src-tauri/src/main.rs"),
+      read("src-tauri/capabilities/default.json"),
+      read("mobile/index.html"),
+      read("src-tauri/tauri.conf.json"),
+      read("package.json"),
+    ]);
+  const permissions = JSON.parse(capability).permissions;
+  const byIdentifier = new Map(
+    permissions
+      .filter((permission) => typeof permission === "object")
+      .map((permission) => [permission.identifier, permission]),
+  );
+  assert.match(source, /export function isTauriApp\(\)/);
+  assert.match(source, /import\("@tauri-apps\/plugin-dialog"\)/);
+  assert.match(source, /import\("@tauri-apps\/plugin-fs"\)/);
+  assert.match(source, /import\("@tauri-apps\/plugin-opener"\)/);
+  assert.match(source, /await openPath\(path\)/);
+  assert.match(source, /target\.hostname !== "wa\.me"/);
+  for (const plugin of ["dialog", "fs", "opener", "single-instance"])
+    assert.match(cargo, new RegExp(`tauri-plugin-${plugin} = "2"`));
+  assert.ok(
+    rust.indexOf("tauri_plugin_single_instance::init") <
+      rust.indexOf("tauri_plugin_dialog::init"),
+    "single-instance protection is registered before other desktop plugins",
+  );
+  assert.match(rust, /tauri::RunEvent::Reopen/);
+  assert.ok(permissions.includes("dialog:allow-save"));
+  assert.deepEqual(byIdentifier.get("fs:allow-mkdir")?.allow, [
+    { path: "$APPCACHE/midori-kanjo-print" },
+  ]);
+  assert.deepEqual(byIdentifier.get("fs:allow-write-file")?.allow, [
+    { path: "$APPCACHE/midori-kanjo-print/*" },
+  ]);
+  assert.deepEqual(byIdentifier.get("opener:allow-open-path")?.allow, [
+    { path: "$APPCACHE/midori-kanjo-print/*" },
+  ]);
+  assert.deepEqual(byIdentifier.get("opener:allow-open-url")?.allow, [
+    { url: "https://wa.me/**" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(permissions), /fs:default|opener:default/);
+  assert.match(mobileHtml, /connect-src 'self' ipc: http:\/\/ipc\.localhost/);
+  assert.equal(
+    JSON.parse(config).bundle.windows.webviewInstallMode.type,
+    "offlineInstaller",
+  );
+  const dependencies = JSON.parse(packageJson).dependencies;
+  for (const dependency of [
+    "@tauri-apps/api",
+    "@tauri-apps/plugin-dialog",
+    "@tauri-apps/plugin-fs",
+    "@tauri-apps/plugin-opener",
+  ]) assert.ok(dependencies[dependency], `${dependency} is installed`);
 });
 
 test("production Tauri builds omit the optional WebDriver dependency and permission", async () => {

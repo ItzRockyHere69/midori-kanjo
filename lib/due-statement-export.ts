@@ -1,7 +1,15 @@
 import type { PartyDueStatement, PartyDueStatementRow } from "./billing";
 import type { Language } from "./db";
 import type { BusinessSettings } from "./pdf";
-import { shareNativeBlob } from "./native-files";
+import {
+  importedDueActivityLabel,
+} from "./due-backup";
+import {
+  createDuesLedgerEnvelope,
+  createDuesLedgerPdf,
+  downloadCurrentDuesLedgerBackup,
+  duesLedgerText,
+} from "./dues-ledger-archive";
 import {
   normalizePdfLanguage,
   pdfDate,
@@ -11,12 +19,6 @@ import {
   registerPdfFont,
   setPdfFont,
 } from "./pdf-i18n";
-
-const safePart = (value: string) =>
-  value
-    .trim()
-    .replace(/[^a-z0-9_-]+/gi, "-")
-    .replace(/^-+|-+$/g, "") || "customer";
 
 export const partyStatementLabel = (
   party: Pick<PartyDueStatement["party"], "name" | "codeName">,
@@ -31,6 +33,8 @@ type DueCopy = {
   accountSummary: string;
   totalDueAdded: string;
   totalPaid: string;
+  returnCredits: string;
+  cashRefunded: string;
   amountToPay: string;
   lastPayment: string;
   on: string;
@@ -68,6 +72,7 @@ const dueCopy: Record<Language, DueCopy> = {
     phone: "Phone", generated: "Generated", customerParty: "Customer / Party",
     customerCode: "Customer code", address: "Address", accountSummary: "ACCOUNT SUMMARY",
     totalDueAdded: "Total due added", totalPaid: "Total paid",
+    returnCredits: "Return credits", cashRefunded: "Cash refunded",
     amountToPay: "AMOUNT TO PAY NEXT / TOTAL REMAINING", lastPayment: "Last payment",
     on: "on", via: "via", noPayment: "No payment recorded",
     detailedActivity: "DETAILED DUE ACTIVITY", date: "Date", activity: "Activity",
@@ -91,6 +96,7 @@ const dueCopy: Record<Language, DueCopy> = {
     phone: "फ़ोन", generated: "बनाने की तारीख", customerParty: "ग्राहक / पार्टी",
     customerCode: "ग्राहक कोड", address: "पता", accountSummary: "खाते का सारांश",
     totalDueAdded: "कुल जोड़ी गई बकाया राशि", totalPaid: "कुल भुगतान",
+    returnCredits: "वापसी क्रेडिट", cashRefunded: "कैश रिफंड",
     amountToPay: "अगला भुगतान / कुल बाकी", lastPayment: "पिछला भुगतान",
     on: "को", via: "के ज़रिए", noPayment: "कोई भुगतान दर्ज नहीं है",
     detailedActivity: "बकाया खाते का पूरा विवरण", date: "तारीख", activity: "लेन-देन",
@@ -114,6 +120,7 @@ const dueCopy: Record<Language, DueCopy> = {
     phone: "ফোন", generated: "তৈরির তারিখ", customerParty: "ক্রেতা / পার্টি",
     customerCode: "ক্রেতার কোড", address: "ঠিকানা", accountSummary: "খাতার সারাংশ",
     totalDueAdded: "মোট যোগ হওয়া বাকি", totalPaid: "মোট পেমেন্ট",
+    returnCredits: "ফেরত ক্রেডিট", cashRefunded: "নগদ ফেরত",
     amountToPay: "পরের পেমেন্ট / মোট বাকি", lastPayment: "শেষ পেমেন্ট",
     on: "তারিখে", via: "মাধ্যমে", noPayment: "কোনো পেমেন্ট লেখা নেই",
     detailedActivity: "বাকি খাতার সম্পূর্ণ বিবরণ", date: "তারিখ", activity: "লেনদেন",
@@ -136,17 +143,23 @@ const dueCopy: Record<Language, DueCopy> = {
 };
 
 function localizedActivity(row: PartyDueStatementRow, language: Language) {
+  if (row.kind === "manual_due" && row.reference.startsWith("MKDUES1|"))
+    return importedDueActivityLabel(language);
   if (language === "en") return row.activity;
   const labels = language === "hi"
     ? {
         opening_balance: "शुरुआती बैलेंस",
         sale_invoice: "बिक्री बिल",
+        return_credit: "बिक्री वापसी क्रेडिट",
+        return_refund: "तुरंत वापसी रिफंड",
         payment: row.activity === "Payment received with bill" ? "बिल के साथ मिला भुगतान" : "ग्राहक से मिला भुगतान",
         balance_adjustment: "खाते के बैलेंस का मिलान",
       }
     : {
         opening_balance: "শুরুর ব্যালেন্স",
         sale_invoice: "বিক্রির বিল",
+        return_credit: "বিক্রি ফেরতের ক্রেডিট",
+        return_refund: "তাৎক্ষণিক ফেরত রিফান্ড",
         payment: row.activity === "Payment received with bill" ? "বিলের সঙ্গে পাওয়া পেমেন্ট" : "ক্রেতার কাছ থেকে পাওয়া পেমেন্ট",
         balance_adjustment: "খাতার ব্যালেন্স মেলানো",
       };
@@ -195,25 +208,28 @@ export function dueStatementText(
     copy.accountSummary,
     `${copy.totalDueAdded}\t${money(statement.totalDueAdded)}`,
     `${copy.totalPaid}\t${money(statement.totalPaid)}`,
+    `${copy.returnCredits}\t${money(statement.totalReturnCredits)}`,
+    `${copy.cashRefunded}\t${money(statement.totalRefunded)}`,
     `${copy.amountToPay}\t${money(statement.remainingDue)}`,
     last
       ? `${copy.lastPayment}\t${money(last.amount)} ${copy.on} ${pdfDate(last.date, active)} ${copy.via} ${pdfPaymentMode(last.mode, active)}${last.reference ? ` | ${last.reference}` : ""}`
       : `${copy.lastPayment}\t${copy.noPayment}`,
     "",
     `${copy.detailedActivity} - ${accountLabel}`,
-    `${copy.date}\t${copy.activity}\t${copy.referenceMode}\t${copy.dueAdded}\t${copy.paymentReceived}\t${copy.runningBalance}`,
+    `${copy.date}\t${copy.generated}\t${copy.activity}\t${copy.referenceMode}\t${copy.dueAdded}\t${copy.paymentReceived}\t${copy.runningBalance}`,
     ...statement.rows.map((row) =>
       [
         pdfDate(row.date, active),
+        pdfDateTime(new Date(row.timestamp), active),
         localizedActivity(row, active),
         [localizedReference(row, active), pdfPaymentMode(row.paymentMode, active)].filter(Boolean).join(" | "),
         row.dueAdded ? money(row.dueAdded) : "-",
-        row.paymentReceived ? money(row.paymentReceived) : "-",
+        row.paymentReceived ? money(row.paymentReceived) : row.refundPaid ? `${copy.cashRefunded} ${money(row.refundPaid)}` : "-",
         money(row.runningBalance),
       ].join("\t"),
     ),
     "",
-    `${copy.total}\t\t\t${money(statement.totalDueAdded)}\t${money(statement.totalPaid)}\t${money(statement.remainingDue)}`,
+    `${copy.total}\t\t\t\t${money(statement.totalDueAdded)}\t${money(statement.totalBalanceReductions)}\t${money(statement.remainingDue)}`,
     "",
     copy.sourceNote,
   ]
@@ -380,7 +396,7 @@ export async function createDueStatementPdf(
   }
 
   statement.rows.forEach((row, index) => {
-    const details = doc.splitTextToSize(rowDetails(row, active), 74).slice(0, 3);
+    const details = doc.splitTextToSize(rowDetails(row, active), 74);
     const rowHeight = Math.max(11, details.length * 3.2 + 4.5);
     if (y + rowHeight > height - 16) {
       doc.addPage();
@@ -396,7 +412,10 @@ export async function createDueStatementPdf(
     setPdfFont(doc);
     doc.setFontSize(6.3);
     doc.setTextColor(...ink);
-    doc.text(pdfDate(row.date, active, { day: "2-digit", month: "short", year: "2-digit" }), margin + 2, y + 5);
+    doc.text([
+      pdfDate(row.date, active, { day: "2-digit", month: "short", year: "2-digit" }),
+      pdfDateTime(new Date(row.timestamp), active),
+    ], margin + 2, y + 5, { maxWidth: 24 });
     doc.text(details, margin + 28, y + 5);
     setPdfFont(doc, "bold");
     if (row.dueAdded) doc.text(money(row.dueAdded), right - 55, y + 5, { align: "right" });
@@ -420,7 +439,7 @@ export async function createDueStatementPdf(
   doc.setTextColor(255, 255, 255);
   doc.text(copy.total.toUpperCase(), margin + 3, y + 6);
   doc.text(money(statement.totalDueAdded), right - 55, y + 6, { align: "right" });
-  doc.text(money(statement.totalPaid), right - 29, y + 6, { align: "right" });
+  doc.text(money(statement.totalBalanceReductions), right - 29, y + 6, { align: "right" });
   doc.setFontSize(9);
   doc.text(money(statement.remainingDue), right - 2, y + 6, { align: "right" });
   doc.setFontSize(6.3);
@@ -430,27 +449,34 @@ export async function createDueStatementPdf(
   return doc;
 }
 
-async function shareOrDownload(
-  blob: Blob,
-  fileName: string,
-  title: string,
-  text: string,
-  dialogTitle: string,
+export async function createImportableDueStatementPdf(
+  statement: PartyDueStatement,
+  business: BusinessSettings,
+  language: Language = "en",
 ) {
-  if (await shareNativeBlob(blob, { fileName, title, text, dialogTitle })) return "shared" as const;
+  const active = normalizePdfLanguage(language);
+  const envelope = await createDuesLedgerEnvelope({
+    parties: [statement.party],
+    invoices: statement.invoices,
+    payments: statement.payments,
+    accountEntries: statement.accountEntries,
+  }, business, { selectedPartyIds: [statement.party.id] });
+  return createDuesLedgerPdf(envelope, active);
+}
 
-  // Browser Web Share support is inconsistent on desktops and can leave the
-  // promise pending behind an operating-system dialog. Web exports therefore
-  // always download; installed native apps continue to use the share sheet.
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = fileName;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-  return "downloaded" as const;
+export async function createImportableDueStatementText(
+  statement: PartyDueStatement,
+  business: BusinessSettings,
+  language: Language = "en",
+) {
+  const active = normalizePdfLanguage(language);
+  const envelope = await createDuesLedgerEnvelope({
+    parties: [statement.party],
+    invoices: statement.invoices,
+    payments: statement.payments,
+    accountEntries: statement.accountEntries,
+  }, business, { selectedPartyIds: [statement.party.id] });
+  return `\uFEFF${duesLedgerText(envelope, active)}`;
 }
 
 export async function downloadDueStatementPdf(
@@ -458,16 +484,7 @@ export async function downloadDueStatementPdf(
   business: BusinessSettings,
   language: Language = "en",
 ) {
-  const active = normalizePdfLanguage(language);
-  const copy = dueCopy[active];
-  const doc = await createDueStatementPdf(statement, business, active);
-  const accountLabel = partyStatementLabel(statement.party);
-  const codePart = statement.party.codeName ? `-${safePart(statement.party.codeName)}` : "";
-  const fileName = `Midori-Kanjo-due-statement-${safePart(statement.party.name)}${codePart}-${new Date().toISOString().slice(0, 10)}.pdf`;
-  return shareOrDownload(
-    doc.output("blob"), fileName, copy.title(accountLabel),
-    copy.shareText(accountLabel, pdfMoney(statement.remainingDue, active)), copy.dialogTitle,
-  );
+  return downloadCurrentDuesLedgerBackup("pdf", business, language, [statement.party.id]);
 }
 
 export async function downloadDueStatementText(
@@ -475,14 +492,5 @@ export async function downloadDueStatementText(
   business: BusinessSettings,
   language: Language = "en",
 ) {
-  const active = normalizePdfLanguage(language);
-  const copy = dueCopy[active];
-  const content = `\uFEFF${dueStatementText(statement, business, active)}`;
-  const accountLabel = partyStatementLabel(statement.party);
-  const codePart = statement.party.codeName ? `-${safePart(statement.party.codeName)}` : "";
-  const fileName = `Midori-Kanjo-due-statement-${safePart(statement.party.name)}${codePart}-${new Date().toISOString().slice(0, 10)}.txt`;
-  return shareOrDownload(
-    new Blob([content], { type: "text/plain;charset=utf-8" }), fileName, copy.title(accountLabel),
-    copy.shareText(accountLabel, pdfMoney(statement.remainingDue, active)), copy.dialogTitle,
-  );
+  return downloadCurrentDuesLedgerBackup("text", business, language, [statement.party.id]);
 }

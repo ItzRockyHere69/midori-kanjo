@@ -1,4 +1,4 @@
-import type { AccountEntry, Invoice, Item, Party } from "./db";
+import type { AccountEntry, Invoice, Item, Party, StockMovement } from "./db";
 import { convertUnitRate, roundMoney } from "./billing";
 
 export interface ReportRange { fromDate?: string; toDate?: string }
@@ -61,6 +61,11 @@ export interface DeadStockRow {
   daysWithoutSale: number | null;
   currentStock: number | null;
   stockValue: number | null;
+  stockState: "unknown" | "negative" | "empty" | "dormant";
+  lastMovementDate?: string;
+  lastMovementReason?: string;
+  daysSinceMovement: number | null;
+  recentInward: boolean;
 }
 
 export interface TopRevenueItemRow {
@@ -241,15 +246,31 @@ export function buildReceivablesAging(input: { invoices: Invoice[]; parties: Par
   };
 }
 
-export function buildDeadStockReport(invoices: Invoice[], items: Item[], asOfDate: string, inactiveDays = 183): DeadStockRow[] {
+export function buildDeadStockReport(invoices: Invoice[], items: Item[], asOfDate: string, inactiveDays = 183, movements: StockMovement[] = []): DeadStockRow[] {
   const latest = new Map<string, string>();
   for (const invoice of activeSales(invoices)) for (const line of invoice.lineItems) {
     const previous = latest.get(line.itemId);
     if (!previous || invoice.date > previous) latest.set(line.itemId, invoice.date);
   }
+  const latestMovement = new Map<string, StockMovement>();
+  for (const movement of movements) {
+    const previous = latestMovement.get(movement.itemId);
+    if (!previous || movement.createdAt > previous.createdAt || (movement.createdAt === previous.createdAt && movement.id > previous.id)) {
+      latestMovement.set(movement.itemId, movement);
+    }
+  }
   return items.filter((item) => item.isActive).map((item): DeadStockRow => {
     const lastSaleDate = latest.get(item.id) || item.lastSoldDate;
     const daysWithoutSale = lastSaleDate ? daysBetween(lastSaleDate, asOfDate) : null;
+    const movement = latestMovement.get(item.id);
+    const daysSinceMovement = movement ? daysBetween(movement.date, asOfDate) : null;
+    const stockState = item.currentStock === null
+      ? "unknown" as const
+      : item.currentStock < 0
+        ? "negative" as const
+        : item.currentStock === 0
+          ? "empty" as const
+          : "dormant" as const;
     return {
       itemId: item.id,
       itemName: item.name,
@@ -257,9 +278,18 @@ export function buildDeadStockReport(invoices: Invoice[], items: Item[], asOfDat
       lastSaleDate,
       daysWithoutSale,
       currentStock: item.currentStock,
-      stockValue: item.currentStock == null || item.purchasePrice <= 0 ? null : roundMoney(item.currentStock * item.purchasePrice)
+      stockValue: item.currentStock == null || item.purchasePrice <= 0 ? null : roundMoney(item.currentStock * item.purchasePrice),
+      stockState,
+      lastMovementDate: movement?.date,
+      lastMovementReason: movement?.reason,
+      daysSinceMovement,
+      recentInward: Boolean(movement?.kind === "inward" && daysSinceMovement !== null && daysSinceMovement < inactiveDays),
     };
-  }).filter((row) => row.daysWithoutSale == null || row.daysWithoutSale >= inactiveDays)
+  }).filter((row) =>
+      row.stockState === "unknown" ||
+      row.stockState === "negative" ||
+      (row.stockState === "dormant" && (row.daysWithoutSale == null || row.daysWithoutSale >= inactiveDays)),
+    )
     .sort((a, b) => (b.daysWithoutSale ?? Number.MAX_SAFE_INTEGER) - (a.daysWithoutSale ?? Number.MAX_SAFE_INTEGER) || a.itemName.localeCompare(b.itemName));
 }
 
