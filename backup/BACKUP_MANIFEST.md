@@ -4,11 +4,11 @@
 |---|---|
 | Product | Midori Kanjo |
 | Publisher | Sayan Finance |
-| Generated | 2026-08-10, Asia/Kolkata |
+| Generated | 2026-08-11, Asia/Kolkata |
 | Source repository | OpenAI Sites project `appgprj_6a76356b6e7c8191bbe5a03637a9ac77` |
 | Branch | `main` |
-| Verified pre-change baseline | `7f2ac4d` (complete dues and master recovery) |
-| Snapshot state | Dark-mode readability and native theme-persistence release checkpoint |
+| Verified pre-change baseline | `f063b5d` (dark-mode readability and native theme-persistence release) |
+| Snapshot state | Desktop universal-macOS artifact verification repair on the V2 source snapshot |
 | Application version | `0.1.2` across hosted, Android and desktop packages |
 | Source visibility at generation | Public deployment; source access is workspace-controlled |
 | JavaScript lockfile | npm lockfile v3, 1,251 package entries |
@@ -17,6 +17,10 @@
 
 ## What was added for this replication package
 
+- Explicit macOS `app,dmg` production bundles plus cache-safe, dynamically
+  resolved verification of the retained app and the app shipped inside the DMG.
+- Space-safe `CFBundleExecutable`, universal-architecture, DMG integrity,
+  retained-versus-shipped binary and portable checksum regression coverage.
 - Paired semantic dark-mode colors for the Items shortcuts, Inventory controls
   and notices, every Season Planner view/editor, and related pale status panels.
 - One safe hosted/native theme lifecycle: saved/system theme is applied before

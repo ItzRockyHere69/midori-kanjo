@@ -46,7 +46,7 @@ software interface but deliberately does not alter printed bills or PDFs.
 
 | Service/account | What it does | Minimum/recommended level |
 |---|---|---|
-| GitHub | Source control and the Windows/macOS Tauri build workflow. Actions artifacts contain MSI, NSIS EXE and DMG installers for 14 days. | Any account with repository and Actions access. Create the replica as a **private** repository. Hosted-runner usage is subject to the account's current Actions allowance. |
+| GitHub | Source control and the Windows/macOS Tauri build workflow. Actions artifacts contain MSI, NSIS EXE and DMG installers for 30 days. | Any account with repository and Actions access. Create the replica as a **private** repository. Hosted-runner usage is subject to the account's current Actions allowance. |
 | Supabase | Postgres database, Anonymous Auth, Row Level Security, REST API and Realtime change notifications for cloud sync. | **Free works functionally** for a small/test replica within quotas, but it has no automatic database backups and may pause after inactivity. **Pro is recommended for production shop data** because paid projects do not pause and receive daily backups. Verify current limits at `https://supabase.com/pricing` and `https://supabase.com/docs/guides/platform/backups`. Use separate production and E2E test projects. |
 | OpenAI/ChatGPT Sites | Hosts the current public web/PWA deployment represented by `.openai/hosting.json`. | Required only to reproduce that exact hosting route. It is not required for local web, Tauri or Android builds. A new account/workspace must create a new Sites project; the archived project ID does not grant ownership. |
 
@@ -485,11 +485,11 @@ The push triggers `.github/workflows/tauri-desktop.yml`. It runs the Windows
 and macOS jobs, lints and unit-tests the shared code, validates the Tauri bundle
 and uploads:
 
-- `midori-kanjo-windows-x64-installers`
-- `midori-kanjo-macos-universal-dmg`
+- `midori-kanjo-v0.1.2-windows-x64-installers`
+- `midori-kanjo-v0.1.2-macos-universal-dmg`
 
 Download them from **GitHub → Actions → Build and test Tauri desktop installers
-→ completed run → Artifacts** within 14 days.
+→ completed run → Artifacts** within 30 days.
 
 To run the real native Supabase round-trip, add the three E2E secrets from
 section 3, open **Actions → workflow → Run workflow**, enable
@@ -530,14 +530,25 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 npm run test:tauri:config
 npm run lint
 npm run test:unit
-npm run tauri:build -- --target universal-apple-darwin --bundles dmg
+npm run tauri:build -- --target universal-apple-darwin --bundles app,dmg
+npm run verify:macos:universal
 ```
 
-Expected output:
+Expected outputs:
 
 ```text
+src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
 src-tauri/target/universal-apple-darwin/release/bundle/dmg/
+SHA256SUMS-macos.txt
 ```
+
+The verifier discovers the generated `.app` instead of assuming its display
+name, reads `CFBundleExecutable` from `Contents/Info.plist`, passes paths to
+`lipo` and `hdiutil` without shell splitting, and requires both `arm64` and
+`x86_64`. It then mounts the DMG read-only, repeats the architecture check on
+the application actually shipped inside it, and confirms that binary matches
+the retained app. This keeps the check safe when the display name contains
+spaces and prevents a valid container from hiding the wrong enclosed binary.
 
 The snapshot's macOS `signingIdentity` is `-` (ad-hoc) and no Windows signing
 certificate is configured. These internal-test installers may trigger

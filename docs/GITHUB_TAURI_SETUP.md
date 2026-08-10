@@ -47,6 +47,21 @@ internal-test installers are not yet
 commercially code-signed or Apple-notarized, so Windows SmartScreen and macOS
 Gatekeeper may show warnings.
 
+The macOS job explicitly requests both Tauri bundle targets, `app` and `dmg`.
+Its verifier discovers the one emitted `.app`, reads the real executable name
+from `Contents/Info.plist`, and invokes `lipo` with an argument array. It does
+not hard-code `Midori Kanjo.app/Contents/MacOS/midori-kanjo`, so the space in
+the product name cannot be split by a shell. The job requires both `arm64` and
+`x86_64`, verifies the DMG with `hdiutil`, mounts it read-only, repeats `lipo`
+against the enclosed app, and confirms the retained and shipped executables
+are byte-identical. It writes a filename-only SHA-256 entry that remains usable
+after downloading the artifact. Stale cached `.app` and DMG bundle directories
+are cleared immediately before the production build so an older artifact
+cannot satisfy the check.
+
+The Windows job likewise clears only stale MSI/NSIS bundle outputs and requires
+exactly one MSI plus exactly one NSIS setup EXE before hashing either file.
+
 ## 3. Enable the real native offline-sync run
 
 Use a dedicated Supabase test project, enable anonymous sign-in, and apply

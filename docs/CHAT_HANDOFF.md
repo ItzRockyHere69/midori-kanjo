@@ -1,6 +1,6 @@
 # Midori Kanjo — Chat Handoff
 
-> Updated 2026-08-10 (Asia/Kolkata) for complete dues-ledger recovery, owner-locked master recovery and the dark-mode readability release. This file contains no secret values. The source, migrations and tests are authoritative when an older conversation disagrees.
+> Updated 2026-08-11 (Asia/Kolkata) for complete dues-ledger recovery, owner-locked master recovery, the dark-mode readability release and the desktop CI artifact-verification repair. This file contains no secret values. The source, migrations and tests are authoritative when an older conversation disagrees.
 
 ## Current status
 
@@ -8,7 +8,7 @@
 
 **Display/package version:** `0.1.2`
 
-**Current completed scope:** Phase 1 billing, Phase 2 inventory, Phase 3 festival planning, complete customer-dues history backup/restore, owner-locked 16-store master backup/restore, the expanded calendar, the implemented reporting/quotation slice of Phase 4, and verified dark-mode readability across the primary application workspaces
+**Current completed scope:** Phase 1 billing, Phase 2 inventory, Phase 3 festival planning, complete customer-dues history backup/restore, owner-locked 16-store master backup/restore, the expanded calendar, the implemented reporting/quotation slice of Phase 4, verified dark-mode readability across the primary application workspaces, and hardened Windows/macOS installer artifact verification
 
 **Delivery model:** one React/TypeScript application for the hosted PWA, Capacitor Android and Tauri Windows/macOS shells
 
@@ -168,6 +168,35 @@ These are invariants, not optional UI preferences.
 - `lib/theme.ts` owns safe saved/system theme selection, root application and cache writes. `mobile/main.tsx` applies it before `createRoot`; the hosted pre-paint bootstrap does the equivalent; and the runtime effect keeps `data-theme` and inline `color-scheme` synchronized for native inputs, selects and options.
 - The contrast regression calculates representative light/dark pairs, rejects the original hard-coded failures, verifies semantic selector coverage and asserts native theme-bootstrap ordering.
 
+## Desktop installer CI artifact verification
+
+- The macOS matrix now requests both explicit Tauri targets, `app,dmg`. The old
+  job requested only `dmg` and then assumed Tauri retained its intermediate
+  `.app`, which is not part of the `dmg`-only output contract.
+- The space in `Midori Kanjo.app` was not the failure: the former Bash step
+  quoted the complete path. The failed path was one argument to `lipo`; the
+  hard-coded executable path was absent. The supplied error alone cannot
+  distinguish an intermediate-app cleanup from a bundle-name, executable-name
+  or output-path mismatch, so the repair no longer assumes any of them.
+- Before the macOS build, only the cached universal `bundle/macos` and
+  `bundle/dmg` outputs are cleared. Rust dependency cache entries remain intact,
+  while stale installer files cannot satisfy or confuse exact-one checks.
+- Before the Windows build, only cached MSI and NSIS bundle outputs are cleared.
+  Verification requires exactly one MSI and exactly one NSIS EXE separately, so
+  two files of one type can never masquerade as the requested installer pair.
+- `scripts/verify-macos-universal.mjs` requires exactly one emitted `.app` and
+  one DMG, discovers the app name, reads `CFBundleExecutable` from `Info.plist`,
+  checks that the executable exists and is runnable, and passes every path as
+  an `execFile` argument so spaces are never shell-split.
+- Both `arm64` and `x86_64` must be present. The verifier validates the disk
+  image, mounts it read-only, repeats the architecture check on the enclosed
+  application, and requires the retained and shipped executable bytes to
+  match before writing a portable filename-only SHA-256 entry.
+- The fixture regression uses a directory, app and DMG name with spaces plus a
+  deliberately different `CFBundleExecutable`; it also rejects a missing app
+  and a single-architecture binary. Static workflow tests prevent restoration
+  of the former hard-coded path and enforce build → verify → upload order.
+
 ## Local database and cloud sync
 
 **Dexie database:** `BurrabazarBillingDB`
@@ -240,15 +269,16 @@ Sync remains pull-first, tenant-scoped, paginated and batched. After every pull,
 | Master recovery | `lib/master-backup.ts`, `app/MasterBackupPanel.tsx`, `app/BillingApp.tsx`, `app/globals.css` |
 | Festival UI | `app/FestivalWorkspace.tsx`, `app/festival-copy.ts`, `app/BillingApp.tsx`, `app/globals.css` |
 | Theme/readability | `lib/theme.ts`, `app/layout.tsx`, `mobile/main.tsx`, `app/globals.css`, `tests/dark-mode-contrast.test.mjs` |
+| Desktop packaging CI | `.github/workflows/tauri-desktop.yml`, `scripts/verify-macos-universal.mjs`, `tests/macos-bundle-verifier.test.mjs`, `tests/tauri-package.test.mjs` |
 | Reports | `lib/reports.ts`, `app/AdvancedReports.tsx` |
 | Sync | `lib/sync.ts`, `app/QolPanels.tsx` |
 | Supabase | `supabase/schema.sql`, `supabase/migrations/202608101500_phase2_inventory_sync.sql` |
 | Backup tools | `backup-tools/` |
-| Regression tests | `tests/billing-core.test.ts`, `tests/due-backup.test.ts`, `tests/dues-ledger-archive.test.ts`, `tests/master-backup.test.ts`, `tests/dues-backup-platform.test.mjs`, `tests/dark-mode-contrast.test.mjs`, `tests/festival-planning.test.ts`, `tests/festival-platform.test.mjs`, `tests/supabase-schema.test.mjs`, `tests/mobile-package.test.mjs`, `backup-tools/backup-tools.test.mjs` |
+| Regression tests | `tests/billing-core.test.ts`, `tests/due-backup.test.ts`, `tests/dues-ledger-archive.test.ts`, `tests/master-backup.test.ts`, `tests/dues-backup-platform.test.mjs`, `tests/dark-mode-contrast.test.mjs`, `tests/festival-planning.test.ts`, `tests/festival-platform.test.mjs`, `tests/macos-bundle-verifier.test.mjs`, `tests/tauri-package.test.mjs`, `tests/supabase-schema.test.mjs`, `tests/mobile-package.test.mjs`, `backup-tools/backup-tools.test.mjs` |
 
 ## Verification boundary
 
-### Executed for this dark-mode/readability release
+### Executed for the V2 source plus desktop CI repair
 
 | Check | Result |
 | --- | --- |
@@ -258,10 +288,19 @@ Sync remains pull-first, tenant-scoped, paginated and batched. After every pull,
 | `npm run test:platform` | 54/54 passed, including the new paired-color and pre-render/native theme lifecycle regressions, current dues-archive/native-permission source contracts and existing responsive/platform hardening |
 | `npm run test:mobile` | 28/28 passed after production mobile build and Capacitor sync |
 | `npm run test:desktop` | 1/1 passed |
-| `npm run test:tauri:config` | 4/4 passed |
+| `npm run test:tauri:config` | 8/8 passed, including four dynamic macOS path/artifact regressions |
 | Localization regression | 6/6 passed |
+| `npm run build` + `npm run validate:artifact` | Passed; the hosted artifact remains valid and unchanged by the desktop-only repair |
 | Agent-preview UI QA | Passed contrast scanning on all seven desktop navigation destinations in dark mode; Inventory hub and form fields; all five Season Planner views; expanded calendar day details and festival editor; paired Items shortcuts in English, Hindi and Bengali; and light/dark theme-toggle synchronization with native `color-scheme` |
 | `git diff --check` | Passed after final documentation updates |
+
+The native Windows and macOS installer jobs cannot execute inside this Linux
+checkout. GitHub `main` still contains the identical pre-fix V2 source under
+commit `1e7f9c4`; pushing or merging this repaired source is therefore required
+to start the real `windows-latest` and `macos-latest` matrix. Do not call the
+native-runner repair confirmed until that new run shows the shared, Windows and
+macOS jobs all succeeded. The macOS job itself now performs the retained-app,
+mounted-DMG and checksum assertions described above before it can turn green.
 
 The Android production web bundle and Capacitor project sync passed. A debug APK could not be assembled in this sandbox because the Gradle 8.7 distribution is not cached and the Gradle download host is unreachable here. Build the APK on the documented Java 17/Android SDK 35 workstation; do not treat a stale APK from another source snapshot as this release.
 

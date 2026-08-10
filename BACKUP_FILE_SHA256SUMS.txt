@@ -1,13 +1,13 @@
 4e7fbd1dfa9f25486cd4d4fbd95df5d23b3a4414c54c7126b7ca241a62aca421  ./.env.example
-0fc5545f5e6e4c687ef17305dbbed6a9152fa0dc75e15433ca81b9bad426227c  ./.github/workflows/tauri-desktop.yml
+44e825cd2abc4876c854a490003b39af9f41e08a7fcdc33d971c3a8015c499c8  ./.github/workflows/tauri-desktop.yml
 c3b679743d0f43b8788fee1dafb5ab58655317c5caa3b53bd5c0fe67b27c4f2a  ./.gitignore
 494e64a8818b6158e89321250500ad5ad018e33ad5cfea06a1cacd2cf4da75fa  ./.npmrc
 0afc7d6b106b509db20cd00c9b6c66f2db2c2d72a31c561680c7510bbb7ba74d  ./.openai/hosting.json
 44bc273571a272e6d666072500466aac8d6cbdb5e5aab820264c14c717bea2db  ./.test-dist/billing-core.test.mjs
 e367da65fdc4a5a4f22cc0e01f4c2e110606f4f189bd79d02d04abd8e9bb2f7a  ./.test-dist/pdf-i18n.test.mjs
-e05433b63777e8d4c6d4f6932e9813d4142b7bd35935e773200950b38e3aeb6c  ./CHAT_HANDOFF.md
-63aa259bbbdab57603dd719f5ea6c61bd9820dd4793319c91394280549dfbf83  ./README.md
-099844cf911224bc6673dcc57eae22f9db85ce27223c99a962f99616eb506a11  ./SETUP_FROM_SCRATCH.md
+32796575ea698823bebeb84c6c17c5ae2cec2ee40326c8e1f5811cd9d7dac854  ./CHAT_HANDOFF.md
+ce434e1c74e5f9f4ceb356d1c5602691b02be0a955165e52f6f0c82bcde03094  ./README.md
+c32506951990ac18ee3b9ea5e374e8b9011e7e43a3611218240c976e3ff15a69  ./SETUP_FROM_SCRATCH.md
 065e4a92a240fe11a0ea230491ad9dabef143f5fd5a3e6884ad6f0395666a971  ./android/.gitignore
 99c54e51ee601a60fbde8016b2cbf717483bc2e92773be86c9247d02a7fa6ea4  ./android/app/.gitignore
 4e4015dd29a6a317202d87c2fa6932b735301eccd3fd323fefee2f2f19aa3668  ./android/app/build.gradle
@@ -82,7 +82,7 @@ a3258c47f3f36730b4601228e89b0400c664b3744db091529fcd7259aa902348  ./backup-tools
 1ea326a77b4013eef5636c48132e9217b678d0245b7de9101d96e17c65e77cbc  ./backup-tools/export-supabase-business-data.sh
 fa36e2ba19a35fe1981c4577040808800f2c4b4059b4c27f960887c86cb2f5e8  ./backup-tools/restore-local-indexeddb.js
 ec35cdd95bf25e79bcef7577b453ef0cbd287b5d55a88c78d160304b54ed7b2f  ./backup-tools/restore-supabase-business-data.sh
-788fdc0cf8ea880a22a07a523526f81143e0bf0fbafc36e77fe3f8914781761b  ./backup/BACKUP_MANIFEST.md
+19724976c01f2e5e269c439e16bb2d4ac6beafb2764d250d881a2764f8363769  ./backup/BACKUP_MANIFEST.md
 66d945b3a2dd27f137bde2c5687dfa003ffe67603597bc4d02a2b388ff9e6873  ./backup/DATA_EXPORT_STATUS.md
 1b030e9a5ce70c2976b7983f744ecdb330ca81030490cb7650eaa84bb0d99ab4  ./backup/LOCALIZATION_UPDATE.md
 213fe3d6b5828dae0d2dadb725a1e3703caf6d565f430ff75664344a65982150  ./backup/REQUIRED_SECRETS.md
@@ -96,9 +96,9 @@ ba55abc297839d61b53caea194bf6c2f33d6948881325f82dcfce704adebfdfa  ./desktop-e2e/
 ff93930acb8b4b281c9107b4e6f63966bfbcb3bad95d033a219afe9701940c05  ./desktop/electron-builder.yml
 312f1aef8a077db96254a6c4b2d451af0d970f5713a1a59e0b08d76fcdb7baa1  ./desktop/main.cjs
 c00b6e89455cddcfc4c1e82eb424602c27dbe0cd2391b156996ded03b27a8306  ./desktop/package.json
-56dcfa8dafb9f7b759a7d4bad72704bb0af4e4517c8b2323860c792529a241cb  ./docs/CHAT_HANDOFF.md
-bfeac57e32e70b01a05c64f6bdfe34009e067ba53a477c9c9b4f63f527df3c1d  ./docs/DESKTOP_INSTALLATION.md
-a6ba5e555ec5d2ef21c4ed10dec3532a5ded34a8aef2dfc07dc331f7ffc06c54  ./docs/GITHUB_TAURI_SETUP.md
+751c398ed9f6d121431b63aff1ea6b64afa4dd7f0c611fa7619ea66c86123fc1  ./docs/CHAT_HANDOFF.md
+fa5ef9b9324417bb97409ec4adcf9ef15786cd9baf19ac2dd4048ce624f2db88  ./docs/DESKTOP_INSTALLATION.md
+9c45855a35e03f4fc687a009b2b9484097dca121304e55419116080200b0eb84  ./docs/GITHUB_TAURI_SETUP.md
 af081f7384aaeb0082cf422e29f139d137ca2f6a57c69b2c37b9fb1f8479867b  ./drizzle.config.ts
 90cb374e093894d0efce6f1830d873a42aadd8ba49d2f024495e5cb2e1c8c303  ./drizzle/meta/_journal.json
 870f1adccecf3051cbcd9fd307cef51d7633cf510979c181a81f4b1797273493  ./eslint.config.mjs
@@ -136,7 +136,7 @@ bf88c78c4876c67c88554a3bd1d88b1c811818a436903316fecab0c8f00245ff  ./lib/reports.
 f8ab2cf6ff7254b3f96fbfbf52f72594e0119d87e554f4e501e1e432281fb506  ./mobile/main.tsx
 614bce25b089c3f19b1e17a6346c74b858034040154c6621e7d35303004767cc  ./next.config.ts
 cd7491bfcc723e838003f8ad96aeed470c5b7d8a3c91b40d336ca34adffabb33  ./package-lock.json
-92ee333cc7d8241594abd750cc612bd512ad547e78204013864a2e4eba4fdeae  ./package.json
+17b2333d912ce2ee1222bd086c3fa5d9d718d949bf62640fddaf06e8192034a7  ./package.json
 dfac7ac2d86d326a0e5adb024e7943c181393ed17a5fcb8f0315b24c7da6ddde  ./postcss.config.mjs
 7063b3fa33a0260d43de93a93c21091cde3d83c3069378fb695e45c91f1f792b  ./public/_headers
 b54ea1fc71578a0b8461332de247858c1c9bd1dd6312f94a3c1a8f49d9fa7d9c  ./public/app-icon-180.png
@@ -157,6 +157,7 @@ f63e840679ca885f206d17b7f8285199bb6bcd47ebc360008d04d16b8e54f63c  ./scripts/inst
 ed282d6180087ab87cc23150b05d9b62888ae56cb0f72b5cbcca3ee1ab66267f  ./scripts/run-android-gradle.mjs
 df86ebfc27d2f00860036658e933ac0ddd7b5f6879aa5d51218f0863c7e1fb60  ./scripts/sites-env.sh
 826354a781d909a664342b6a6f1a3155529e21f757dc163befa937420c713c2b  ./scripts/validate-artifact.sh
+d14119fdf78585fe8295ee1a15aee7e366f4c99c6d73f70ae4ab6697fa141189  ./scripts/verify-macos-universal.mjs
 d01c5d48a9c488f2cb7ce6d13703e9f9de71d920d135ce8589bf2fcf6fc62863  ./src-tauri/.gitignore
 8b1e13f5e2dd1c099f0f480ed8ee989744ec9ce30529e74c6456343e1977695c  ./src-tauri/Cargo.toml
 487059eaf8a947b80f20a9aacac038a5047b2ad69d2401b827376c67d6fe847f  ./src-tauri/build.rs
@@ -234,6 +235,7 @@ f93c6e1550459b2a23199db4b66b34962bf388e974662c7468448c62ceff5e7b  ./tests/dues-l
 60ba4f34b6aea4715aa6c70131908235c174429d9846e07e4a10441570a85580  ./tests/festival-platform.test.mjs
 2213c12e6a4e33418153f3384a6df336f8b5bddfa73509c4a8dec13e83251ee3  ./tests/interface-scale.test.mjs
 c49dce16f181a369113bc149069387494b73a42b435e0439aba6ef5badb23423  ./tests/localization-regression.test.mjs
+f986c65e683e73dd0b12370244ea8c213c331148837dcc235703306e103aac51  ./tests/macos-bundle-verifier.test.mjs
 15966d2a8922d2993df6beb73e3e0bcf7c958d2553d3305f8129c25a3134e6ef  ./tests/master-backup.test.ts
 418b958fa0c3e17b9dd0200f5dbc590b88f3be53f342e42d76b581e6a643314a  ./tests/mobile-build-lock.test.mjs
 c59ba91025333429b9d9d827e969d42ee1cf88a7da7a8310bc3360f22d338df0  ./tests/mobile-package.test.mjs
@@ -242,7 +244,7 @@ e7eb078b37ca6f5f4a3ec23c3131684d138ca93d6fa9de6f7bbc0261e9a9bc85  ./tests/pdf-i1
 a74204b6c44722c75a4d2149506b500638551932cc3065e7930c8d305aa93a16  ./tests/platform-hardening.test.mjs
 eae1d187870ad9a4b3f0c37b40589b25c1a2090dcbee19964555cf70c136b118  ./tests/rendered-html.test.mjs
 28c7774e4385145ac07482cad88645a958cb8006deb03c7b90298ec59827d91f  ./tests/supabase-schema.test.mjs
-6aeae6e078bc53bf4676c0667562a1d3febb2c54dfab1e3d5d2c79bc5f82cb9e  ./tests/tauri-package.test.mjs
+131c885de6f4878d924790b68d622d433fa2834dbd7fec8f0211f717a5ebce02  ./tests/tauri-package.test.mjs
 72ed3722a65e2242200f164aaed26b046901f134660bf81d64464ea73a37b4a8  ./tsconfig.json
 2ac6d81bd7d8751d11cfd189362ccc3f6b86aff208df4d984e99067a9203db55  ./tsconfig.tsbuildinfo
 1b7b1fe1093e7f10a8a7f366a3d4cc31e3812b7b16eabcc2aff9a88c18f7506c  ./vite.config.ts

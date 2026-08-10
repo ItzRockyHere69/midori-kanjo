@@ -79,7 +79,10 @@ jobs:
             label: macOS · Universal DMG
             os: macos-latest
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            tauri_args: --target universal-apple-darwin --bundles dmg
+            # Request the application bundle explicitly. Building only the DMG
+            # does not guarantee that Tauri keeps bundle/macos/*.app after the
+            # disk image has been assembled.
+            tauri_args: --target universal-apple-darwin --bundles app,dmg
             binary_path: src-tauri/target/release/midori-kanjo
             artifact_name: midori-kanjo-v0.1.2-macos-universal-dmg
             artifact_path: |
@@ -139,6 +142,24 @@ jobs:
           MIDORI_E2E_SYNC_CODE: ${{ secrets.MIDORI_E2E_SYNC_CODE }}
         run: npm run test:tauri:e2e
 
+      - name: Clear stale macOS bundle outputs
+        if: ${{ matrix.id == 'macos-universal' }}
+        shell: bash
+        run: |
+          rm -rf \
+            "src-tauri/target/universal-apple-darwin/release/bundle/macos" \
+            "src-tauri/target/universal-apple-darwin/release/bundle/dmg"
+
+      - name: Clear stale Windows bundle outputs
+        if: ${{ matrix.id == 'windows-x64' }}
+        shell: pwsh
+        run: |
+          $bundlePaths = @(
+            "src-tauri/target/release/bundle/msi"
+            "src-tauri/target/release/bundle/nsis"
+          )
+          Remove-Item -Path $bundlePaths -Recurse -Force -ErrorAction SilentlyContinue
+
       - name: Build production installer
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         with:
@@ -148,11 +169,19 @@ jobs:
         if: ${{ matrix.id == 'windows-x64' }}
         shell: pwsh
         run: |
-          $installers = @(
-            Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi"
-            Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe"
+          $msiInstallers = @(
+            Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" -File -ErrorAction SilentlyContinue
           )
-          if ($installers.Count -ne 2) { throw "Expected one MSI and one NSIS installer." }
+          $nsisInstallers = @(
+            Get-ChildItem -Path "src-tauri/target/release/bundle/nsis/*-setup.exe" -File -ErrorAction SilentlyContinue
+          )
+          if ($msiInstallers.Count -ne 1) {
+            throw "Expected exactly one MSI installer; found $($msiInstallers.Count)."
+          }
+          if ($nsisInstallers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer; found $($nsisInstallers.Count)."
+          }
+          $installers = @($msiInstallers[0], $nsisInstallers[0])
           $lines = $installers | ForEach-Object {
             $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
             "$hash  $($_.Name)"
@@ -161,17 +190,7 @@ jobs:
 
       - name: Verify universal Mac app, DMG and checksum
         if: ${{ matrix.id == 'macos-universal' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          app_path="src-tauri/target/universal-apple-darwin/release/bundle/macos/Midori Kanjo.app"
-          binary_path="$app_path/Contents/MacOS/midori-kanjo"
-          architectures="$(lipo -archs "$binary_path")"
-          [[ "$architectures" == *arm64* && "$architectures" == *x86_64* ]]
-          dmg_path="$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' -print -quit)"
-          test -n "$dmg_path"
-          hdiutil verify "$dmg_path"
-          shasum -a 256 "$dmg_path" > SHA256SUMS-macos.txt
+        run: npm run verify:macos:universal
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

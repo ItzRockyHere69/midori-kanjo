@@ -46,6 +46,13 @@ shasum -a 256 "Midori Kanjo_0.1.2_universal.dmg"
 
 Compare the result with `SHA256SUMS-macos.txt`.
 
+When building the source manually on macOS, run
+`npm run desktop:build:macos` followed by
+`npm run verify:macos:universal`. The verifier handles the space in the product
+name without shell splitting, checks both processor architectures in the
+retained app and in the app mounted from the DMG, validates the disk image and
+writes `SHA256SUMS-macos.txt`.
+
 ## Desktop behavior
 
 - PDF, CSV and text exports use the operating system's Save dialog.

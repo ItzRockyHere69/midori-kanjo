@@ -180,6 +180,7 @@ on devices with inaccurate clocks.
 
 - Android release distribution requires a private signing key and Play Console account, plus an API 36 toolchain before the 2026-08-31 target-SDK deadline.
 - Local Tauri builds require Rust and the target platform's native tools (MSVC on Windows or Xcode on macOS). Public Windows distribution still needs commercial code signing; public macOS distribution needs Apple signing credentials and notarization.
+- `npm run test:tauri:config` validates configuration, the offline frontend and synthetic macOS artifact/path fixtures; only the GitHub `windows-latest` and `macos-latest` jobs build and verify the real MSI, NSIS, app and DMG outputs.
 - Unsigned internal installers can trigger SmartScreen or Gatekeeper. Automated packaging does not replace acceptance testing on the intended computers, phones, printers and shop network.
 
 ## Billing assumptions

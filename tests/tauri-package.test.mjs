@@ -68,14 +68,40 @@ test("production frontend is offline-local and excludes the runner harness", asy
 
 test("GitHub Actions produces both requested installer artifact groups", async () => {
   const workflow = await read(".github/workflows/tauri-desktop.yml");
+  const packageJson = JSON.parse(await read("package.json"));
   assert.match(workflow, /windows-latest/);
   assert.match(workflow, /macos-latest/);
   assert.match(workflow, /--bundles msi,nsis/);
-  assert.match(workflow, /--target universal-apple-darwin --bundles dmg/);
+  assert.match(workflow, /--target universal-apple-darwin --bundles app,dmg/);
+  assert.match(workflow, /npm run verify:macos:universal/);
+  assert.equal(
+    packageJson.scripts["desktop:build:macos"],
+    "tauri build --target universal-apple-darwin --bundles app,dmg",
+  );
+  assert.equal(
+    packageJson.scripts["verify:macos:universal"],
+    "node scripts/verify-macos-universal.mjs",
+  );
+  assert.doesNotMatch(
+    workflow,
+    /bundle\/macos\/Midori Kanjo\.app\/Contents\/MacOS\/midori-kanjo/,
+  );
   assert.match(workflow, /midori-kanjo-v0\.1\.2-windows-x64-installers/);
   assert.match(workflow, /midori-kanjo-v0\.1\.2-macos-universal-dmg/);
   assert.match(workflow, /SHA256SUMS-windows\.txt/);
   assert.match(workflow, /SHA256SUMS-macos\.txt/);
+  assert.match(workflow, /\$msiInstallers\.Count -ne 1/);
+  assert.match(workflow, /\$nsisInstallers\.Count -ne 1/);
   assert.match(workflow, /run_native_offline_sync_test/);
   assert.match(workflow, /test:tauri:e2e/);
+  assert.ok(
+    workflow.indexOf("Build production installer")
+      < workflow.indexOf("Verify universal Mac app, DMG and checksum"),
+    "macOS verification must run after the production build",
+  );
+  assert.ok(
+    workflow.indexOf("Verify universal Mac app, DMG and checksum")
+      < workflow.indexOf("Upload installer artifact"),
+    "installer upload must run only after macOS verification",
+  );
 });
